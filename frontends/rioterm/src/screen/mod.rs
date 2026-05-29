@@ -1913,6 +1913,16 @@ impl Screen<'_> {
         clipboard.set(ty, text);
     }
 
+    pub fn copy_selection_on_pointer_release(
+        &mut self,
+        copy_on_select: bool,
+        clipboard: &mut Clipboard,
+    ) {
+        for &ty in pointer_release_clipboard_targets(copy_on_select) {
+            self.copy_selection(ty, clipboard);
+        }
+    }
+
     #[inline]
     pub fn select_all(&mut self) {
         let current = self.context_manager.current_mut();
@@ -5031,6 +5041,18 @@ fn shell_execute_open(target: &str) {
     }
 }
 
+// Clipboard slots that receive the current selection when a pointer button is
+// released after a text drag. PRIMARY is unconditional — middle-click and
+// Shift+Insert paste it, and other terminals all populate it on mouse
+// selection. `copy_on_select` additionally mirrors into the system clipboard.
+fn pointer_release_clipboard_targets(copy_on_select: bool) -> &'static [ClipboardType] {
+    if copy_on_select {
+        &[ClipboardType::Selection, ClipboardType::Clipboard]
+    } else {
+        &[ClipboardType::Selection]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5066,5 +5088,20 @@ mod tests {
             at: std::time::Instant::now() - crate::constants::MULTI_CLICK_THRESHOLD * 2,
         };
         assert!(!stale.validates_double_click(origin));
+    }
+
+    // Regression test for #1620: mouse selection must claim the PRIMARY
+    // selection regardless of copy_on_select, so middle-click / Shift+Insert
+    // paste the text just selected in Rio.
+    #[test]
+    fn pointer_release_always_claims_primary() {
+        assert_eq!(
+            pointer_release_clipboard_targets(false),
+            &[ClipboardType::Selection],
+        );
+        assert_eq!(
+            pointer_release_clipboard_targets(true),
+            &[ClipboardType::Selection, ClipboardType::Clipboard],
+        );
     }
 }
