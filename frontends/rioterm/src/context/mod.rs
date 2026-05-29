@@ -1280,6 +1280,33 @@ pub mod test {
         assert_eq!(context_manager.capacity, 8);
     }
 
+    /// Regression: backend events (PTY-reply targets, color requests,
+    /// damage notifications) carry a `route_id` that identifies the
+    /// originating panel, not the visible one. `get_by_route_id` used to
+    /// scan only the active tab, so a reply destined for a hidden tab was
+    /// silently dropped — most visibly, a shell on the hidden tab that had
+    /// issued a cursor-position query would wait out its full timeout
+    /// before continuing, freezing visible input echo on that tab.
+    #[test]
+    fn test_get_by_route_id_finds_hidden_tab() {
+        let window_id: WindowId = WindowId::from(0);
+
+        let mut context_manager =
+            ContextManager::start_with_capacity(5, VoidListener {}, window_id).unwrap();
+        let hidden_route_id = context_manager.contexts[0].current().route_id;
+
+        context_manager.add_context(true, 0);
+        assert_eq!(
+            context_manager.current_index, 1,
+            "second tab should be active after add_context(redirect=true, …)"
+        );
+
+        let found = context_manager
+            .get_by_route_id(hidden_route_id)
+            .expect("hidden tab's route_id must still resolve via get_by_route_id");
+        assert_eq!(found.val.route_id, hidden_route_id);
+    }
+
     #[test]
     fn test_add_context() {
         let window_id: WindowId = WindowId::from(0);
