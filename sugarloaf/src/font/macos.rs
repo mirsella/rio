@@ -450,6 +450,7 @@ pub fn rasterize_glyph(
     is_color: bool,
     synthetic_italic: bool,
     synthetic_bold: bool,
+    antialias: bool,
 ) -> Option<RasterizedGlyph> {
     let ct_font = if synthetic_italic {
         ct_font_sheared(&handle.base_font, size_px as f64)
@@ -567,9 +568,9 @@ pub fn rasterize_glyph(
         (bytes, cx)
     };
 
-    cx.set_should_antialias(true);
-    cx.set_allows_antialiasing(true);
-    cx.set_should_smooth_fonts(true);
+    cx.set_should_antialias(antialias);
+    cx.set_allows_antialiasing(antialias);
+    cx.set_should_smooth_fonts(antialias);
     cx.set_gray_fill_color(0.0, 1.0);
     // Synthetic bold via fill+stroke. Line width scales with size
     // (1/14 of points, floored at 1 device pixel) so bold weight looks
@@ -1722,7 +1723,7 @@ mod tests {
             .expect("static bytes should parse");
         let size = 18.0;
         let gid = glyph_id_for_char(&handle, size as f64, 'M');
-        let g = rasterize_glyph(&handle, gid, size, false, false, false)
+        let g = rasterize_glyph(&handle, gid, size, false, false, false, true)
             .expect("rasterize returned None");
         assert!(g.width > 0 && g.height > 0);
         // Inked: at least one non-zero alpha pixel.
@@ -1734,7 +1735,7 @@ mod tests {
         let handle = FontHandle::from_bytes(FONT_CASCADIA_CODE_NF).expect("load font");
         let size = 24.0;
         let gid = glyph_id_for_char(&handle, size as f64, 'A');
-        let g = rasterize_glyph(&handle, gid, size, false, false, false)
+        let g = rasterize_glyph(&handle, gid, size, false, false, false, true)
             .expect("rasterize returned None");
 
         assert!(g.width > 0, "A should have non-zero width");
@@ -1814,7 +1815,7 @@ mod tests {
         let handle = FontHandle::from_bytes(FONT_CASCADIA_CODE_NF).expect("load font");
         let size = 24.0;
         let gid = glyph_id_for_char(&handle, size as f64, ' ');
-        let g = rasterize_glyph(&handle, gid, size, false, false, false)
+        let g = rasterize_glyph(&handle, gid, size, false, false, false, true)
             .expect("rasterize returned None");
 
         // Space carries advance but no ink; rasterizer should short-circuit.
