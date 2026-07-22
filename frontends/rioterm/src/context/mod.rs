@@ -275,6 +275,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 pty = match create_pty_with_fork(
                     config.shell.program.as_deref(),
                     &config.shell.args,
+                    &config.working_dir,
                     cols,
                     rows,
                     initial_winsize.width,
