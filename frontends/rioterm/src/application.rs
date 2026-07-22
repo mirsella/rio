@@ -1254,9 +1254,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         && button == MouseButton::Left
                         && route.window.screen.allow_manual_dragging
                     {
-                        use crate::renderer::island::ISLAND_HEIGHT;
                         let scale = route.window.screen.sugarloaf.scale_factor();
-                        if route.window.screen.mouse.y <= (ISLAND_HEIGHT * scale) as f64 {
+                        let tab_bar_height =
+                            route.window.screen.renderer.navigation.tab_bar_height;
+                        if route.window.screen.mouse.y <= (tab_bar_height * scale) as f64
+                        {
                             let _ = route.window.winit_window.drag_window();
                         }
                     }
@@ -1395,10 +1397,15 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
                             #[cfg(target_os = "macos")]
                             if route.window.screen.allow_manual_dragging {
-                                use crate::renderer::island::ISLAND_HEIGHT;
                                 let scale = route.window.screen.sugarloaf.scale_factor();
+                                let tab_bar_height = route
+                                    .window
+                                    .screen
+                                    .renderer
+                                    .navigation
+                                    .tab_bar_height;
                                 if route.window.screen.mouse.y
-                                    <= (ISLAND_HEIGHT * scale) as f64
+                                    <= (tab_bar_height * scale) as f64
                                 {
                                     route
                                         .window
@@ -1754,11 +1761,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 // The macOS full-size content view keeps this band as custom
                 // window chrome even when hide-if-single hides the island.
                 // Other platforms only reserve it while the island is drawn.
-                use crate::renderer::island::ISLAND_HEIGHT;
                 let scale_factor = route.window.screen.sugarloaf.scale_factor();
-                let island_height_px = (ISLAND_HEIGHT * scale_factor) as f64;
                 let num_tabs = route.window.screen.ctx().len();
                 let nav = &route.window.screen.renderer.navigation;
+                let island_height_px = (nav.tab_bar_height * scale_factor) as f64;
                 if nav.chrome_band_reserved(num_tabs) && y <= island_height_px {
                     route.window.winit_window.set_cursor(CursorIcon::Default);
                     return;
