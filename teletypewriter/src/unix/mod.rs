@@ -23,7 +23,7 @@ use std::ops::Deref;
 use std::os::fd::OwnedFd;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::ptr;
 
@@ -718,6 +718,14 @@ pub fn create_pty_with_spawn(
                 set_nonblocking(main);
             }
 
+            let ptsname: String = tty_ptsname(main).unwrap_or_else(|_| "".to_string());
+            let child_unix = Child {
+                id: main,
+                ptsname,
+                pid: child_process.id().try_into().unwrap(),
+                exited: false,
+            };
+
             Ok(Pty {
                 child: child_unix,
                 child_event_emitted: false,
@@ -813,7 +821,12 @@ pub fn create_pty_with_fork(
             // Whenever it happens it will just simply shut down the teletyperwriter
             // In the future add an option to check before release the method
             let ptsname: String = tty_ptsname(main).unwrap_or_else(|_| "".to_string());
-            let child = Child::new(main, id, ptsname, None);
+            let child = Child {
+                id: main,
+                ptsname,
+                pid: id,
+                exited: false,
+            };
 
             unsafe {
                 set_nonblocking(main);
@@ -858,6 +871,84 @@ unsafe fn set_nonblocking(fd: libc::c_int) {
 
     let res = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
     assert_eq!(res, 0);
+}
+
+#[derive(Debug)]
+pub struct Child {
+    pub id: libc::c_int,
+    pub pid: libc::pid_t,
+    #[allow(dead_code)]
+    ptsname: String,
+    exited: bool,
+}
+
+impl Child {
+    /// The tcgetwinsize function fills in the winsize structure pointed to by
+    ///  gws with values that represent the size of the terminal window for which
+    ///  fd provides an open file descriptor.  If no error occurs tcgetwinsize()
+    ///  returns zero (0).
+    ///  The tcsetwinsize function sets the terminal window size, for the terminal
+    ///  referenced by fd, to the sizes from the winsize structure pointed to by
+    ///  sws.  If no error occurs tcsetwinsize() returns zero (0).
+    ///  The winsize structure, defined in <termios.h>, contains (at least) the
+    ///  following four fields
+    ///  unsigned short ws_row;      /* Number of rows, in characters */
+    ///  unsigned short ws_col;      /* Number of columns, in characters */
+    ///  unsigned short ws_xpixel;   /* Width, in pixels */
+    ///  unsigned short ws_ypixel;   /* Height, in pixels */
+    /// If the actual window size of the controlling terminal of a process
+    /// changes, the process is sent a SIGWINCH signal.  See signal(7).  Note
+    /// simply changing the sizes using tcsetwinsize() does not necessarily
+    /// change the actual window size, and if not, will not generate a SIGWINCH.
+    pub fn set_winsize(&self, winsize_builder: WinsizeBuilder) -> io::Result<()> {
+        let winsize: Winsize = winsize_builder.build();
+        match unsafe { libc::ioctl(**self, TIOCSWINSZ, &winsize as *const _) } {
+            -1 => Err(io::Error::last_os_error()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Return the child’s exit status if it has already exited. If the child is still running, return Ok(None).
+    /// https://linux.die.net/man/2/waitpid
+    pub fn waitpid(&mut self) -> Result<Option<i32>, String> {
+        let mut status = 0 as libc::c_int;
+        // If WNOHANG was specified in options and there were no children in a waitable state, then waitid() returns 0 immediately and the state of the siginfo_t structure pointed to by infop is unspecified. To distinguish this case from that where a child was in a waitable state, zero out the si_pid field before the call and check for a nonzero value in this field after the call returns.
+        let res =
+            unsafe { waitpid(self.pid, &mut status as *mut libc::c_int, libc::WNOHANG) };
+        if res <= -1 {
+            return Err(String::from("error"));
+        }
+
+        if res == 0 && status == 0 {
+            return Ok(None);
+        }
+
+        self.exited = true;
+        Ok(Some(status))
+    }
+}
+
+pub fn kill_pid(pid: i32) {
+    unsafe {
+        libc::kill(pid, libc::SIGHUP);
+    }
+}
+
+impl Deref for Child {
+    type Target = libc::c_int;
+    fn deref(&self) -> &libc::c_int {
+        &self.id
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        if !self.exited {
+            unsafe {
+                libc::kill(self.pid, libc::SIGHUP);
+            }
+        }
+    }
 }
 
 pub fn command_per_pid(pid: libc::pid_t) -> String {
@@ -1020,12 +1111,7 @@ pub fn foreground_process_path(
 }
 
 /// Start a new process in the background.
-pub fn spawn_daemon<I, S>(
-    program: &str,
-    args: I,
-    main_fd: RawFd,
-    shell_pid: u32,
-) -> io::Result<()>
+pub fn spawn_daemon<I, S>(program: &str, args: I, cwd: Option<&Path>) -> io::Result<()>
 where
     I: IntoIterator<Item = S> + Copy,
     S: AsRef<std::ffi::OsStr>,
@@ -1036,7 +1122,7 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Ok(cwd) = foreground_process_path(main_fd, shell_pid) {
+    if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
     unsafe {

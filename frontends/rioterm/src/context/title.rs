@@ -14,6 +14,13 @@ impl Default for ContextTitle {
     }
 }
 
+pub fn create_title_extra_from_context<T: rio_backend::event::EventListener>(
+    context: &Context<T>,
+) -> Option<ContextTitleExtra> {
+    let program = context.foreground_process_name()?;
+    Some(ContextTitleExtra { program })
+}
+
 // Possible options:
 
 // - `TITLE`: terminal title via OSC sequences for setting terminal title
@@ -61,6 +68,41 @@ fn shorten_path(absolute: &str) -> String {
     }
 }
 
+fn current_path<T: rio_backend::event::EventListener>(
+    context: &Context<T>,
+) -> Option<String> {
+    context
+        .terminal
+        .lock()
+        .current_directory
+        .clone()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .or_else(|| {
+            context
+                .foreground_process_path()
+                .map(|path| path.to_string_lossy().into_owned())
+        })
+}
+
+fn variable_value<T: rio_backend::event::EventListener>(
+    variable: &str,
+    context: &Context<T>,
+) -> Option<String> {
+    match variable.trim().to_ascii_lowercase().as_str() {
+        "columns" => Some(context.dimension.columns.to_string()),
+        "lines" => Some(context.dimension.lines.to_string()),
+        "title" => Some(context.terminal.lock().title.clone()),
+        "program" => Some(context.foreground_process_name().unwrap_or_default()),
+        "absolute_path" => Some(current_path(context).unwrap_or_default()),
+        "relative_path" => Some(
+            current_path(context)
+                .map(|path| shorten_path(&path))
+                .unwrap_or_default(),
+        ),
+        _ => None,
+    }
+}
+
 #[inline]
 /// Render the title template. Every variable is event-known, so this
 /// NEVER inspects the foreground process: `{{ title }}` is OSC 0/2,
@@ -81,113 +123,20 @@ pub fn update_title<T: rio_backend::event::EventListener>(
     }
 
     let mut new_template = template.to_owned();
-    let lowered = template.to_lowercase();
-    let needs_title = lowered.contains("title");
-    let needs_path = lowered.contains("path");
-    let (terminal_title, current_directory) =
-        if (needs_title && prefetched_title.is_none()) || needs_path {
-            let terminal = context.terminal.lock();
-            (
-                match prefetched_title {
-                    Some(title) => title.to_string(),
-                    None => terminal.title.to_string(),
-                },
-                terminal.current_directory.clone(),
-            )
-        } else {
-            (prefetched_title.unwrap_or_default().to_string(), None)
-        };
-    // Compiled once: titles are now rendered per OSC title change, not on
-    // a 2s poll, so a per-call `Regex::new` would sit in the hot path.
-    static RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"\{\{(.*?)\}\}").unwrap());
-    for (to_replace_str, [variable]) in RE.captures_iter(template).map(|c| c.extract()) {
-        let variables = if to_replace_str.contains("||") {
-            variable.split("||").collect()
-        } else {
-            vec![variable]
-        };
 
-        let mut matched = false;
-        for (i, scoped_variable) in variables.iter().enumerate() {
-            if matched {
-                break;
+    let re = regex::Regex::new(r"\{\{(.*?)\}\}").unwrap();
+    for (to_replace_str, [variable]) in re.captures_iter(template).map(|c| c.extract()) {
+        let mut variables = variable.split("||").peekable();
+        while let Some(variable) = variables.next() {
+            let Some(value) = variable_value(variable, context) else {
+                continue;
+            };
+            if value.is_empty() && variables.peek().is_some() {
+                continue;
             }
 
-            let var = scoped_variable.to_owned().trim().to_lowercase();
-            match var.as_str() {
-                "columns" => {
-                    new_template = new_template
-                        .replace(to_replace_str, &context.dimension.columns.to_string());
-                    matched = true;
-                }
-                "lines" => {
-                    new_template = new_template
-                        .replace(to_replace_str, &context.dimension.lines.to_string());
-                    matched = true;
-                }
-                "title" => {
-                    // In case it has a fallback and title is empty
-                    // or
-                    // In case is the last then we need to erase variables either way
-                    let is_only_one = variables.len() == 1;
-                    let is_last = i == variables.len() - 1;
-                    if is_only_one || is_last {
-                        new_template =
-                            new_template.replace(to_replace_str, &terminal_title);
-                        continue;
-                    }
-
-                    if !terminal_title.is_empty() {
-                        new_template =
-                            new_template.replace(to_replace_str, &terminal_title);
-                        matched = true;
-                    }
-                }
-                "program" => {
-                    new_template =
-                        new_template.replace(to_replace_str, &context.spawned_program);
-                    matched = true;
-                }
-                "absolute_path" => {
-                    let path = current_directory
-                        .as_ref()
-                        .and_then(|d| d.clone().into_os_string().into_string().ok())
-                        .unwrap_or_default();
-
-                    let is_only_one = variables.len() == 1;
-                    let is_last = i == variables.len() - 1;
-                    if is_only_one || is_last {
-                        new_template = new_template.replace(to_replace_str, &path);
-                        continue;
-                    }
-
-                    if !path.is_empty() {
-                        new_template = new_template.replace(to_replace_str, &path);
-                        matched = true;
-                    }
-                }
-                "relative_path" => {
-                    let path = current_directory
-                        .as_ref()
-                        .and_then(|d| d.clone().into_os_string().into_string().ok())
-                        .map(|d| shorten_path(&d))
-                        .unwrap_or_default();
-
-                    let is_only_one = variables.len() == 1;
-                    let is_last = i == variables.len() - 1;
-                    if is_only_one || is_last {
-                        new_template = new_template.replace(to_replace_str, &path);
-                        continue;
-                    }
-
-                    if !path.is_empty() {
-                        new_template = new_template.replace(to_replace_str, &path);
-                        matched = true;
-                    }
-                }
-                _ => {}
-            }
+            new_template = new_template.replace(to_replace_str, &value);
+            break;
         }
     }
 
@@ -322,7 +271,12 @@ pub mod test {
         );
 
         assert_eq!(
-            update_title("{{ title || title }}", &context, None),
+            update_title("{{ program || columns }}", &context),
+            String::from("64")
+        );
+
+        assert_eq!(
+            update_title("{{ title || title }}", &context),
             String::from("")
         );
 
