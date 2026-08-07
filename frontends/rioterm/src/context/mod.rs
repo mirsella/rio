@@ -69,14 +69,8 @@ pub struct Context<T: EventListener> {
 
 impl<T: rio_backend::event::EventListener> Drop for Context<T> {
     fn drop(&mut self) {
-        // Shutdown the terminal's PTY.
+        // The performer owns the PTY and terminates its child when it shuts down.
         let _ = self.messenger.channel.send(Msg::Shutdown);
-        // Also hang up synchronously: quit paths call process::exit
-        // right after dropping routes, before the reader thread can run
-        // its shutdown escalation. The handle is a no-op once the child
-        // was reaped, so no stale PID is ever signaled.
-        #[cfg(not(target_os = "windows"))]
-        let _ = self.child_terminator.hangup();
     }
 }
 
