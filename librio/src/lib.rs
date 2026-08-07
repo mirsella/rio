@@ -149,10 +149,10 @@ pub enum Action {
 /// nothing rather than forcing unsafe impls on the embedder.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait MaybeSendSync: Send + Sync {}
-#[cfg(not(target_arch = "wasm32"))]
-impl<T: Send + Sync> MaybeSendSync for T {}
 #[cfg(target_arch = "wasm32")]
 pub trait MaybeSendSync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync> MaybeSendSync for T {}
 #[cfg(target_arch = "wasm32")]
 impl<T> MaybeSendSync for T {}
 
@@ -1208,11 +1208,12 @@ impl Surface {
     /// integration.
     #[cfg(feature = "pty")]
     pub fn foreground_process_name(&self) -> String {
-        #[cfg(target_os = "windows")]
-        return String::new();
-
         #[cfg(not(target_os = "windows"))]
-        teletypewriter::foreground_process_name(self.main_fd, self.shell_pid)
+        {
+            teletypewriter::foreground_process_name(self.main_fd, self.shell_pid)
+        }
+        #[cfg(target_os = "windows")]
+        String::new()
     }
 
     /// Inject bytes into the terminal's DISPLAY (the VT parser), as if they

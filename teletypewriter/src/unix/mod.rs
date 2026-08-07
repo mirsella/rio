@@ -23,7 +23,7 @@ use std::ops::Deref;
 use std::os::fd::OwnedFd;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::ptr;
 
@@ -1039,12 +1039,7 @@ pub fn foreground_process_path(
 }
 
 /// Start a new process in the background.
-pub fn spawn_daemon<I, S>(
-    program: &str,
-    args: I,
-    main_fd: RawFd,
-    shell_pid: u32,
-) -> io::Result<()>
+pub fn spawn_daemon<I, S>(program: &str, args: I, cwd: Option<&Path>) -> io::Result<()>
 where
     I: IntoIterator<Item = S> + Copy,
     S: AsRef<std::ffi::OsStr>,
@@ -1055,7 +1050,7 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Ok(cwd) = foreground_process_path(main_fd, shell_pid) {
+    if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
     unsafe {
