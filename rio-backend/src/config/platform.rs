@@ -102,8 +102,34 @@ pub struct PlatformNavigation {
     pub open_config_with_split: Option<bool>,
     #[serde(default = "Option::default", rename = "unfocused-split-opacity")]
     pub unfocused_split_opacity: Option<f32>,
-    #[serde(default = "Option::default", rename = "tab-max-width")]
+    #[serde(default = "Option::default", rename = "tab-font-size")]
+    pub tab_font_size: Option<f32>,
+    #[serde(default = "Option::default", rename = "tab-bar-height")]
+    pub tab_bar_height: Option<f32>,
+    #[serde(
+        default = "Option::default",
+        rename = "tab-max-width",
+        alias = "max-tab-width"
+    )]
     pub tab_max_width: Option<f32>,
+    #[serde(default = "Option::default", rename = "tab-gap")]
+    pub tab_gap: Option<f32>,
+    #[serde(default = "Option::default", rename = "tab-inset-y")]
+    pub tab_inset_y: Option<f32>,
+    #[serde(default = "Option::default", rename = "tab-radius")]
+    pub tab_radius: Option<f32>,
+    #[serde(
+        default = "Option::default",
+        deserialize_with = "crate::config::colors::deserialize_to_arr_opt",
+        rename = "tab-fill"
+    )]
+    pub tab_fill: Option<crate::config::colors::ColorArray>,
+    #[serde(
+        default = "Option::default",
+        deserialize_with = "crate::config::colors::deserialize_to_arr_opt",
+        rename = "tab-fill-active"
+    )]
+    pub tab_fill_active: Option<crate::config::colors::ColorArray>,
     #[serde(
         default = "Option::default",
         deserialize_with = "crate::config::colors::deserialize_to_arr_opt",
