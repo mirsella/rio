@@ -119,17 +119,6 @@ impl Route<'_> {
     }
 
     #[inline]
-    #[allow(unused_variables)]
-    pub fn set_window_subtitle(&mut self, subtitle: &str) {
-        #[cfg(target_os = "macos")]
-        self.window.winit_window.set_subtitle(subtitle);
-    }
-
-    /// Set the native window title, deduplicating against the last
-    /// value: every upstream producer may poke redundantly (the whole
-    /// design converges instead of change-detecting), so the OS call
-    /// happens only when the text really changed.
-    #[inline]
     pub fn set_window_title(&mut self, title: &str) {
         if self.window.last_window_title == title {
             return;

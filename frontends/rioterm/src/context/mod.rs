@@ -7,7 +7,8 @@ use crate::ansi::{KeyboardModes, KeyboardModesApplyBehavior};
 use crate::context::title::{update_title, ContextTitle};
 use crate::event::sync::FairMutex;
 use crate::event::{Msg, RioEvent};
-pub use crate::layout::{ContextDimension, ContextGrid, ContextGridItem};
+use crate::ime::Ime;
+pub use crate::layout::{ContextDimension, ContextGrid};
 use crate::messenger::Messenger;
 use crate::performer::handler::Handler;
 use crate::performer::{self, Machine};
@@ -1063,87 +1064,22 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
-    /// Re-render one pane's title. Returns whether the displayed text
-    /// changed (the empty-content fallback is the pane's static
-    /// spawned program, so displayed text changes exactly when the
-    /// content does).
-    fn refresh_item_title(
-        template: &str,
-        context: &mut Context<T>,
-        prefetched_title: Option<&str>,
-    ) -> bool {
-        let content = update_title(template, context, prefetched_title);
-        if content == context.title.content {
-            return false;
-        }
-        context.title = ContextTitle { content };
-        true
-    }
+    pub fn update_titles(&mut self) {
+        let interval_time = Duration::from_secs(2);
+        if self
+            .last_title_update
+            .map(|i| i.elapsed() > interval_time)
+            .unwrap_or(true)
+        {
+            self.last_title_update = Some(Instant::now());
+            for grid in self.contexts.iter_mut() {
+                let content = update_title(&self.config.title.content, grid.current());
 
-    /// A pane's title data changed: an OSC 0/2 title (carried in
-    /// `raw_title`, so the common `{{ title }}` render never locks the
-    /// terminal) or an OSC 7 working directory (`raw_title` None: the
-    /// render re-reads the stored directory). A DISPLAYED pane (its
-    /// tab's current) re-renders immediately; a hidden pane is only
-    /// marked dirty (one flag write, no locks, no render) and renders
-    /// when it surfaces, so a background split streaming titles costs
-    /// nothing visible. One route scan serves every decision. Returns
-    /// whether the strip must repaint.
-    pub fn on_title_change(&mut self, route_id: usize, raw_title: Option<&str>) -> bool {
-        let Some(tab_index) = self.tab_index_for_route(route_id) else {
-            return false;
-        };
-        if self.contexts[tab_index].current().route_id != route_id {
-            if let Some(item) = self.contexts[tab_index].get_by_route_id(route_id) {
-                item.context_mut().title_dirty = true;
-            }
-            return false;
-        }
-        let template = self.config.title.content.clone();
-        let context = self.contexts[tab_index].current_mut();
-        context.title_dirty = false;
-        Self::refresh_item_title(&template, context, raw_title)
-    }
-
-    /// Mark every pane's title stale. For changes that affect panes no
-    /// walk re-renders (a resize changing `{{columns}}`, a config
-    /// reload changing the template), hidden splits and unwalked tabs
-    /// re-render lazily when they surface via `sync_current_route`.
-    pub fn mark_all_titles_dirty(&mut self) {
-        for grid in self.contexts.iter_mut() {
-            for item in grid.contexts_mut().values_mut() {
-                item.context_mut().title_dirty = true;
-            }
-        }
-    }
-
-    /// Re-render tab titles from local state: a config reload can
-    /// change the template, and a resize changes `{{columns}}`/
-    /// `{{lines}}`. OSC title and OSC 7 changes arrive via
-    /// `on_title_change` instead; nothing calls this on a timer. The
-    /// chrome repaint rides the returned flag, and one unconditional
-    /// titlebar poke per run makes the native title CONVERGE on the
-    /// displayed text (the poke is payload-less and deduped at the
-    /// sink, so a run that changed nothing costs one no-op event).
-    /// `only_current` restricts the walk to the displayed tab: with
-    /// the tab strip absent (navigation disabled) background tabs'
-    /// titles render nowhere, so refreshing them buys nothing.
-    pub fn update_titles(&mut self, only_current: bool) -> bool {
-        let template = self.config.title.content.clone();
-        let mut repaint = false;
-        let range = if only_current {
-            self.current_index..self.current_index + 1
-        } else {
-            0..self.contexts.len()
-        };
-        for index in range {
-            let context = self.contexts[index].current_mut();
-            context.title_dirty = false;
-            repaint |= Self::refresh_item_title(&template, context, None);
-        }
-        self.sync_window_title();
-        repaint
-    }
+                let extra = if self.config.should_update_title_extra {
+                    create_title_extra_from_context(grid.current())
+                } else {
+                    None
+                };
 
     /// The title the strip displays for `index`'s tab: the user rename,
     /// else the rendered content, else the foreground program, else
@@ -1161,6 +1097,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             if !context.spawned_program.is_empty() {
                 return context.spawned_program.clone();
             }
+            self.event_proxy.send_event(
+                RioEvent::Title(
+                    self.current().route_id,
+                    self.current().title.content.clone(),
+                ),
+                self.window_id,
+            );
         }
         String::from("~")
     }
@@ -1235,13 +1178,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn get_by_route_id(
-        &mut self,
-        route_id: usize,
-    ) -> Option<&mut ContextGridItem<T>> {
+    pub fn get_by_route_id(&mut self, route_id: usize) -> Option<&mut Context<T>> {
         self.contexts
             .iter_mut()
-            .find_map(|grid| grid.get_by_route_id(route_id))
+            .find_map(|grid| grid.get_by_route_id(route_id).map(|item| &mut item.val))
     }
 
     #[inline]
@@ -1294,6 +1234,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if context_id < self.contexts.len() {
             self.current_index = context_id;
             self.sync_current_route();
+            self.event_proxy.send_event(
+                RioEvent::Title(self.current_route, self.current().title.content.clone()),
+                self.window_id,
+            );
         }
     }
 
@@ -1373,14 +1317,14 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn switch_to_next(&mut self) {
         if self.step_tab(true) {
-            self.sync_current_route();
+            self.set_current(self.current_index);
         }
     }
 
     #[inline]
     pub fn switch_to_prev(&mut self) {
         if self.step_tab(false) {
-            self.sync_current_route();
+            self.set_current(self.current_index);
         }
     }
 
@@ -1427,30 +1371,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     pub fn split(&mut self, rich_text_id: usize, split_down: bool) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Some(path) = current_context.foreground_process_path() {
-                    working_dir = Some(path.to_string_lossy().to_string());
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
-            }
-        }
-
         let mut cloned_config = self.config.clone();
-        if working_dir.is_some() {
-            cloned_config.working_dir = working_dir;
-        }
+        cloned_config.working_dir = self.working_dir_for_new_context();
 
         let current = self.current();
         let cursor = current.cursor_from_ref();
@@ -1545,25 +1467,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn add_context(&mut self, redirect: bool, rich_text_id: usize) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Some(path) = current_context.foreground_process_path() {
-                    working_dir = Some(path.to_string_lossy().to_string());
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
-            }
-        }
+        let working_dir = self.working_dir_for_new_context();
 
         if self.config.is_native {
             self.event_proxy
@@ -1576,9 +1480,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             let last_index = self.contexts.len();
 
             let mut cloned_config = self.config.clone();
-            if working_dir.is_some() {
-                cloned_config.working_dir = working_dir;
-            }
+            cloned_config.working_dir = working_dir;
 
             let current = self.current();
             let cursor = current.cursor_from_ref();
@@ -1616,6 +1518,17 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     tracing::error!("not able to create a new context");
                 }
             }
+        }
+    }
+
+    fn working_dir_for_new_context(&self) -> Option<String> {
+        if self.config.cwd {
+            self.current()
+                .foreground_process_path()
+                .map(|path| path.to_string_lossy().into_owned())
+                .or_else(|| self.config.working_dir.clone())
+        } else {
+            self.config.working_dir.clone()
         }
     }
 
@@ -1684,6 +1597,18 @@ pub fn process_open_url(
 pub mod test {
     use super::*;
     use crate::event::VoidListener;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct TitleListener(Arc<Mutex<Vec<(usize, String)>>>);
+
+    impl EventListener for TitleListener {
+        fn send_event(&self, event: RioEvent, _id: WindowId) {
+            if let RioEvent::Title(route_id, title) = event {
+                self.0.lock().unwrap().push((route_id, title));
+            }
+        }
+    }
 
     #[derive(Clone, Default)]
     struct FocusRecorder(std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>>);
@@ -1813,7 +1738,34 @@ pub mod test {
         let found = context_manager
             .get_by_route_id(hidden_route_id)
             .expect("hidden tab's route_id must still resolve via get_by_route_id");
-        assert_eq!(found.val.route_id, hidden_route_id);
+        assert_eq!(found.route_id, hidden_route_id);
+    }
+
+    #[test]
+    fn update_titles_emits_only_the_current_tab() {
+        let listener = TitleListener::default();
+        let events = Arc::clone(&listener.0);
+        let mut manager =
+            ContextManager::start_with_capacity(3, listener, WindowId::from(0)).unwrap();
+        manager.add_context(true, 0);
+        manager.config.title.content = "{{columns}}".into();
+        manager.contexts[0].current_mut().dimension.columns = 80;
+        manager.contexts[1].current_mut().dimension.columns = 120;
+        manager.update_titles();
+
+        assert_eq!(manager.title(0).unwrap().content, "80");
+        assert_eq!(manager.title(1).unwrap().content, "120");
+        assert_eq!(
+            *events.lock().unwrap(),
+            [(manager.current().route_id, "120".into())]
+        );
+
+        events.lock().unwrap().clear();
+        manager.set_current(0);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [(manager.current().route_id, "80".into())]
+        );
     }
 
     #[test]

@@ -261,15 +261,6 @@ impl Listener {
                     },
                 );
             }
-            RioEvent::TitleWithSubtitle(title, subtitle) => {
-                self.delegate.action(
-                    self.surface_id,
-                    Action::SetTitle {
-                        title,
-                        subtitle: Some(subtitle),
-                    },
-                );
-            }
             RioEvent::Bell(_) => {
                 self.delegate.action(self.surface_id, Action::RingBell);
             }

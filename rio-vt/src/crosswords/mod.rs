@@ -3711,10 +3711,8 @@ impl<U: EventListener> Handler for Crosswords<U> {
             return;
         }
         self.current_directory = path;
-        self.event_proxy.send_event(
-            RioEvent::CurrentDirectoryChanged(self.route_id),
-            self.window_id,
-        );
+        self.event_proxy
+            .send_event(RioEvent::RenderRoute(self.route_id), self.window_id);
     }
 
     fn set_semantic_prompt(
@@ -8699,7 +8697,7 @@ mod tests {
                 .borrow()
                 .iter()
                 .filter(
-                    |e| matches!(e, RioEvent::CurrentDirectoryChanged(route) if *route == 7),
+                    |e| matches!(e, RioEvent::RenderRoute(route) if *route == 7),
                 )
                 .count()
         };
