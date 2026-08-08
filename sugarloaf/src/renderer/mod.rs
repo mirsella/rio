@@ -787,9 +787,8 @@ fn select_texture_evictions(
 /// Per-instance data for image rendering (one instance = one image placement).
 /// The vertex shader generates 4 quad corners from vertex_id.
 ///
-/// `pub` because it appears in the signature of
-/// `vulkan::VulkanRenderer::render_image_overlays` (also `pub` so
-/// the `Renderer` dispatcher can call it). Not part of the crate's
+/// `pub` because it appears in the Vulkan renderer's image preparation
+/// and phased-draw signatures. Not part of the crate's
 /// public API in spirit — just in visibility.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -812,8 +811,8 @@ pub struct ImageInstance {
 ///   cell-text passes — the kitty default for "image with text on top".
 /// - `AboveText` — `z >= 0`. Drawn after the cell-text pass; sits on
 ///   top of all glyphs.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ImageLayer {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImageLayer {
     BelowBg,
     BelowText,
     AboveText,
@@ -829,6 +828,27 @@ struct ImageDraw {
     image_id: u64,
     instance: ImageInstance,
     layer: ImageLayer,
+}
+
+/// Vulkan's image placements, grouped into contiguous painter phases.
+/// Instances are uploaded once before rendering starts; each phase only
+/// binds the corresponding texture descriptors and buffer offsets.
+#[cfg(target_os = "linux")]
+pub(crate) struct VulkanImageDraws {
+    draws: Vec<(ash::vk::DescriptorSet, ImageInstance)>,
+    below_bg_end: usize,
+    below_text_end: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl VulkanImageDraws {
+    pub(crate) fn range(&self, layer: ImageLayer) -> std::ops::Range<usize> {
+        match layer {
+            ImageLayer::BelowBg => 0..self.below_bg_end,
+            ImageLayer::BelowText => self.below_bg_end..self.below_text_end,
+            ImageLayer::AboveText => self.below_text_end..self.draws.len(),
+        }
+    }
 }
 
 /// Decoded background image pixels (RGBA8) waiting to be uploaded to the GPU.
@@ -2441,43 +2461,16 @@ impl Renderer {
         });
     }
 
-    /// Record sugarloaf's own draws inside the active dynamic-rendering
-    /// pass that `Sugarloaf::render_vulkan` opens. Order:
-    /// 1. Background image (full-screen quad).
-    /// 2. BelowText image overlays (kitty / sixel placements with
-    ///    `dest_pos.z < 0`).
-    /// 3. Rich-text quad pass — `quad()` / `rect()` calls + cell
-    ///    underline decorations (dashed/dotted/curly handled in
-    ///    `quad.frag.glsl`).
-    /// 4. Non-quad geometry — `polygon()` / `line()` / `triangle()`
-    ///    / `arc()` calls (cursor underline shape, hint highlights).
-    /// 5. AboveText image overlays.
-    /// 6. Optional bootstrap rect (`RIO_VULKAN_BOOTSTRAP=1`).
-    ///
-    /// Glyph atlas sampling through this pipeline isn't ported —
-    /// grid text + UI text overlay each own dedicated atlas
-    /// pipelines, so the rich-text path doesn't need it.
-    // `if let ImageTexture::Vulkan(...)` is irrefutable on Linux+no-wgpu
-    // because that's the only variant compiled in (Wgpu / Metal arms
-    // are cfg'd out). Keeping the `if let` form so the same code stays
-    // valid when wgpu support is enabled.
+    /// Resolve and upload every Vulkan image placement once, before the
+    /// render pass. The returned ranges are consumed at the three canonical
+    /// image painter phases.
     #[allow(irrefutable_let_patterns)]
     #[cfg(target_os = "linux")]
-    pub fn render_vulkan(
+    pub(crate) fn prepare_vulkan_images(
         &mut self,
-        cmd: ash::vk::CommandBuffer,
         frame: &crate::context::vulkan::VulkanFrame,
-    ) {
+    ) -> VulkanImageDraws {
         let viewport = [frame.extent.width as f32, frame.extent.height as f32];
-        let slot = frame.slot;
-
-        // Resolve image draws into (descriptor_set, instance) pairs
-        // before the &mut brush borrow takes hold; the per-image
-        // texture lookup needs an immutable borrow on
-        // `self.image_textures` which would conflict with the
-        // brush's `&mut self`.
-        // Keep both layers in one shared instance buffer, then draw each
-        // range at its proper point in the painter order.
         let resolve_draw = |draw: &ImageDraw| {
             let entry = self.image_textures.get(&draw.image_id)?;
             let ImageTexture::Vulkan(texture) = &entry.gpu else {
@@ -2485,42 +2478,83 @@ impl Renderer {
             };
             Some((texture.descriptor_set, draw.instance))
         };
-        let mut ordered: Vec<(ash::vk::DescriptorSet, ImageInstance)> = self
-            .image_draws
-            .iter()
-            .filter(|d| d.layer == ImageLayer::BelowText)
-            .filter_map(resolve_draw)
-            .collect();
-        let below_count = ordered.len();
-        ordered.extend(
-            self.image_draws
-                .iter()
-                .filter(|d| d.layer == ImageLayer::AboveText)
-                .filter_map(resolve_draw),
-        );
+        let mut draws = Vec::with_capacity(self.image_draws.len());
+        let layers = [
+            ImageLayer::BelowBg,
+            ImageLayer::BelowText,
+            ImageLayer::AboveText,
+        ];
+        let mut phase_ends = [0; 2];
+        for (phase, layer) in layers.into_iter().enumerate() {
+            draws.extend(
+                self.image_draws
+                    .iter()
+                    .filter(|draw| draw.layer == layer)
+                    .filter_map(resolve_draw),
+            );
+            if phase < phase_ends.len() {
+                phase_ends[phase] = draws.len();
+            }
+        }
 
         if let RendererType::Vulkan(brush) = &mut self.brush_type {
-            if let Some(bg) = &self.background_image_texture {
-                if let ImageTexture::Vulkan(tex) = &bg.gpu {
-                    brush.render_background_image(
-                        cmd,
-                        slot,
-                        viewport,
-                        tex.descriptor_set,
-                    );
-                }
-            }
+            brush.prepare_image_overlays(frame.slot, viewport, &draws);
+        }
+        VulkanImageDraws {
+            draws,
+            below_bg_end: phase_ends[0],
+            below_text_end: phase_ends[1],
+        }
+    }
 
-            brush.render_image_overlays(cmd, slot, viewport, &ordered, 0..below_count);
+    #[allow(irrefutable_let_patterns)]
+    #[cfg(target_os = "linux")]
+    pub(crate) fn render_vulkan_background(
+        &mut self,
+        cmd: ash::vk::CommandBuffer,
+        frame: &crate::context::vulkan::VulkanFrame,
+    ) {
+        let Some(bg) = &self.background_image_texture else {
+            return;
+        };
+        let ImageTexture::Vulkan(texture) = &bg.gpu else {
+            return;
+        };
+        if let RendererType::Vulkan(brush) = &mut self.brush_type {
+            brush.render_background_image(
+                cmd,
+                frame.slot,
+                [frame.extent.width as f32, frame.extent.height as f32],
+                texture.descriptor_set,
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn render_vulkan_images(
+        &mut self,
+        cmd: ash::vk::CommandBuffer,
+        frame: &crate::context::vulkan::VulkanFrame,
+        draws: &VulkanImageDraws,
+        layer: ImageLayer,
+    ) {
+        if let RendererType::Vulkan(brush) = &mut self.brush_type {
+            brush.draw_image_overlays(cmd, frame.slot, &draws.draws, draws.range(layer));
+        }
+    }
+
+    /// Draw immediate-mode UI geometry after terminal content and images.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn render_vulkan_ui(
+        &mut self,
+        cmd: ash::vk::CommandBuffer,
+        frame: &crate::context::vulkan::VulkanFrame,
+    ) {
+        let viewport = [frame.extent.width as f32, frame.extent.height as f32];
+        let slot = frame.slot;
+        if let RendererType::Vulkan(brush) = &mut self.brush_type {
             brush.render_quads(cmd, slot, viewport, &self.instances);
             brush.render_geometry(cmd, slot, viewport, &self.vertices);
-            brush.render_image_overlays(
-                cmd,
-                slot,
-                viewport,
-                &ordered,
-                below_count..ordered.len(),
-            );
             brush.draw_bootstrap(cmd);
         }
     }

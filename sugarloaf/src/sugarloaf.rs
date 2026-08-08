@@ -963,15 +963,9 @@ impl Sugarloaf<'_> {
     /// rich-text / images / UI text overlays all share one
     /// dynamic-rendering pass and one swapchain present.
     ///
-    /// Order of operations inside the pass:
-    ///   1. swapchain image barrier `UNDEFINED → COLOR_ATTACHMENT_OPTIMAL`
-    ///   2. `cmd_begin_rendering` with `LOAD_OP_CLEAR(bg)`
-    ///   3. set viewport + scissor
-    ///   4. per-panel `GridRenderer::render_vulkan` (Phase 3+)
-    ///   5. `VulkanRenderer::draw_bootstrap` (debug rect, gated by env)
-    ///   6. `cmd_end_rendering`
-    ///   7. swapchain image barrier `COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC_KHR`
-    ///   8. `present_frame` (queue submit + present)
+    /// Inside the pass, painter order is: background image, BelowBg images,
+    /// grid backgrounds, BelowText images, grid text, AboveText images, UI
+    /// geometry, then UI text. One acquire/barrier/pass/present wraps it all.
     #[inline]
     #[cfg(target_os = "linux")]
     pub fn render_vulkan(
@@ -1011,6 +1005,7 @@ impl Sugarloaf<'_> {
             grid.prepare_vulkan(ctx, cmd, frame.slot);
         }
         self.text.prepare_vulkan(ctx, cmd, frame.slot);
+        let image_draws = self.renderer.prepare_vulkan_images(&frame);
 
         vkr::cmd_acquire_image_for_rendering(&device, cmd, frame.image);
 
@@ -1048,21 +1043,35 @@ impl Sugarloaf<'_> {
             device.cmd_set_scissor(cmd, 0, &[scissor]);
         }
 
-        // Per-panel grid passes — draw cell backgrounds + grid text
-        // underneath everything else. Vulkan doesn't yet interleave
-        // kitty image layers around the bg/text split — same as the
-        // wgpu path; follow-up.
+        // Canonical painter order, matching GraphicLayer and the Metal/CPU
+        // backends: window image, BelowBg, all grid backgrounds, BelowText,
+        // all grid text, AboveText, then immediate-mode UI geometry/text.
+        self.renderer.render_vulkan_background(cmd, &frame);
+        self.renderer.render_vulkan_images(
+            cmd,
+            &frame,
+            &image_draws,
+            crate::renderer::ImageLayer::BelowBg,
+        );
         for (grid, uniforms) in grids.iter_mut() {
             grid.render_bg_vulkan(ctx, cmd, frame.slot, uniforms);
+        }
+        self.renderer.render_vulkan_images(
+            cmd,
+            &frame,
+            &image_draws,
+            crate::renderer::ImageLayer::BelowText,
+        );
+        for (grid, uniforms) in grids.iter_mut() {
             grid.render_text_vulkan(ctx, cmd, frame.slot, uniforms);
         }
-
-        // Rich-text quad pass — `Sugarloaf::quad()` / `rect()` calls
-        // (command palette background, search overlay panel,
-        // assistant frame, etc.). Drawn AFTER grid so panel chrome
-        // covers cells underneath, BEFORE the text overlay so labels
-        // sit on top.
-        self.renderer.render_vulkan(cmd, &frame);
+        self.renderer.render_vulkan_images(
+            cmd,
+            &frame,
+            &image_draws,
+            crate::renderer::ImageLayer::AboveText,
+        );
+        self.renderer.render_vulkan_ui(cmd, &frame);
 
         // UI text overlay (tab titles, search overlay labels,
         // command palette items, etc.). Drawn last so labels sit on
