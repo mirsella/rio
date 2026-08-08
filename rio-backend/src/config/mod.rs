@@ -378,6 +378,7 @@ impl Config {
             let content = std::fs::read_to_string(path).unwrap();
             match toml::from_str::<Config>(&content) {
                 Ok(mut decoded) => {
+                    decoded.overwrite_based_on_platform();
                     let theme = &decoded.theme;
                     if theme.is_empty() {
                         return decoded;
@@ -411,6 +412,7 @@ impl Config {
             match std::fs::read_to_string(path) {
                 Ok(content) => match toml::from_str::<Config>(&content) {
                     Ok(mut decoded) => {
+                        decoded.overwrite_based_on_platform();
                         let theme = &decoded.theme;
                         let theme_path = config_dir_path().join("themes");
                         if !theme.is_empty() {
@@ -500,6 +502,12 @@ impl Config {
         if let Some(macos) = &self.platform.macos {
             self.overwrite_with_platform_config(macos.clone());
         }
+
+        self.navigation.unfocused_split_opacity =
+            crate::config::navigation::clamp_unfocused_split_opacity(
+                self.navigation.unfocused_split_opacity,
+            );
+        self.navigation.clamp_tab_geometry();
     }
 
     fn overwrite_with_platform_config(&mut self, platform_config: PlatformConfig) {
@@ -597,21 +605,34 @@ impl Config {
             {
                 self.navigation.unfocused_split_opacity = unfocused_opacity;
             }
+            if let Some(font_size) = navigation_overwrite.tab_font_size {
+                self.navigation.tab_font_size = font_size;
+            }
+            if let Some(bar_height) = navigation_overwrite.tab_bar_height {
+                self.navigation.tab_bar_height = bar_height;
+            }
             if let Some(fill) = navigation_overwrite.unfocused_split_fill {
                 self.navigation.unfocused_split_fill = Some(fill);
             }
             if let Some(tab_max_width) = navigation_overwrite.tab_max_width {
                 self.navigation.tab_max_width = tab_max_width;
             }
+            if let Some(gap) = navigation_overwrite.tab_gap {
+                self.navigation.tab_gap = gap;
+            }
+            if let Some(inset) = navigation_overwrite.tab_inset_y {
+                self.navigation.tab_inset_y = inset;
+            }
+            if let Some(radius) = navigation_overwrite.tab_radius {
+                self.navigation.tab_radius = radius;
+            }
+            if let Some(fill) = navigation_overwrite.tab_fill {
+                self.navigation.tab_fill = Some(fill);
+            }
+            if let Some(fill) = navigation_overwrite.tab_fill_active {
+                self.navigation.tab_fill_active = Some(fill);
+            }
         }
-
-        // Clamp after platform merge so both the base and any override go
-        // through the same bound.
-        self.navigation.unfocused_split_opacity =
-            crate::config::navigation::clamp_unfocused_split_opacity(
-                self.navigation.unfocused_split_opacity,
-            );
-        self.navigation.clamp_tab_geometry();
 
         // Merge renderer fields individually
         if let Some(renderer_overwrite) = &platform_config.renderer {

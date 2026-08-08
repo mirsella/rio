@@ -63,7 +63,7 @@ impl Navigation {
         self.tab_bar_height = positive(self.tab_bar_height, 1.0);
         self.tab_max_width = non_negative(self.tab_max_width);
         self.tab_gap = non_negative(self.tab_gap);
-        self.tab_inset_y = non_negative(self.tab_inset_y);
+        self.tab_inset_y = non_negative(self.tab_inset_y).min(self.tab_bar_height / 2.0);
         self.tab_radius = non_negative(self.tab_radius);
     }
 }
@@ -209,7 +209,11 @@ pub struct Navigation {
     pub tab_bar_height: f32,
     /// Maximum width (logical px) of one tab. 0 = no cap: tabs expand
     /// to fill the whole strip.
-    #[serde(default = "default_tab_max_width", rename = "tab-max-width")]
+    #[serde(
+        default = "default_tab_max_width",
+        rename = "tab-max-width",
+        alias = "max-tab-width"
+    )]
     pub tab_max_width: f32,
     /// Horizontal gap (logical px) between tab islands. 0 = tabs touch.
     #[serde(default = "default_tab_gap", rename = "tab-gap")]
