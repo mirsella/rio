@@ -15,8 +15,8 @@ use std::sync::OnceLock;
 use fontconfig_sys as fc;
 use fontconfig_sys::constants::{
     FC_ANTIALIAS, FC_CHARSET, FC_FAMILY, FC_FILE, FC_HINTING, FC_HINT_NONE,
-    FC_HINT_STYLE, FC_INDEX, FC_LANG, FC_MONO, FC_RGBA, FC_SLANT, FC_SLANT_ITALIC,
-    FC_SPACING, FC_WEIGHT, FC_WEIGHT_BOLD,
+    FC_HINT_STYLE, FC_INDEX, FC_LANG, FC_MONO, FC_SLANT, FC_SLANT_ITALIC, FC_SPACING,
+    FC_WEIGHT, FC_WEIGHT_BOLD,
 };
 
 /// Process-global fontconfig handle. `FcConfigGetCurrent` returns a
@@ -213,13 +213,11 @@ unsafe fn pattern_path_and_index(pattern: *mut fc::FcPattern) -> Option<(PathBuf
 }
 
 /// Rendering preferences fontconfig reports for a family, used as
-/// defaults when the Rio config leaves them unset. `rgba` carries the
-/// `FC_RGBA_*` subpixel order for the renderer.
+/// defaults when the Rio config leaves them unset.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FcRenderSettings {
     pub antialias: Option<bool>,
     pub hinting: Option<bool>,
-    pub rgba: Option<i32>,
 }
 
 /// Query fontconfig for the render settings it would apply to
@@ -276,13 +274,6 @@ pub fn render_settings(family: &str) -> FcRenderSettings {
                 hinting = Some(false);
             }
             out.hinting = hinting;
-
-            let mut rgba: i32 = 0;
-            if fc::FcPatternGetInteger(matched, FC_RGBA.as_ptr(), 0, &mut rgba)
-                == fc::FcResultMatch
-            {
-                out.rgba = Some(rgba);
-            }
 
             fc::FcPatternDestroy(matched);
         }
