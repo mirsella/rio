@@ -125,11 +125,9 @@ fn resolve_working_dir(path: &str) -> Option<String> {
 }
 
 impl Overrides {
-    /// Applies the platform blocks, then the launch flags, to a freshly
-    /// loaded config.
+    /// Applies the launch flags to a freshly loaded config. Platform blocks
+    /// are already merged by `Config::load`/`try_load`.
     pub fn apply(&self, config: &mut rio_backend::config::Config) {
-        config.overwrite_based_on_platform();
-
         if let Some(shell) = &self.shell {
             config.shell = shell.clone();
             config.use_fork = false;
