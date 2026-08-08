@@ -622,6 +622,11 @@ fn trim_match_tail(text: &str) -> usize {
         .len()
 }
 
+/// A regex match after hint post-processing (see [`trim_match_tail`]).
+pub(crate) fn trim_match(text: &str) -> &str {
+    &text[..trim_match_tail(text)]
+}
+
 /// URI scheme prefixes that should never be resolved as file paths.
 /// Matches the scheme branch of `DEFAULT_URL_REGEX`.
 const URI_SCHEMES: &[&str] = &[
