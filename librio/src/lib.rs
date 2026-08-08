@@ -1203,12 +1203,6 @@ impl Surface {
 impl Drop for Surface {
     fn drop(&mut self) {
         let _ = self.channel.send(Msg::Shutdown);
-        // Also hang up synchronously: an embedder may exit the process
-        // right after dropping the surface, before the reader thread can
-        // run its shutdown escalation. The handle is a no-op once the
-        // child was reaped, so no stale PID is ever signaled.
-        #[cfg(not(target_os = "windows"))]
-        let _ = self.child_terminator.hangup();
     }
 }
 
