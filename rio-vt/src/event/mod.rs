@@ -190,23 +190,8 @@ pub enum RioEvent {
     /// Grid has changed possibly requiring a mouse cursor shape change.
     MouseCursorDirty,
 
-    /// Terminal title change from the PTY identified by `route_id`.
+    /// Window title change from a terminal route.
     Title(usize, String),
-
-    /// Working directory change (OSC 7) from the PTY identified by
-    /// `route_id`. Payload-less: the handler re-reads the terminal's
-    /// stored directory, which the emitter already committed.
-    CurrentDirectoryChanged(usize),
-
-    /// Ask the event loop to refresh the native titlebar from the
-    /// currently displayed pane. Payload-less on purpose: the handler
-    /// re-reads the displayed title at handling time, so a queued poke
-    /// can never overwrite a newer title with a stale snapshot, and
-    /// redundant pokes dedupe at the sink.
-    SyncWindowTitle,
-
-    /// Window title change.
-    TitleWithSubtitle(String, String),
 
     /// Reset to the default window title.
     ResetTitle,
@@ -316,14 +301,7 @@ impl Debug for RioEvent {
                 write!(f, "PtyWrite(route={route_id}, {text})")
             }
             RioEvent::Title(route_id, title) => {
-                write!(f, "Title route {route_id} ({title})")
-            }
-            RioEvent::CurrentDirectoryChanged(route_id) => {
-                write!(f, "CurrentDirectoryChanged route {route_id}")
-            }
-            RioEvent::SyncWindowTitle => write!(f, "SyncWindowTitle"),
-            RioEvent::TitleWithSubtitle(title, subtitle) => {
-                write!(f, "TitleWithSubtitle({title}, {subtitle})")
+                write!(f, "Title(route={route_id}, {title})")
             }
             RioEvent::Minimize(cond) => write!(f, "Minimize({cond})"),
             RioEvent::Hide => write!(f, "Hide)"),
