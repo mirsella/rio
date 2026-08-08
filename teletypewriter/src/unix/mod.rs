@@ -708,7 +708,6 @@ pub fn create_pty_with_spawn(
             let ptsname: String = tty_ptsname(main).unwrap_or_else(|_| "".to_string());
             let child_unix = Child {
                 id: main,
-                ptsname,
                 pid: child_process.id().try_into().unwrap(),
                 exited: false,
             };
@@ -812,7 +811,6 @@ pub fn create_pty_with_fork(
             let ptsname: String = tty_ptsname(main).unwrap_or_else(|_| "".to_string());
             let child = Child {
                 id: main,
-                ptsname,
                 pid: id,
                 exited: false,
             };
@@ -874,8 +872,6 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 pub struct Child {
     pub id: libc::c_int,
     pub pid: libc::pid_t,
-    #[allow(dead_code)]
-    ptsname: String,
     exited: bool,
 }
 
@@ -907,21 +903,27 @@ impl Child {
 
     /// Return the child’s exit status if it has already exited. If the child is still running, return Ok(None).
     /// https://linux.die.net/man/2/waitpid
-    pub fn waitpid(&mut self) -> Result<Option<i32>, String> {
-        let mut status = 0 as libc::c_int;
-        // If WNOHANG was specified in options and there were no children in a waitable state, then waitid() returns 0 immediately and the state of the siginfo_t structure pointed to by infop is unspecified. To distinguish this case from that where a child was in a waitable state, zero out the si_pid field before the call and check for a nonzero value in this field after the call returns.
-        let res =
-            unsafe { waitpid(self.pid, &mut status as *mut libc::c_int, libc::WNOHANG) };
-        if res <= -1 {
-            return Err(String::from("error"));
+    pub fn waitpid(&mut self) -> io::Result<Option<i32>> {
+        loop {
+            let mut status = 0;
+            match unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) } {
+                -1 => {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    if error.raw_os_error() == Some(libc::ECHILD) {
+                        self.exited = true;
+                    }
+                    return Err(error);
+                }
+                0 => return Ok(None),
+                _ => {
+                    self.exited = true;
+                    return Ok(Some(status));
+                }
+            }
         }
-
-        if res == 0 && status == 0 {
-            return Ok(None);
-        }
-
-        self.exited = true;
-        Ok(Some(status))
     }
 }
 
@@ -940,9 +942,65 @@ impl Deref for Child {
 
 impl Drop for Child {
     fn drop(&mut self) {
-        if !self.exited {
-            unsafe {
-                libc::kill(self.pid, libc::SIGHUP);
+        if self.exited {
+            return;
+        }
+
+        match self.waitpid() {
+            Ok(Some(_)) => return,
+            Err(_) if self.exited => return,
+            Err(error) => {
+                tracing::warn!("failed to inspect PTY child before shutdown: {error}");
+                return;
+            }
+            Ok(None) => {}
+        }
+
+        let pid = self.pid;
+        unsafe { libc::kill(pid, libc::SIGHUP) };
+        if let Err(error) =
+            std::thread::Builder::new()
+                .name("pty-reaper".into())
+                .spawn(move || {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    loop {
+                        let mut status = 0;
+                        match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
+                            child if child == pid => return,
+                            -1 if io::Error::last_os_error().kind()
+                                == io::ErrorKind::Interrupted =>
+                            {
+                                continue;
+                            }
+                            -1 => return,
+                            _ if std::time::Instant::now() >= deadline => break,
+                            _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+                        }
+                    }
+
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    loop {
+                        let mut status = 0;
+                        match unsafe { libc::waitpid(pid, &mut status, 0) } {
+                            child if child == pid => return,
+                            -1 if io::Error::last_os_error().kind()
+                                == io::ErrorKind::Interrupted => {}
+                            _ => return,
+                        }
+                    }
+                })
+        {
+            tracing::error!("failed to start PTY child reaper: {error}");
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            loop {
+                let mut status = 0;
+                match unsafe { libc::waitpid(pid, &mut status, 0) } {
+                    child if child == pid => break,
+                    -1 if io::Error::last_os_error().kind()
+                        == io::ErrorKind::Interrupted => {}
+                    _ => break,
+                }
             }
         }
     }
@@ -972,8 +1030,9 @@ impl EventedPty for Pty {
             }
 
             match self.child.waitpid() {
-                Err(_e) => {
-                    // std::process::exit(1);
+                Err(_) if self.child.exited => Some(ChildEvent::Exited(None)),
+                Err(error) => {
+                    tracing::warn!("failed to collect PTY child status: {error}");
                     None
                 }
                 Ok(None) => None,
@@ -1165,6 +1224,154 @@ mod resolve_working_dir_tests {
         ] {
             assert_eq!(resolve_working_dir(input).unwrap(), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod child_wait_tests {
+    use super::Child;
+
+    fn exited_child(code: libc::c_int) -> libc::pid_t {
+        match unsafe { libc::fork() } {
+            0 => unsafe { libc::_exit(code) },
+            pid if pid > 0 => pid,
+            _ => panic!("fork failed: {}", std::io::Error::last_os_error()),
+        }
+    }
+
+    fn live_child(ignore_hangup: bool) -> libc::pid_t {
+        let mut ready = [0; 2];
+        if unsafe { libc::pipe(ready.as_mut_ptr()) } == -1 {
+            panic!("pipe failed: {}", std::io::Error::last_os_error());
+        }
+
+        match unsafe { libc::fork() } {
+            0 => unsafe {
+                libc::close(ready[0]);
+                libc::signal(
+                    libc::SIGHUP,
+                    if ignore_hangup {
+                        libc::SIG_IGN
+                    } else {
+                        libc::SIG_DFL
+                    },
+                );
+                let ready_byte = 1_u8;
+                if libc::write(ready[1], &ready_byte as *const u8 as *const _, 1) != 1 {
+                    libc::_exit(127);
+                }
+                libc::close(ready[1]);
+                loop {
+                    libc::pause();
+                }
+            },
+            pid if pid > 0 => {
+                unsafe {
+                    libc::close(ready[1]);
+                }
+                let mut ready_byte = 0_u8;
+                loop {
+                    match unsafe {
+                        libc::read(ready[0], &mut ready_byte as *mut u8 as *mut _, 1)
+                    } {
+                        1 => break,
+                        -1 if std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::Interrupted => {}
+                        result => panic!("child readiness failed: read={result}"),
+                    }
+                }
+                unsafe {
+                    libc::close(ready[0]);
+                }
+                pid
+            }
+            _ => {
+                unsafe {
+                    libc::close(ready[0]);
+                    libc::close(ready[1]);
+                }
+                panic!("fork failed: {}", std::io::Error::last_os_error());
+            }
+        }
+    }
+
+    fn assert_drop_reaps_child(pid: libc::pid_t, timeout: std::time::Duration) {
+        drop(Child {
+            id: -1,
+            pid,
+            exited: false,
+        });
+
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let mut status = 0;
+            match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
+                child if child == pid => break,
+                -1 if std::io::Error::last_os_error().raw_os_error()
+                    == Some(libc::ECHILD) =>
+                {
+                    break;
+                }
+                0 if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => panic!("child was not reaped before timeout: waitpid={result}"),
+            }
+        }
+    }
+
+    #[test]
+    fn waitpid_reports_normal_exit() {
+        let pid = exited_child(7);
+        let mut child = Child {
+            id: -1,
+            pid,
+            exited: false,
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let status = loop {
+            if let Some(status) = child.waitpid().unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "child did not exit");
+            std::thread::yield_now();
+        };
+
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 7);
+    }
+
+    #[test]
+    fn waitpid_marks_externally_reaped_child_exited() {
+        let pid = exited_child(0);
+        let mut status = 0;
+        while unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted
+            );
+        }
+
+        let mut child = Child {
+            id: -1,
+            pid,
+            exited: false,
+        };
+        let error = child.waitpid().unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+        assert!(child.exited);
+    }
+
+    #[test]
+    fn dropping_live_child_terminates_and_reaps_it() {
+        assert_drop_reaps_child(live_child(false), std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn dropping_child_that_ignores_hangup_escalates_and_reaps_it() {
+        assert_drop_reaps_child(live_child(true), std::time::Duration::from_secs(3));
     }
 }
 
