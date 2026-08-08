@@ -179,16 +179,7 @@ impl Listener {
                     },
                 );
             }
-            RioEvent::TitleWithSubtitle(title, subtitle) => {
-                self.delegate.action(
-                    self.surface_id,
-                    Action::SetTitle {
-                        title,
-                        subtitle: Some(subtitle),
-                    },
-                );
-            }
-            RioEvent::Bell(_) => {
+            RioEvent::Bell => {
                 self.delegate.action(self.surface_id, Action::RingBell);
             }
             RioEvent::CursorBlinkingChange | RioEvent::CursorBlinkingChangeOnRoute(_) => {
