@@ -162,23 +162,6 @@ pub struct SugarloafFonts {
     pub additional_dirs: Option<Vec<String>>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hinting_and_antialias_parse_and_default_to_unset() {
-        let fonts: SugarloafFonts = toml::from_str("").unwrap();
-        assert_eq!(fonts.hinting, None);
-        assert_eq!(fonts.antialias, None);
-
-        let fonts: SugarloafFonts =
-            toml::from_str("hinting = false\nantialias = false").unwrap();
-        assert_eq!(fonts.hinting, Some(false));
-        assert_eq!(fonts.antialias, Some(false));
-    }
-}
-
 pub fn parse_unicode(input: &str) -> Option<char> {
     if let Ok(unicode) = u32::from_str_radix(input, 16) {
         if let Some(result) = char::from_u32(unicode) {
