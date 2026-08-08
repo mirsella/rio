@@ -1488,9 +1488,6 @@ impl Screen<'_> {
     }
 
     pub fn split_right_with_config(&mut self, config: rio_backend::config::Config) {
-        // Allocate panel id; position lands on `ContextDimension`
-        // through the Taffy layout pass (`apply_taffy_layout`).
-        let _ = config.margin.left;
         let rich_text_id = next_rich_text_id();
         self.context_manager.split_from_config(
             rich_text_id,
@@ -1573,9 +1570,6 @@ impl Screen<'_> {
         self.context_manager.contexts_mut()[old_index]
             .update_dimensions(&mut self.sugarloaf);
 
-        // Allocate panel id; the layout pass handles positioning via
-        // `ContextDimension` once the new tab's grid is built.
-        let _ = self.context_manager.current_grid().scaled_margin.left;
         let rich_text_id = next_rich_text_id();
         self.context_manager.add_context(redirect, rich_text_id);
         let new_index = self.context_manager.current_index();
