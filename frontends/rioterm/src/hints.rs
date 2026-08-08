@@ -484,54 +484,36 @@ pub fn resolve_path_for_opening(text: &str, cwd: Option<&Path>) -> Option<PathBu
 }
 
 /// Apply post-processing to hyperlink URIs (same as in screen/mod.rs)
-fn post_process_hyperlink_uri(uri: &str) -> String {
-    let chars: Vec<char> = uri.chars().collect();
-    if chars.is_empty() {
-        return String::new();
-    }
-
-    let mut end_idx = chars.len() - 1;
+pub(crate) fn post_process_hyperlink_uri(uri: &str) -> String {
+    let mut end = uri.len();
     let mut open_parents = 0;
     let mut open_brackets = 0;
 
-    // First pass: handle uneven brackets/parentheses
-    for (i, &c) in chars.iter().enumerate() {
+    for (index, c) in uri.char_indices() {
         match c {
             '(' => open_parents += 1,
             '[' => open_brackets += 1,
             ')' => {
                 if open_parents == 0 {
-                    // Unmatched closing parenthesis, truncate here
-                    end_idx = i.saturating_sub(1);
+                    end = index;
                     break;
-                } else {
-                    open_parents -= 1;
                 }
+                open_parents -= 1;
             }
             ']' => {
                 if open_brackets == 0 {
-                    // Unmatched closing bracket, truncate here
-                    end_idx = i.saturating_sub(1);
+                    end = index;
                     break;
-                } else {
-                    open_brackets -= 1;
                 }
+                open_brackets -= 1;
             }
             _ => (),
         }
     }
 
-    // Second pass: remove trailing delimiters
-    while end_idx > 0 {
-        match chars[end_idx] {
-            '.' | ',' | ':' | ';' | '?' | '!' | '(' | '[' | '\'' => {
-                end_idx = end_idx.saturating_sub(1);
-            }
-            _ => break,
-        }
-    }
-
-    chars.into_iter().take(end_idx + 1).collect()
+    uri[..end]
+        .trim_end_matches(['.', ',', ':', ';', '?', '!', '(', '[', '\''])
+        .to_string()
 }
 
 #[cfg(test)]

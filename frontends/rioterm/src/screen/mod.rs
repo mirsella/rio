@@ -2151,7 +2151,7 @@ impl Screen<'_> {
 
         let mut uri = hyperlink.uri().to_string();
         if hint_config.post_processing {
-            uri = post_process_hyperlink_uri(&uri);
+            uri = crate::hints::post_process_hyperlink_uri(&uri);
         }
 
         Some(crate::hints::HintMatch {
@@ -2193,49 +2193,24 @@ impl Screen<'_> {
                 continue;
             }
             let start_col = byte_to_col[start];
-            let last_col = byte_to_col[end - 1];
-            let end_col = if grid[point.row][last_col].is_wide() {
-                last_col + 1
-            } else {
-                last_col
-            };
+            let mut match_text = line_text[start..end].to_string();
+            if hint_config.post_processing {
+                match_text = crate::hints::post_process_hyperlink_uri(&match_text);
+            }
+            if match_text.is_empty() {
+                continue;
+            }
 
-            // Check if the point is within this match
+            let mut end_col = byte_to_col[start + match_text.len() - 1];
+            if grid[point.row][end_col].is_wide() {
+                end_col += 1;
+            }
+
             if point.col >= start_col && point.col <= end_col {
-                let original_match_text = line_text[start..end].to_string();
-                let mut match_text = original_match_text.clone();
-
-                // Apply grid-based post-processing
-                let (processed_start, processed_end) = if hint_config.post_processing {
-                    self.hint_post_processing(
-                        terminal,
-                        start_col,
-                        end_col,
-                        rio_backend::crosswords::pos::Line(point.row.0),
-                    )
-                    .unwrap_or((start_col, end_col))
-                } else {
-                    (start_col, end_col)
-                };
-
-                // Extract the processed text
-                if hint_config.post_processing {
-                    let mut processed_text = String::new();
-                    for col in processed_start.0..=processed_end.0 {
-                        let cell =
-                            &grid[point.row][rio_backend::crosswords::pos::Column(col)];
-                        processed_text.push(cell.c());
-                    }
-                    match_text = processed_text.trim_end().to_string();
-                }
-
                 return Some(crate::hints::HintMatch {
                     text: match_text,
-                    start: rio_backend::crosswords::pos::Pos::new(
-                        point.row,
-                        processed_start,
-                    ),
-                    end: rio_backend::crosswords::pos::Pos::new(point.row, processed_end),
+                    start: rio_backend::crosswords::pos::Pos::new(point.row, start_col),
+                    end: rio_backend::crosswords::pos::Pos::new(point.row, end_col),
                     hint: hint_config,
                 });
             }
@@ -2298,7 +2273,7 @@ impl Screen<'_> {
 
     fn open_hyperlink(&self, hyperlink: Hyperlink) {
         // Apply post-processing to remove trailing delimiters and handle uneven brackets
-        let processed_uri = post_process_hyperlink_uri(hyperlink.uri());
+        let processed_uri = crate::hints::post_process_hyperlink_uri(hyperlink.uri());
 
         self.open_with_default_handler(&processed_uri);
     }
@@ -4810,100 +4785,6 @@ impl Screen<'_> {
             .renderable_content
             .hint_labels = hint_labels;
     }
-
-    /// Apply grid-based hint post-processing.
-    ///
-    /// This iterates through the terminal grid character by character and adjusts
-    /// the match bounds based on bracket balance and trailing delimiters.
-    fn hint_post_processing(
-        &self,
-        terminal: &rio_backend::crosswords::Crosswords<EventProxy>,
-        start_col: rio_backend::crosswords::pos::Column,
-        end_col: rio_backend::crosswords::pos::Column,
-        row: rio_backend::crosswords::pos::Line,
-    ) -> Option<(
-        rio_backend::crosswords::pos::Column,
-        rio_backend::crosswords::pos::Column,
-    )> {
-        use rio_backend::crosswords::grid::BidirectionalIterator;
-
-        let grid = &terminal.grid;
-        let start_pos = rio_backend::crosswords::pos::Pos::new(row, start_col);
-        let end_pos = rio_backend::crosswords::pos::Pos::new(row, end_col);
-
-        let mut iter = grid.iter_from(start_pos);
-        let mut current_pos = start_pos;
-        let mut open_parents = 0;
-        let mut open_brackets = 0;
-
-        // First pass: handle uneven brackets/parentheses
-        while current_pos <= end_pos {
-            if let Some(indexed) = iter.next() {
-                let c = indexed.square.c();
-                current_pos = indexed.pos;
-
-                match c {
-                    '(' => open_parents += 1,
-                    '[' => open_brackets += 1,
-                    ')' => {
-                        if open_parents == 0 {
-                            // Unmatched closing parenthesis, truncate here
-                            if iter.prev().is_some() {
-                                return Some((start_col, iter.pos().col));
-                            }
-                            break;
-                        } else {
-                            open_parents -= 1;
-                        }
-                    }
-                    ']' => {
-                        if open_brackets == 0 {
-                            // Unmatched closing bracket, truncate here
-                            if iter.prev().is_some() {
-                                return Some((start_col, iter.pos().col));
-                            }
-                            break;
-                        } else {
-                            open_brackets -= 1;
-                        }
-                    }
-                    _ => (),
-                }
-
-                if current_pos == end_pos {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        // Second pass: remove trailing delimiters
-        let mut final_end = end_pos;
-        let mut iter = grid.iter_from(end_pos);
-
-        while final_end > start_pos {
-            if let Some(indexed) = iter.next() {
-                let c = indexed.square.c();
-                if !matches!(c, '.' | ',' | ':' | ';' | '?' | '!' | '(' | '[' | '\'') {
-                    break;
-                }
-
-                if let Some(prev_indexed) = iter.prev() {
-                    final_end = prev_indexed.pos;
-                    if iter.prev().is_some() {
-                        // Move iterator back one more position for next iteration
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        Some((start_col, final_end.col))
-    }
 }
 
 /// Open `target` with whatever Windows has registered for it, without a
@@ -4949,57 +4830,6 @@ fn pointer_release_clipboard_targets(copy_on_select: bool) -> &'static [Clipboar
     }
 }
 
-/// Apply post-processing to hyperlink URIs to remove trailing delimiters and handle uneven brackets.
-fn post_process_hyperlink_uri(uri: &str) -> String {
-    let chars: Vec<char> = uri.chars().collect();
-    if chars.is_empty() {
-        return String::new();
-    }
-
-    let mut end_idx = chars.len() - 1;
-    let mut open_parents = 0;
-    let mut open_brackets = 0;
-
-    // First pass: handle uneven brackets/parentheses
-    for (i, &c) in chars.iter().enumerate() {
-        match c {
-            '(' => open_parents += 1,
-            '[' => open_brackets += 1,
-            ')' => {
-                if open_parents == 0 {
-                    // Unmatched closing parenthesis, truncate here
-                    end_idx = i.saturating_sub(1);
-                    break;
-                } else {
-                    open_parents -= 1;
-                }
-            }
-            ']' => {
-                if open_brackets == 0 {
-                    // Unmatched closing bracket, truncate here
-                    end_idx = i.saturating_sub(1);
-                    break;
-                } else {
-                    open_brackets -= 1;
-                }
-            }
-            _ => (),
-        }
-    }
-
-    // Second pass: remove trailing delimiters
-    while end_idx > 0 {
-        match chars[end_idx] {
-            '.' | ',' | ':' | ';' | '?' | '!' | '(' | '[' | '\'' => {
-                end_idx = end_idx.saturating_sub(1);
-            }
-            _ => break,
-        }
-    }
-
-    chars.into_iter().take(end_idx + 1).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5039,57 +4869,63 @@ mod tests {
 
     #[test]
     fn test_post_process_hyperlink_uri() {
+        assert_eq!(crate::hints::post_process_hyperlink_uri(")"), "");
+
         // Test removing trailing parenthesis
         assert_eq!(
-            post_process_hyperlink_uri("https://example.com)"),
+            crate::hints::post_process_hyperlink_uri("https://example.com)"),
             "https://example.com"
         );
 
         // Test removing trailing comma
         assert_eq!(
-            post_process_hyperlink_uri("https://example.com,"),
+            crate::hints::post_process_hyperlink_uri("https://example.com,"),
             "https://example.com"
         );
 
         // Test removing trailing period
         assert_eq!(
-            post_process_hyperlink_uri("https://example.com."),
+            crate::hints::post_process_hyperlink_uri("https://example.com."),
             "https://example.com"
         );
 
         // Test handling balanced parentheses (should keep them)
         assert_eq!(
-            post_process_hyperlink_uri("https://example.com/path(with)parens"),
+            crate::hints::post_process_hyperlink_uri(
+                "https://example.com/path(with)parens"
+            ),
             "https://example.com/path(with)parens"
         );
 
         // Test handling unbalanced parentheses
         assert_eq!(
-            post_process_hyperlink_uri("https://example.com/path)"),
+            crate::hints::post_process_hyperlink_uri("https://example.com/path)"),
             "https://example.com/path"
         );
 
         // Test handling multiple trailing delimiters
         assert_eq!(
-            post_process_hyperlink_uri("https://example.com.'),"),
+            crate::hints::post_process_hyperlink_uri("https://example.com.'),"),
             "https://example.com"
         );
 
         // Test markdown-style URLs
         assert_eq!(
-            post_process_hyperlink_uri("https://example.com)"),
+            crate::hints::post_process_hyperlink_uri("https://example.com)"),
             "https://example.com"
         );
 
         // Test handling unbalanced brackets
         assert_eq!(
-            post_process_hyperlink_uri("https://example.com/path]"),
+            crate::hints::post_process_hyperlink_uri("https://example.com/path]"),
             "https://example.com/path"
         );
 
         // Test balanced brackets (should keep them)
         assert_eq!(
-            post_process_hyperlink_uri("https://example.com/path[with]brackets"),
+            crate::hints::post_process_hyperlink_uri(
+                "https://example.com/path[with]brackets"
+            ),
             "https://example.com/path[with]brackets"
         );
     }
