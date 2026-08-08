@@ -221,14 +221,7 @@ pub struct FontLibrary {
 
 impl FontLibrary {
     pub fn new(spec: SugarloafFonts) -> (Self, Option<SugarloafErrors>) {
-        let mut font_library = FontLibraryData::default();
-
-        let mut sugarloaf_errors = None;
-
-        let fonts_not_found = font_library.load(spec);
-        if !fonts_not_found.is_empty() {
-            sugarloaf_errors = Some(SugarloafErrors { fonts_not_found });
-        }
+        let (font_library, sugarloaf_errors) = Self::load_data(spec);
 
         (
             Self {
@@ -238,16 +231,23 @@ impl FontLibrary {
         )
     }
 
-    /// Replace loaded font data while retaining per-terminal glyph registries.
-    pub fn replace_fonts(&self, replacement: Self) {
-        let Ok(replacement) = Arc::try_unwrap(replacement.inner) else {
-            tracing::warn!("ignoring shared font library replacement");
-            return;
-        };
-        let mut replacement = replacement.into_inner();
+    fn load_data(spec: SugarloafFonts) -> (FontLibraryData, Option<SugarloafErrors>) {
+        let mut data = FontLibraryData::default();
+        let fonts_not_found = data.load(spec);
+        let errors =
+            (!fonts_not_found.is_empty()).then_some(SugarloafErrors { fonts_not_found });
+        (data, errors)
+    }
+
+    /// Reload configured fonts in place while retaining every live per-terminal
+    /// glyph registry. All clones observe the update through the existing Arc.
+    pub fn reload(&self, spec: SugarloafFonts) -> Option<SugarloafErrors> {
+        clear_font_data_cache();
+        let (mut replacement, errors) = Self::load_data(spec);
         let mut current = self.inner.write();
         replacement.glyph_registries = std::mem::take(&mut current.glyph_registries);
         *current = replacement;
+        errors
     }
 
     /// Parsed CoreText font for `font_id` — a direct read of the handle
@@ -2401,32 +2401,21 @@ mod glyph_registry_install_tests {
     }
 
     #[test]
-    fn replacing_fonts_preserves_glyph_registries() {
+    fn reloading_fonts_preserves_glyph_registries_for_all_clones() {
         let library = FontLibrary::default();
         let observer = library.clone();
         let registry = GlyphRegistry::new();
         library.install_glyph_registry(42, registry.clone());
 
-        let replacement = FontLibrary::default();
-        replacement.inner.write().hinting = false;
-        library.replace_fonts(replacement);
+        let spec = SugarloafFonts {
+            hinting: Some(false),
+            ..SugarloafFonts::default()
+        };
+        library.reload(spec);
 
         assert!(library
             .glyph_registry_for(42)
             .is_some_and(|installed| installed.ptr_eq(&registry)));
         assert!(!observer.inner.read().hinting);
-    }
-
-    #[test]
-    fn replacing_fonts_rejects_shared_replacement() {
-        let library = FontLibrary::default();
-        let replacement = FontLibrary::default();
-        replacement.inner.write().hinting = false;
-        let replacement_observer = replacement.clone();
-
-        library.replace_fonts(replacement);
-
-        assert!(library.inner.read().hinting);
-        assert!(!replacement_observer.inner.read().hinting);
     }
 }

@@ -267,9 +267,6 @@ impl Sugarloaf<'_> {
     pub fn update_font(&mut self, font_library: &FontLibrary) {
         tracing::info!("requested a font change");
 
-        // Clear the global font data cache to ensure fonts are reloaded
-        crate::font::clear_font_data_cache();
-
         // Clear the atlas to remove old font glyphs
         self.renderer.clear_atlas();
         // Cached tinted glyphs alias the old atlas coordinates — drop them.

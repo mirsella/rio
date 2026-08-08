@@ -559,11 +559,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 let has_binding_updates = self.config.bindings != config.bindings;
 
                 let font_library_errors = if has_font_updates {
-                    let new_font_library = rio_backend::sugarloaf::font::FontLibrary::new(
-                        config.fonts.to_owned(),
-                    );
-                    self.router.font_library.replace_fonts(new_font_library.0);
-                    new_font_library.1
+                    self.router.font_library.reload(config.fonts.to_owned())
                 } else {
                     None
                 };
