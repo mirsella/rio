@@ -282,6 +282,7 @@ impl Sugarloaf<'_> {
         // Glyph resolutions point at the old font ids — drop them.
         self.font_cache.clear();
 
+        self.text.update_font_library(font_library);
         self.state.reset();
         self.state.set_fonts(font_library, &mut self.renderer);
     }

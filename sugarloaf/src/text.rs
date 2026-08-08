@@ -207,6 +207,41 @@ impl Text {
         }
     }
 
+    pub fn update_font_library(&mut self, font_library: &FontLibrary) {
+        self.font_library = font_library.clone();
+        self.instances.clear();
+        self.font_resolve.clear();
+        self.synthesis_cache.clear();
+        #[cfg(not(target_os = "macos"))]
+        self.wght_variation_cache.clear();
+        self.ascent_cache.clear();
+        self.shape_cache.clear();
+        #[cfg(target_os = "macos")]
+        self.handle_cache.clear();
+        #[cfg(not(target_os = "macos"))]
+        self.font_data_cache.clear();
+
+        #[cfg(target_os = "macos")]
+        if let Some(state) = &mut self.metal {
+            state.atlas_grayscale.clear();
+            state.atlas_color.clear();
+        }
+        #[cfg(all(feature = "wgpu", not(target_os = "macos")))]
+        if let Some(state) = &mut self.wgpu {
+            state.atlas_grayscale.clear();
+            state.atlas_color.clear();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(state) = &mut self.vulkan {
+            state.atlas_grayscale.clear();
+            state.atlas_color.clear();
+        }
+        if let Some(state) = &mut self.cpu {
+            state.atlas_grayscale.clear();
+            state.atlas_color.clear();
+        }
+    }
+
     /// Idempotent CPU-state init. Call once before the first
     /// `draw()` on the CPU backend; subsequent calls are no-ops.
     pub fn init_cpu(&mut self) {
