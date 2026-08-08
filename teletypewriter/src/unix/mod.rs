@@ -52,7 +52,7 @@ extern "C" {
 
 }
 
-fn reset_child_signals() {
+fn reset_child_signals() -> io::Result<()> {
     unsafe {
         for signal in [
             libc::SIGABRT,
@@ -72,12 +72,19 @@ fn reset_child_signals() {
             libc::SIGTTIN,
             libc::SIGTTOU,
         ] {
-            libc::signal(signal, libc::SIG_DFL);
+            if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(io::Error::last_os_error());
+            }
         }
         let mut mask = std::mem::zeroed();
-        libc::sigemptyset(&mut mask);
-        libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+        if libc::sigemptyset(&mut mask) == -1
+            || libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
     }
+
+    Ok(())
 }
 
 /// Expand a leading `~` against the current user's home directory.
@@ -173,7 +180,9 @@ impl ShellCommand {
     }
 
     fn exec(&self) -> ! {
-        reset_child_signals();
+        if reset_child_signals().is_err() {
+            unsafe { libc::_exit(126) };
+        }
         unsafe {
             libc::execvp(self.program.as_ptr(), self.argv_ptrs.as_ptr());
             libc::_exit(127);
@@ -662,7 +671,7 @@ pub fn create_pty_with_spawn(
                 set_controlling_terminal(child)?;
             }
 
-            reset_child_signals();
+            reset_child_signals()?;
 
             Ok(())
         });
@@ -684,11 +693,8 @@ pub fn create_pty_with_spawn(
 
     match builder.spawn() {
         Ok(child_process) => {
-            let child = Child {
-                id: main,
-                pid: child_process.id().try_into().unwrap(),
-                exited: false,
-            };
+            // Establish lifecycle ownership before any fallible parent-side setup.
+            let child = Child::new(main, child_process.id() as libc::pid_t);
             set_nonblocking(main)?;
 
             Ok(Pty {
@@ -775,11 +781,8 @@ pub fn create_pty_with_fork(
         }
         id if id > 0 => {
             let file = unsafe { File::from_raw_fd(main) };
-            let child = Child {
-                id: main,
-                pid: id,
-                exited: false,
-            };
+            // Establish lifecycle ownership before any fallible parent-side setup.
+            let child = Child::new(main, id);
             set_cloexec(main)?;
             set_nonblocking(main)?;
             Ok(Pty {
@@ -842,7 +845,15 @@ pub struct Child {
 }
 
 impl Child {
-    pub fn set_winsize(&self, winsize_builder: WinsizeBuilder) -> io::Result<()> {
+    fn new(id: RawFd, pid: libc::pid_t) -> Self {
+        Self {
+            id,
+            pid,
+            exited: false,
+        }
+    }
+
+    fn set_winsize(&self, winsize_builder: WinsizeBuilder) -> io::Result<()> {
         let winsize: Winsize = winsize_builder.build();
         match unsafe { libc::ioctl(self.id, TIOCSWINSZ, &winsize as *const _) } {
             -1 => Err(io::Error::last_os_error()),
@@ -850,28 +861,49 @@ impl Child {
         }
     }
 
-    pub fn waitpid(&mut self) -> io::Result<Option<i32>> {
-        loop {
-            let mut status = 0;
-            match unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) } {
-                -1 => {
-                    let error = io::Error::last_os_error();
-                    if error.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    if error.raw_os_error() == Some(libc::ECHILD) {
-                        self.exited = true;
-                    }
+    fn try_wait(&mut self) -> io::Result<Option<i32>> {
+        let result = wait_for_child(self.pid, libc::WNOHANG);
+        if matches!(&result, Ok(Some(_)))
+            || matches!(&result, Err(error) if error.raw_os_error() == Some(libc::ECHILD))
+        {
+            self.exited = true;
+        }
+        result
+    }
+}
+
+fn wait_for_child(pid: libc::pid_t, options: libc::c_int) -> io::Result<Option<i32>> {
+    loop {
+        let mut status = 0;
+        match unsafe { libc::waitpid(pid, &mut status, options) } {
+            -1 => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
                     return Err(error);
                 }
-                0 => return Ok(None),
-                _ => {
-                    self.exited = true;
-                    return Ok(Some(status));
-                }
             }
+            0 => return Ok(None),
+            _ => return Ok(Some(status)),
         }
     }
+}
+
+fn reap_child(pid: libc::pid_t) {
+    let _ = wait_for_child(pid, 0);
+}
+
+fn terminate_and_reap_child(pid: libc::pid_t) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match wait_for_child(pid, libc::WNOHANG) {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if std::time::Instant::now() >= deadline => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    reap_child(pid);
 }
 
 impl Drop for Child {
@@ -880,7 +912,7 @@ impl Drop for Child {
             return;
         }
 
-        match self.waitpid() {
+        match self.try_wait() {
             Ok(Some(_)) => return,
             Err(_) if self.exited => return,
             Err(error) => {
@@ -892,50 +924,13 @@ impl Drop for Child {
 
         let pid = self.pid;
         unsafe { libc::kill(pid, libc::SIGHUP) };
-        if let Err(error) =
-            std::thread::Builder::new()
-                .name("pty-reaper".into())
-                .spawn(move || {
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(1);
-                    loop {
-                        let mut status = 0;
-                        match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
-                            child if child == pid => return,
-                            -1 if io::Error::last_os_error().kind()
-                                == io::ErrorKind::Interrupted =>
-                            {
-                                continue;
-                            }
-                            -1 => return,
-                            _ if std::time::Instant::now() >= deadline => break,
-                            _ => std::thread::sleep(std::time::Duration::from_millis(10)),
-                        }
-                    }
-
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                    loop {
-                        let mut status = 0;
-                        match unsafe { libc::waitpid(pid, &mut status, 0) } {
-                            child if child == pid => return,
-                            -1 if io::Error::last_os_error().kind()
-                                == io::ErrorKind::Interrupted => {}
-                            _ => return,
-                        }
-                    }
-                })
+        if let Err(error) = std::thread::Builder::new()
+            .name("pty-reaper".into())
+            .spawn(move || terminate_and_reap_child(pid))
         {
             tracing::error!("failed to start PTY child reaper: {error}");
             unsafe { libc::kill(pid, libc::SIGKILL) };
-            loop {
-                let mut status = 0;
-                match unsafe { libc::waitpid(pid, &mut status, 0) } {
-                    child if child == pid => break,
-                    -1 if io::Error::last_os_error().kind()
-                        == io::ErrorKind::Interrupted => {}
-                    _ => break,
-                }
-            }
+            reap_child(pid);
         }
     }
 }
@@ -948,7 +943,7 @@ impl EventedPty for Pty {
                 return None;
             }
 
-            match self.child.waitpid() {
+            match self.child.try_wait() {
                 Err(_) if self.child.exited => Some(ChildEvent::Exited(None)),
                 Err(error) => {
                     tracing::warn!("failed to collect PTY child status: {error}");
@@ -1197,11 +1192,7 @@ mod child_wait_tests {
     }
 
     fn assert_drop_reaps_child(pid: libc::pid_t, timeout: std::time::Duration) {
-        drop(Child {
-            id: -1,
-            pid,
-            exited: false,
-        });
+        drop(Child::new(-1, pid));
 
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -1224,15 +1215,11 @@ mod child_wait_tests {
     #[test]
     fn waitpid_reports_normal_exit() {
         let pid = exited_child(7);
-        let mut child = Child {
-            id: -1,
-            pid,
-            exited: false,
-        };
+        let mut child = Child::new(-1, pid);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let status = loop {
-            if let Some(status) = child.waitpid().unwrap() {
+            if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
             assert!(std::time::Instant::now() < deadline, "child did not exit");
@@ -1254,12 +1241,8 @@ mod child_wait_tests {
             );
         }
 
-        let mut child = Child {
-            id: -1,
-            pid,
-            exited: false,
-        };
-        let error = child.waitpid().unwrap_err();
+        let mut child = Child::new(-1, pid);
+        let error = child.try_wait().unwrap_err();
 
         assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
         assert!(child.exited);
