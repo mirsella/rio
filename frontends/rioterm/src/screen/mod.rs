@@ -879,13 +879,11 @@ impl Screen<'_> {
             let text = key.text_with_all_modifiers().unwrap_or_default();
             for character in text.chars() {
                 let terminal = self.context_manager.current().terminal.lock();
-                if let Some(hint_match) =
+                if let Some((hint_match, paste)) =
                     self.hint_state.keyboard_input(&*terminal, character)
                 {
                     drop(terminal);
-                    self.execute_hint_action(&hint_match, clipboard);
-                    // Stop hint mode and update state with proper damage tracking
-                    self.hint_state.stop();
+                    self.execute_hint_action(&hint_match, clipboard, paste);
                     self.update_hint_state();
                     self.mark_dirty();
                     return;
@@ -2116,7 +2114,7 @@ impl Screen<'_> {
             Pos::new(viewport_point.row - display_offset, viewport_point.col);
 
         // Find hint at mouse position
-        let highlighted_hint = self.find_hint_at_point(&terminal, mouse_point, mods);
+        let highlighted_hint = self.find_hint_at_point(&terminal, mouse_point);
         drop(terminal);
         self.last_hint_probe = Some((viewport_point, mods));
 
@@ -2235,35 +2233,31 @@ impl Screen<'_> {
         &self,
         terminal: &rio_backend::crosswords::Crosswords<EventProxy>,
         point: rio_backend::crosswords::pos::Pos,
-        _modifiers: rio_window::keyboard::ModifiersState,
     ) -> Option<crate::hints::HintMatch> {
-        // The logical line under the point is rule-independent:
-        // extracted lazily on the first regex rule, then shared across
-        // the remaining rules.
-        let mut logical_line: Option<Option<crate::hints::LogicalLine>> = None;
-
-        // Check each enabled hint configuration
+        // Prefer OSC targets even when a regex from an earlier configuration
+        // also matches the cell.
         for hint_config in &self.hints_config {
-            // Check if mouse highlighting is enabled for this hint
-            if !hint_config.mouse.enabled {
+            if !hint_config.mouse.enabled
+                || !hint_config.hyperlinks
+                || !self.modifiers_match(&hint_config.mouse.mods)
+            {
                 continue;
             }
 
-            // Check if current modifiers match the required modifiers for this hint
-            if !self.modifiers_match(&hint_config.mouse.mods) {
+            if let Some(hyperlink_match) =
+                self.find_hyperlink_at_point(terminal, point, hint_config.clone())
+            {
+                return Some(hyperlink_match);
+            }
+        }
+
+        let mut logical_line: Option<Option<crate::hints::LogicalLine>> = None;
+        for hint_config in &self.hints_config {
+            if !hint_config.mouse.enabled
+                || !self.modifiers_match(&hint_config.mouse.mods)
+            {
                 continue;
             }
-
-            // Check hyperlinks if enabled
-            if hint_config.hyperlinks {
-                if let Some(hyperlink_match) =
-                    self.find_hyperlink_at_point(terminal, point)
-                {
-                    return Some(hyperlink_match);
-                }
-            }
-
-            // Check regex patterns if specified
             if let Some(regex_pattern) = &hint_config.regex {
                 if let Some(regex) = self.compiled_hint_regex(regex_pattern) {
                     let line = logical_line.get_or_insert_with(|| {
@@ -2296,6 +2290,7 @@ impl Screen<'_> {
         &self,
         terminal: &rio_backend::crosswords::Crosswords<EventProxy>,
         point: rio_backend::crosswords::pos::Pos,
+        hint_config: std::rc::Rc<rio_backend::config::hints::Hint>,
     ) -> Option<crate::hints::HintMatch> {
         let grid = &terminal.grid;
 
@@ -2332,24 +2327,12 @@ impl Screen<'_> {
             }
         }
 
-        // Build a synthetic hint config so the rest of the hint
-        // pipeline (highlighting, click action) treats this just like
-        // a regex/url match.
-        let hint_config = std::rc::Rc::new(rio_backend::config::hints::Hint {
-            regex: None,
-            hyperlinks: true,
-            post_processing: true,
-            persist: false,
-            action: rio_backend::config::hints::HintAction::Action {
-                action: rio_backend::config::hints::HintInternalAction::Open,
-            },
-            mouse: rio_backend::config::hints::HintMouse::default(),
-            binding: None,
-        });
-
         let mut uri = hyperlink.uri().to_string();
         if hint_config.post_processing {
             uri = crate::hints::post_process_hyperlink_uri(&uri);
+        }
+        if uri.is_empty() {
+            return None;
         }
 
         Some(crate::hints::HintMatch {
@@ -2419,7 +2402,7 @@ impl Screen<'_> {
         // (Copy) would otherwise leave the underline painted until
         // unrelated output touches those rows.
         self.clear_highlighted_hint();
-        self.execute_hint_action(&latched, clipboard);
+        self.execute_hint_action(&latched, clipboard, false);
     }
 
     /// Hand `target` to the platform's default handler.
@@ -4818,23 +4801,6 @@ impl Screen<'_> {
         }
     }
 
-    /// Process a new character for keyboard hints
-    #[allow(dead_code)]
-    pub fn hint_input(&mut self, c: char, clipboard: &mut Clipboard) {
-        let terminal = self.context_manager.current().terminal.lock();
-        if let Some(hint_match) = self.hint_state.keyboard_input(&*terminal, c) {
-            drop(terminal);
-            self.execute_hint_action(&hint_match, clipboard);
-            // Stop hint mode and update state with proper damage tracking
-            self.hint_state.stop();
-            self.update_hint_state();
-        } else {
-            drop(terminal);
-            self.update_hint_state();
-        }
-        self.mark_dirty();
-    }
-
     /// Start hint mode with the given hint configuration
     pub fn start_hint_mode(
         &mut self,
@@ -4875,6 +4841,7 @@ impl Screen<'_> {
         &mut self,
         hint_match: &crate::hints::HintMatch,
         clipboard: &mut Clipboard,
+        paste: bool,
     ) {
         use rio_backend::config::hints::{HintAction, HintCommand, HintInternalAction};
 
@@ -4882,6 +4849,9 @@ impl Screen<'_> {
             HintAction::Action { action } => match action {
                 HintInternalAction::Copy => {
                     clipboard.set(ClipboardType::Clipboard, hint_match.text.clone());
+                    if paste {
+                        self.paste(&hint_match.text, true);
+                    }
                 }
                 HintInternalAction::Paste => {
                     self.paste(&hint_match.text, true);
