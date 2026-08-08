@@ -19,7 +19,6 @@ use std::fs::File;
 use std::io;
 use std::io::Error;
 use std::mem::MaybeUninit;
-use std::ops::Deref;
 use std::os::fd::OwnedFd;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
@@ -53,7 +52,6 @@ extern "C" {
         winsize: *const Winsize,
     ) -> libc::pid_t;
 
-    fn ptsname(fd: *mut libc::c_int) -> *mut libc::c_char;
 }
 
 fn reset_child_signals() {
@@ -111,7 +109,7 @@ fn expand_tilde(dir: &str) -> Option<String> {
 /// directory. Unusable values fall back to inheriting the parent's
 /// directory with a warning instead of failing the spawn or silently
 /// landing somewhere unexpected.
-pub fn resolve_working_dir(dir: Option<&str>) -> io::Result<Option<String>> {
+fn resolve_working_dir(dir: Option<&str>) -> io::Result<Option<String>> {
     let Some(dir) = dir else {
         return Ok(None);
     };
@@ -463,8 +461,7 @@ impl ShellUser {
             },
         };
 
-        #[allow(unused_mut)]
-        let mut shell = match std::env::var("SHELL") {
+        let shell = match std::env::var("SHELL") {
             Ok(env_shell) => env_shell,
             Err(_) => match pw {
                 Ok(ref pw) => pw.shell.to_owned(),
@@ -516,12 +513,6 @@ fn login_argv(
     argv
 }
 
-/// Creates a pseudoterminal using spawn.
-///
-/// The [`create_pty`] creates a pseudoterminal with similar behavior as tty,
-/// which is a command in Unix and Unix-like operating systems to print the file name of the
-/// terminal connected to standard input. tty stands for TeleTYpewriter.
-///
 /// `env`, when given, is applied on top of the inherited environment,
 /// overriding inherited variables of the same name. `None` inherits as-is.
 ///
@@ -529,9 +520,6 @@ fn login_argv(
 /// is looked up and, on macOS, wrapped in `/usr/bin/login` so the child gets a
 /// login session. A caller that names a program gets exactly that program,
 /// spawned directly, with no `login` in between.
-///
-/// It returns two [`Pty`] along with respective process name [`String`] and process id (`libc::pid_`)
-///
 #[allow(clippy::too_many_arguments)]
 pub fn create_pty_with_spawn(
     shell: Option<&str>,
@@ -621,6 +609,7 @@ pub fn create_pty_with_spawn(
 
     // No program means the caller wants the user's default shell, which is the
     // only case that goes through `login`. A named program is spawned as given.
+    #[cfg(target_os = "macos")]
     let uses_default_shell = shell.is_none();
     let shell_program = shell.unwrap_or(&user.shell);
 
@@ -632,8 +621,7 @@ pub fn create_pty_with_spawn(
             if uses_default_shell {
                 // On macOS, use /usr/bin/login to ensure proper login shell environment
                 // This ensures PATH includes directories like /usr/local/bin
-                let hushlogin =
-                    std::path::Path::new(&user.home).join(".hushlogin").exists();
+                let hushlogin = Path::new(&user.home).join(".hushlogin").exists();
 
                 let mut login_cmd = Command::new("/usr/bin/login");
                 login_cmd.args(login_argv(hushlogin, &user.user, shell_program, &args));
@@ -658,7 +646,7 @@ pub fn create_pty_with_spawn(
     {
         // If running inside a flatpak sandbox.
         // Must retrieve $SHELL from outside the sandbox, so ask the host.
-        if std::path::PathBuf::from("/.flatpak-info").exists() {
+        if PathBuf::from("/.flatpak-info").exists() {
             builder = Command::new("flatpak-spawn");
 
             let mut with_args = vec![
@@ -669,10 +657,7 @@ pub fn create_pty_with_spawn(
             ];
 
             if let Some(directory) = &working_directory {
-                with_args.push(format!(
-                    "--directory={}",
-                    std::path::Path::new(directory).display()
-                ));
+                with_args.push(format!("--directory={}", Path::new(directory).display()));
             }
 
             let output = std::process::Command::new("flatpak-spawn")
@@ -720,7 +705,7 @@ pub fn create_pty_with_spawn(
 
     // Handle set working directory option.
     if let Some(dir) = &working_directory {
-        if std::path::Path::new(dir).is_dir() {
+        if Path::new(dir).is_dir() {
             builder.current_dir(dir);
         } else {
             tracing::warn!(
@@ -734,8 +719,7 @@ pub fn create_pty_with_spawn(
 
     match builder.spawn() {
         Ok(child_process) => {
-            let ptsname: String = tty_ptsname(main).unwrap_or_else(|_| "".to_string());
-            let child_unix = Child {
+            let child = Child {
                 id: main,
                 pid: child_process.id().try_into().unwrap(),
                 exited: false,
@@ -743,7 +727,7 @@ pub fn create_pty_with_spawn(
             set_nonblocking(main)?;
 
             Ok(Pty {
-                child: child_unix,
+                child,
                 file,
                 token: corcovado::Token::from(0),
                 signals,
@@ -761,25 +745,7 @@ pub fn create_pty_with_spawn(
     }
 }
 
-///
-/// Creates a pseudoterminal using fork.
-///
-/// The [`create_pty`] creates a pseudoterminal with similar behavior as tty,
-/// which is a command in Unix and Unix-like operating systems to print the file name of the
-/// terminal connected to standard input. tty stands for TeleTYpewriter.
-///
-/// It returns two [`Pty`] along with respective process name [`String`] and process id (`libc::pid_`)
-///
-/// The shell a spawn falls back to when none is configured: `$SHELL`,
-/// else the passwd entry. Public so per-shell decisions made before
-/// spawning (title program name, shell integration) match what
-/// actually spawns.
-pub fn default_shell_program() -> String {
-    ShellUser::from_env()
-        .map(|user| user.shell)
-        .unwrap_or_default()
-}
-
+/// Creates a pseudoterminal using `forkpty`.
 pub fn create_pty_with_fork(
     shell: Option<&str>,
     args: &[String],
@@ -846,11 +812,6 @@ pub fn create_pty_with_fork(
         }
         id if id > 0 => {
             let file = unsafe { File::from_raw_fd(main) };
-            // TODO: Currently we fork the process and don't wait to know if led to failure
-            // Whenever it happens it will just simply shut down the teletyperwriter
-            // In the future add an option to check before release the method
-            let file = unsafe { File::from_raw_fd(main) };
-            let ptsname: String = tty_ptsname(main).unwrap_or_else(|_| "".to_string());
             let child = Child {
                 id: main,
                 pid: id,
@@ -919,23 +880,6 @@ pub struct Child {
 }
 
 impl Child {
-    /// The tcgetwinsize function fills in the winsize structure pointed to by
-    ///  gws with values that represent the size of the terminal window for which
-    ///  fd provides an open file descriptor.  If no error occurs tcgetwinsize()
-    ///  returns zero (0).
-    ///  The tcsetwinsize function sets the terminal window size, for the terminal
-    ///  referenced by fd, to the sizes from the winsize structure pointed to by
-    ///  sws.  If no error occurs tcsetwinsize() returns zero (0).
-    ///  The winsize structure, defined in <termios.h>, contains (at least) the
-    ///  following four fields
-    ///  unsigned short ws_row;      /* Number of rows, in characters */
-    ///  unsigned short ws_col;      /* Number of columns, in characters */
-    ///  unsigned short ws_xpixel;   /* Width, in pixels */
-    ///  unsigned short ws_ypixel;   /* Height, in pixels */
-    /// If the actual window size of the controlling terminal of a process
-    /// changes, the process is sent a SIGWINCH signal.  See signal(7).  Note
-    /// simply changing the sizes using tcsetwinsize() does not necessarily
-    /// change the actual window size, and if not, will not generate a SIGWINCH.
     pub fn set_winsize(&self, winsize_builder: WinsizeBuilder) -> io::Result<()> {
         let winsize: Winsize = winsize_builder.build();
         match unsafe { libc::ioctl(self.id, TIOCSWINSZ, &winsize as *const _) } {
@@ -944,8 +888,6 @@ impl Child {
         }
     }
 
-    /// Return the child’s exit status if it has already exited. If the child is still running, return Ok(None).
-    /// https://linux.die.net/man/2/waitpid
     pub fn waitpid(&mut self) -> io::Result<Option<i32>> {
         loop {
             let mut status = 0;
@@ -967,19 +909,6 @@ impl Child {
                 }
             }
         }
-    }
-}
-
-pub fn kill_pid(pid: i32) {
-    unsafe {
-        libc::kill(pid, libc::SIGHUP);
-    }
-}
-
-impl Deref for Child {
-    type Target = libc::c_int;
-    fn deref(&self) -> &libc::c_int {
-        &self.id
     }
 }
 
@@ -1047,21 +976,6 @@ impl Drop for Child {
             }
         }
     }
-}
-
-pub fn command_per_pid(pid: libc::pid_t) -> String {
-    let current_process_name = Command::new("ps")
-        .arg("-p")
-        .arg(format!("{pid:}"))
-        .arg("-o")
-        .arg("comm=")
-        .output()
-        .expect("failed to execute process")
-        .stdout;
-
-    std::str::from_utf8(&current_process_name)
-        .unwrap_or("")
-        .to_string()
 }
 
 impl EventedPty for Pty {
@@ -1145,24 +1059,6 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>, Error> {
         dir: unsafe { CStr::from_ptr(entry.pw_dir).to_str().unwrap() },
         shell: unsafe { CStr::from_ptr(entry.pw_shell).to_str().unwrap() },
     })
-}
-
-/// Unsafe
-/// Return tty pts name [`String`]
-///
-/// # Safety
-///
-/// This function is unsafe because it contains the usage of `libc::ptsname`
-/// from libc that's naturally unsafe.
-pub fn tty_ptsname(fd: libc::c_int) -> Result<String, String> {
-    let c_str: &CStr = unsafe {
-        let name_ptr = ptsname(fd as *mut _);
-        CStr::from_ptr(name_ptr)
-    };
-    let str_slice: &str = c_str.to_str().unwrap();
-    let str_buf: String = str_slice.to_owned();
-
-    Ok(str_buf)
 }
 
 pub fn foreground_process_name(main_fd: RawFd, shell_pid: u32) -> String {
