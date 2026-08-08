@@ -1139,15 +1139,10 @@ const SHAPING_FLAG_MASK: u16 = StyleFlags::BOLD.bits() | StyleFlags::ITALIC.bits
 const RUN_BUCKET_COUNT: usize = 256;
 const RUN_BUCKET_SIZE: usize = 8;
 
-/// One shaped glyph. Same shape from both CoreText (macOS) and swash
-/// (non-macOS). `cluster` is a UTF-8 byte offset into the run string.
+/// One shaped glyph. `cluster` is a UTF-8 byte offset into the run string.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // `x` / `y` / `advance` kept for future kerning-aware layout
 struct ShapedGlyph {
     id: u16,
-    x: f32,
-    y: f32,
-    advance: f32,
     cluster: u32,
 }
 
@@ -1532,9 +1527,6 @@ fn shape_run_ct(
         .iter()
         .map(|g| ShapedGlyph {
             id: g.id,
-            x: g.x,
-            y: g.y,
-            advance: g.advance,
             cluster: g.cluster,
         })
         .collect();
@@ -1609,9 +1601,6 @@ fn shape_run_swash(
         for g in cluster.glyphs {
             glyphs.push(ShapedGlyph {
                 id: g.id,
-                x: g.x,
-                y: g.y,
-                advance: g.advance,
                 cluster: byte_offset,
             });
         }
