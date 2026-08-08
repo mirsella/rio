@@ -239,6 +239,18 @@ impl FontLibrary {
         )
     }
 
+    /// Replace loaded font data while retaining per-terminal glyph registries.
+    pub fn replace_fonts(&self, replacement: Self) {
+        let Ok(replacement) = Arc::try_unwrap(replacement.inner) else {
+            tracing::warn!("ignoring shared font library replacement");
+            return;
+        };
+        let mut replacement = replacement.into_inner();
+        let mut current = self.inner.write();
+        replacement.glyph_registries = std::mem::take(&mut current.glyph_registries);
+        *current = replacement;
+    }
+
     /// Parsed CoreText font for `font_id` — a direct read of the handle
     /// stored on the corresponding `FontData` (per-font pointer rather
     /// than a library-global cache).
@@ -2387,5 +2399,35 @@ mod glyph_registry_install_tests {
 
         assert!(library.glyph_registry_for(1).unwrap().ptr_eq(&a));
         assert!(library.glyph_registry_for(2).unwrap().ptr_eq(&b));
+    }
+
+    #[test]
+    fn replacing_fonts_preserves_glyph_registries() {
+        let library = FontLibrary::default();
+        let observer = library.clone();
+        let registry = GlyphRegistry::new();
+        library.install_glyph_registry(42, registry.clone());
+
+        let replacement = FontLibrary::default();
+        replacement.inner.write().hinting = false;
+        library.replace_fonts(replacement);
+
+        assert!(library
+            .glyph_registry_for(42)
+            .is_some_and(|installed| installed.ptr_eq(&registry)));
+        assert!(!observer.inner.read().hinting);
+    }
+
+    #[test]
+    fn replacing_fonts_rejects_shared_replacement() {
+        let library = FontLibrary::default();
+        let replacement = FontLibrary::default();
+        replacement.inner.write().hinting = false;
+        let replacement_observer = replacement.clone();
+
+        library.replace_fonts(replacement);
+
+        assert!(library.inner.read().hinting);
+        assert!(!replacement_observer.inner.read().hinting);
     }
 }
