@@ -519,7 +519,7 @@ const DECORATION_FONT_ID_BASE: u32 = 0xFFFF_FF00;
 /// cursor/decoration ranges and never collides with a real font index.
 /// The atlas `glyph_id` for a registered cell is
 /// `pack_atlas_glyph_id(codepoint, version)`.
-use rio_backend::sugarloaf::font::glyph_registry::CUSTOM_GLYPH_FONT_ID_U32;
+use rio_backend::sugarloaf::font::glyph_registry::{is_pua, CUSTOM_GLYPH_FONT_ID_U32};
 
 /// Sentinel font_id base for cursor sprites. Distinct from the
 /// decoration range so the two never collide in the atlas
@@ -1491,6 +1491,15 @@ impl GridGlyphRasterizer {
         // faces the user loaded), and non-ASCII can hit fallback.
         if style_flags == 0 && (' '..='~').contains(&ch) {
             return (rio_backend::sugarloaf::font::FONT_ID_REGULAR as u32, false);
+        }
+
+        // Glyph Protocol registrations can change without replacing the font
+        // library, so PUA resolution must always consult the live registry.
+        if is_pua(ch as u32) {
+            let span_style = span_style_for_flags(style_flags);
+            let (id, emoji) =
+                font_library.resolve_font_for_char(ch, &span_style, Some(route_id));
+            return (id as u32, emoji);
         }
 
         *self
@@ -3503,6 +3512,34 @@ mod cluster_text_tests {
             out.push(cell_idx);
         }
         assert_eq!(out, [0, 0, 1]);
+    }
+}
+
+#[cfg(test)]
+mod glyph_registry_resolution_tests {
+    use super::*;
+    use rio_backend::sugarloaf::font::glyph_registry::{GlyphRegistry, StoredPayload};
+
+    #[test]
+    fn pua_resolution_tracks_registry_changes() {
+        let library = FontLibrary::default();
+        let registry = GlyphRegistry::new();
+        let route_id = 42;
+        let ch = '\u{e000}';
+        let mut rasterizer = GridGlyphRasterizer::new();
+
+        let before = rasterizer.resolve_font(ch, 0, &library, route_id).0;
+        registry
+            .register(ch as u32, StoredPayload::glyf(Vec::new()), 1000)
+            .unwrap();
+        library.install_glyph_registry(route_id, registry.clone());
+        assert_eq!(
+            rasterizer.resolve_font(ch, 0, &library, route_id).0,
+            CUSTOM_GLYPH_FONT_ID_U32
+        );
+
+        registry.clear_one(ch as u32);
+        assert_eq!(rasterizer.resolve_font(ch, 0, &library, route_id).0, before);
     }
 }
 
