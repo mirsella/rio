@@ -60,18 +60,51 @@ extern "C" {
     fn ptsname(fd: *mut libc::c_int) -> *mut libc::c_char;
 }
 
-/// Expand a leading `~` against `$HOME`. Returns None (with a
-/// warning) when the expansion is impossible.
+fn reset_child_signals() {
+    unsafe {
+        for signal in [
+            libc::SIGABRT,
+            libc::SIGALRM,
+            libc::SIGBUS,
+            libc::SIGCHLD,
+            libc::SIGFPE,
+            libc::SIGHUP,
+            libc::SIGILL,
+            libc::SIGINT,
+            libc::SIGPIPE,
+            libc::SIGQUIT,
+            libc::SIGSEGV,
+            libc::SIGTERM,
+            libc::SIGTRAP,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+        ] {
+            libc::signal(signal, libc::SIG_DFL);
+        }
+        let mut mask = std::mem::zeroed();
+        libc::sigemptyset(&mut mask);
+        libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+    }
+}
+
+/// Expand a leading `~` against the current user's home directory.
 fn expand_tilde(dir: &str) -> Option<String> {
     if dir == "~" || dir.starts_with("~/") {
-        match std::env::var("HOME") {
-            Ok(home) => Some(format!("{home}{}", &dir[1..])),
-            Err(_) => {
-                tracing::warn!(
-                    "working-dir {dir:?} needs $HOME, which is unset; inheriting the current directory"
-                );
-                None
-            }
+        let Some(home) = dirs::home_dir() else {
+            tracing::warn!(
+                "working-dir {dir:?} needs a home directory; inheriting the current directory"
+            );
+            return None;
+        };
+        if dir == "~" {
+            Some(home.to_string_lossy().into_owned())
+        } else {
+            Some(
+                home.join(dir[2..].trim_start_matches('/'))
+                    .to_string_lossy()
+                    .into_owned(),
+            )
         }
     } else {
         Some(dir.to_string())
@@ -82,73 +115,77 @@ fn expand_tilde(dir: &str) -> Option<String> {
 /// directory. Unusable values fall back to inheriting the parent's
 /// directory with a warning instead of failing the spawn or silently
 /// landing somewhere unexpected.
-pub fn resolve_working_dir(dir: &Option<String>) -> Option<String> {
-    let expanded = expand_tilde(dir.as_deref()?)?;
-    if std::path::Path::new(&expanded).is_dir() {
-        Some(expanded)
+pub fn resolve_working_dir(dir: Option<&str>) -> io::Result<Option<String>> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    let Some(expanded) = expand_tilde(dir) else {
+        return Ok(None);
+    };
+    if expanded.as_bytes().contains(&0) {
+        return Err(Error::new(
+            io::ErrorKind::InvalidInput,
+            "working-dir contains a NUL byte",
+        ));
+    }
+    if Path::new(&expanded).is_dir() {
+        Ok(Some(expanded))
     } else {
         tracing::warn!(
             "working-dir {expanded:?} is not a directory; inheriting the current directory"
         );
-        None
+        Ok(None)
     }
 }
 
-fn default_shell_command(shell: &str, args: &[String]) {
-    // Ignored signal dispositions survive exec (unlike caught
-    // handlers), so the shell inherits whatever the launcher left
-    // ignored: SIGINT/SIGQUIT from a background-job launch, and
-    // SIGPIPE which the Rust runtime always sets to ignore. Reset
-    // the full set to default before exec.
-    unsafe {
-        libc::signal(libc::SIGABRT, libc::SIG_DFL);
-        libc::signal(libc::SIGALRM, libc::SIG_DFL);
-        libc::signal(libc::SIGBUS, libc::SIG_DFL);
-        libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-        libc::signal(libc::SIGFPE, libc::SIG_DFL);
-        libc::signal(libc::SIGHUP, libc::SIG_DFL);
-        libc::signal(libc::SIGILL, libc::SIG_DFL);
-        libc::signal(libc::SIGINT, libc::SIG_DFL);
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-        libc::signal(libc::SIGQUIT, libc::SIG_DFL);
-        libc::signal(libc::SIGSEGV, libc::SIG_DFL);
-        libc::signal(libc::SIGTERM, libc::SIG_DFL);
-        libc::signal(libc::SIGTRAP, libc::SIG_DFL);
-    }
+struct ShellCommand {
+    program: CString,
+    _argv: Vec<CString>,
+    argv_ptrs: Vec<*const libc::c_char>,
+}
 
-    let program = match CString::new(shell) {
-        Ok(program) => program,
-        Err(_) => return,
-    };
+impl ShellCommand {
+    fn new(shell: &str, args: &[String]) -> io::Result<Self> {
+        let program = CString::new(shell).map_err(|_| {
+            Error::new(io::ErrorKind::InvalidInput, "shell contains a NUL byte")
+        })?;
 
-    // argv[0] is the program itself, except on macOS with no custom
-    // args: there a bare shell becomes a login shell via the classic
-    // convention of prefixing argv[0] with '-' (what login(1) does),
-    // which every shell understands without flag parsing.
-    #[allow(unused_mut)]
-    let mut arg0 = program.clone();
-    #[cfg(target_os = "macos")]
-    if args.is_empty() {
-        let name = shell.rsplit('/').next().unwrap_or(shell);
-        if let Ok(login_arg0) = CString::new(format!("-{name}")) {
-            arg0 = login_arg0;
+        #[allow(unused_mut)]
+        let mut arg0 = program.clone();
+        #[cfg(target_os = "macos")]
+        if args.is_empty() {
+            let name = shell.rsplit('/').next().unwrap_or(shell);
+            arg0 = CString::new(format!("-{name}")).map_err(|_| {
+                Error::new(io::ErrorKind::InvalidInput, "shell contains a NUL byte")
+            })?;
         }
-    }
-    let mut argv_owned: Vec<CString> = vec![arg0];
-    for arg in args {
-        match CString::new(arg.as_str()) {
-            Ok(arg) => argv_owned.push(arg),
-            Err(_) => return,
+
+        let mut argv = Vec::with_capacity(args.len() + 1);
+        argv.push(arg0);
+        for arg in args {
+            argv.push(CString::new(arg.as_str()).map_err(|_| {
+                Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "shell argument contains a NUL byte",
+                )
+            })?);
         }
+        let mut argv_ptrs = argv.iter().map(|arg| arg.as_ptr()).collect::<Vec<_>>();
+        argv_ptrs.push(std::ptr::null());
+
+        Ok(Self {
+            program,
+            _argv: argv,
+            argv_ptrs,
+        })
     }
 
-    // execvp requires a null-terminated argv.
-    let mut argv: Vec<*const libc::c_char> =
-        argv_owned.iter().map(|arg| arg.as_ptr()).collect();
-    argv.push(std::ptr::null());
-
-    unsafe {
-        libc::execvp(program.as_ptr(), argv.as_ptr());
+    fn exec(&self) -> ! {
+        reset_child_signals();
+        unsafe {
+            libc::execvp(self.program.as_ptr(), self.argv_ptrs.as_ptr());
+            libc::_exit(127);
+        }
     }
 }
 
@@ -160,43 +197,18 @@ pub struct Pty {
     signals: Signals,
 }
 
-impl Deref for Pty {
-    type Target = Child;
-    fn deref(&self) -> &Child {
-        &self.child
-    }
-}
-
 impl io::Write for Pty {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match unsafe {
-            libc::write(
-                *self.child,
-                buf.as_ptr() as *const _,
-                buf.len() as libc::size_t,
-            )
-        } {
-            n if n >= 0 => Ok(n as usize),
-            _ => Err(io::Error::last_os_error()),
-        }
+        io::Write::write(&mut self.file, buf)
     }
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        io::Write::flush(&mut self.file)
     }
 }
 
 impl io::Read for Pty {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match unsafe {
-            libc::read(
-                *self.child,
-                buf.as_mut_ptr() as *mut _,
-                buf.len() as libc::size_t,
-            )
-        } {
-            n if n >= 0 => Ok(n as usize),
-            _ => Err(io::Error::last_os_error()),
-        }
+        io::Read::read(&mut self.file, buf)
     }
 }
 
@@ -526,6 +538,15 @@ pub fn create_pty_with_spawn(
     // the host, which may see directories this sandbox cannot, so
     // existence is validated at the local use site instead.
     let working_directory = working_directory.as_deref().and_then(expand_tilde);
+    if working_directory
+        .as_deref()
+        .is_some_and(|dir| dir.as_bytes().contains(&0))
+    {
+        return Err(Error::new(
+            io::ErrorKind::InvalidInput,
+            "working-dir contains a NUL byte",
+        ));
+    }
 
     #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
     let mut is_controling_terminal = true;
@@ -556,6 +577,10 @@ pub fn create_pty_with_spawn(
     if res < 0 {
         return Err(Error::other("openpty failed"));
     }
+    let file = unsafe { File::from_raw_fd(main) };
+    let owned_child = unsafe { OwnedFd::from_raw_fd(child) };
+    set_cloexec(file.as_raw_fd())?;
+    set_cloexec(owned_child.as_raw_fd())?;
 
     let user = match ShellUser::from_env() {
         Ok(data) => data,
@@ -635,12 +660,7 @@ pub fn create_pty_with_spawn(
         }
     }
 
-    // Setup child stdin/stdout/stderr as child fd of PTY.
-    // Ownership of fd is transferred to the Stdio structs and will be closed by them at the end of
-    // this scope. (It is not an issue that the fd is closed three times since File::drop ignores
-    // error on libc::close.).
-    let owned_child = unsafe { OwnedFd::from_raw_fd(child) };
-
+    // Give each standard stream its own slave descriptor.
     builder.stdin(owned_child.try_clone()?);
     builder.stderr(owned_child.try_clone()?);
     builder.stdout(owned_child);
@@ -663,23 +683,7 @@ pub fn create_pty_with_spawn(
                 set_controlling_terminal(child)?;
             }
 
-            // No longer need child/main fds.
-            libc::close(child);
-            libc::close(main);
-
-            libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-            libc::signal(libc::SIGHUP, libc::SIG_DFL);
-            libc::signal(libc::SIGINT, libc::SIG_DFL);
-            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
-            libc::signal(libc::SIGTERM, libc::SIG_DFL);
-            libc::signal(libc::SIGALRM, libc::SIG_DFL);
-
-            // The embedding process may run with signals blocked (e.g. on a
-            // background thread); the child must not inherit that mask or
-            // Ctrl-C and friends stop working in the spawned shell.
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
-            libc::sigprocmask(libc::SIG_SETMASK, &set, std::ptr::null_mut());
+            reset_child_signals();
 
             Ok(())
         });
@@ -697,15 +701,10 @@ pub fn create_pty_with_spawn(
     }
 
     // Prepare signal handling before spawning child.
-    let signals =
-        Signals::new([sigconsts::SIGCHLD]).expect("error preparing signal handling");
+    let signals = Signals::new([sigconsts::SIGCHLD])?;
 
     match builder.spawn() {
         Ok(child_process) => {
-            unsafe {
-                set_nonblocking(main);
-            }
-
             let ptsname: String = tty_ptsname(main).unwrap_or_else(|_| "".to_string());
             let child_unix = Child {
                 id: main,
@@ -713,10 +712,11 @@ pub fn create_pty_with_spawn(
                 pid: child_process.id().try_into().unwrap(),
                 exited: false,
             };
+            set_nonblocking(main)?;
 
             Ok(Pty {
                 child: child_unix,
-                file: unsafe { File::from_raw_fd(main) },
+                file,
                 token: corcovado::Token::from(0),
                 signals,
                 signals_token: corcovado::Token::from(0),
@@ -753,8 +753,15 @@ pub fn create_pty_with_fork(
 ) -> Result<Pty, Error> {
     // Resolved in the parent so the failure path can log; the fork
     // child only consumes the already-validated CString.
-    let working_directory =
-        resolve_working_dir(working_directory).and_then(|dir| CString::new(dir).ok());
+    let working_directory = resolve_working_dir(working_directory.as_deref())?
+        .map(CString::new)
+        .transpose()
+        .map_err(|_| {
+            Error::new(
+                io::ErrorKind::InvalidInput,
+                "working-dir contains a NUL byte",
+            )
+        })?;
     let mut main = 0;
     let winsize = Winsize {
         ws_row: rows as libc::c_ushort,
@@ -778,6 +785,8 @@ pub fn create_pty_with_fork(
     });
 
     tracing::info!("fork {:?}", shell_program);
+    let command = ShellCommand::new(shell_program, args)?;
+    let signals = Signals::new([sigconsts::SIGCHLD])?;
 
     match unsafe {
         forkpty(
@@ -789,19 +798,17 @@ pub fn create_pty_with_fork(
     } {
         0 => {
             if let Some(dir) = &working_directory {
-                unsafe {
-                    libc::chdir(dir.as_ptr());
+                if unsafe { libc::chdir(dir.as_ptr()) } != 0 {
+                    unsafe { libc::_exit(126) };
                 }
             }
-            default_shell_command(shell_program, args);
-            Err(Error::other(format!(
-                "forkpty has reach unreachable with {shell_program}"
-            )))
+            command.exec()
         }
         id if id > 0 => {
             // TODO: Currently we fork the process and don't wait to know if led to failure
             // Whenever it happens it will just simply shut down the teletyperwriter
             // In the future add an option to check before release the method
+            let file = unsafe { File::from_raw_fd(main) };
             let ptsname: String = tty_ptsname(main).unwrap_or_else(|_| "".to_string());
             let child = Child {
                 id: main,
@@ -809,17 +816,12 @@ pub fn create_pty_with_fork(
                 pid: id,
                 exited: false,
             };
-
-            unsafe {
-                set_nonblocking(main);
-            }
-
-            let signals = Signals::new([sigconsts::SIGCHLD])
-                .expect("error preparing signal handling");
+            set_cloexec(main)?;
+            set_nonblocking(main)?;
             Ok(Pty {
                 child,
                 signals,
-                file: unsafe { File::from_raw_fd(main) },
+                file,
                 token: corcovado::Token(0),
                 signals_token: corcovado::Token(0),
             })
@@ -848,12 +850,24 @@ fn set_controlling_terminal(fd: libc::c_int) -> Result<(), Error> {
     Ok(())
 }
 
-// https://man7.org/linux/man-pages/man2/fcntl.2.html
-unsafe fn set_nonblocking(fd: libc::c_int) {
-    use libc::{fcntl, F_GETFL, F_SETFL, O_NONBLOCK};
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1
+        || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
 
-    let res = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-    assert_eq!(res, 0);
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -885,7 +899,7 @@ impl Child {
     /// change the actual window size, and if not, will not generate a SIGWINCH.
     pub fn set_winsize(&self, winsize_builder: WinsizeBuilder) -> io::Result<()> {
         let winsize: Winsize = winsize_builder.build();
-        match unsafe { libc::ioctl(**self, TIOCSWINSZ, &winsize as *const _) } {
+        match unsafe { libc::ioctl(self.id, TIOCSWINSZ, &winsize as *const _) } {
             -1 => Err(io::Error::last_os_error()),
             _ => Ok(()),
         }
@@ -1129,46 +1143,28 @@ where
 
 #[cfg(test)]
 mod resolve_working_dir_tests {
-    use super::resolve_working_dir;
+    use super::{resolve_working_dir, ShellCommand};
 
     #[test]
-    fn none_stays_none() {
-        assert_eq!(resolve_working_dir(&None), None);
+    fn shell_command_rejects_nul_bytes_before_fork() {
+        assert!(ShellCommand::new("/bin/sh", &["bad\0argument".into()]).is_err());
+        assert!(resolve_working_dir(Some("/tmp/bad\0directory")).is_err());
     }
 
     #[test]
-    fn tilde_expands_to_home() {
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(resolve_working_dir(&Some("~".into())), Some(home));
-    }
-
-    #[test]
-    fn tilde_slash_expands_under_home() {
-        // Use a path guaranteed to exist under $HOME on any system
-        // running the tests: $HOME itself via `~/.`.
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(
-            resolve_working_dir(&Some("~/.".into())),
-            Some(format!("{home}/."))
-        );
-    }
-
-    #[test]
-    fn absolute_dir_passes_through() {
-        assert_eq!(resolve_working_dir(&Some("/".into())), Some("/".into()));
-    }
-
-    #[test]
-    fn missing_dir_falls_back_to_inherit() {
-        assert_eq!(
-            resolve_working_dir(&Some("/definitely/not/a/real/dir".into())),
-            None
-        );
-    }
-
-    #[test]
-    fn mid_string_tilde_is_not_expanded() {
-        assert_eq!(resolve_working_dir(&Some("/tmp/~x".into())), None);
+    fn working_directory_resolution() {
+        let home = dirs::home_dir().unwrap().to_string_lossy().into_owned();
+        for (input, expected) in [
+            (None, None),
+            (Some("~"), Some(home.clone())),
+            (Some("~/."), Some(format!("{home}/."))),
+            (Some("~//."), Some(format!("{home}/."))),
+            (Some("/"), Some("/".into())),
+            (Some("/definitely/not/a/real/dir"), None),
+            (Some("/tmp/~x"), None),
+        ] {
+            assert_eq!(resolve_working_dir(input).unwrap(), expected);
+        }
     }
 }
 
