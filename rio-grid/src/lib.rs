@@ -1282,12 +1282,8 @@ const RUN_BUCKET_SIZE: usize = 8;
 /// cell: UTF-16 code units on macOS (CoreText string indices), UTF-8
 /// bytes elsewhere (swash `cluster.source.start`).
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // `x` / `y` / `advance` kept for future kerning-aware layout
 struct ShapedGlyph {
     id: u16,
-    x: f32,
-    y: f32,
-    advance: f32,
     cluster: u32,
 }
 
@@ -1717,9 +1713,6 @@ fn shape_run_ct(
         .iter()
         .map(|g| ShapedGlyph {
             id: g.id,
-            x: g.x,
-            y: g.y,
-            advance: g.advance,
             cluster: g.cluster,
         })
         .collect();
@@ -1794,9 +1787,6 @@ fn shape_run_swash(
         for g in cluster.glyphs {
             glyphs.push(ShapedGlyph {
                 id: g.id,
-                x: g.x,
-                y: g.y,
-                advance: g.advance,
                 cluster: byte_offset,
             });
         }
