@@ -35,13 +35,48 @@ pub(crate) fn extract_line_text_with_cols<T: EventListener>(
             continue;
         }
 
-        for c in grid.cell_text(pos) {
+        for c in grid.cell_text(pos).map(|c| if c == '\0' { ' ' } else { c }) {
             text.push(c);
             byte_to_col.extend(std::iter::repeat_n(col, c.len_utf8()));
         }
     }
 
     (text, byte_to_col)
+}
+
+pub(crate) fn regex_match<T: EventListener>(
+    term: &rio_backend::crosswords::Crosswords<T>,
+    line: Line,
+    line_text: &str,
+    byte_to_col: &[Column],
+    start: usize,
+    end: usize,
+    hint: Rc<Hint>,
+) -> Option<HintMatch> {
+    if start == end || end > byte_to_col.len() {
+        return None;
+    }
+
+    let mut text = line_text[start..end].to_string();
+    if hint.post_processing {
+        text = post_process_hyperlink_uri(&text);
+    }
+    if text.is_empty() {
+        return None;
+    }
+
+    let start_col = byte_to_col[start];
+    let mut end_col = byte_to_col[start + text.len() - 1];
+    if term.grid[line][end_col].is_wide() {
+        end_col += 1;
+    }
+
+    Some(HintMatch {
+        text,
+        start: Pos::new(line, start_col),
+        end: Pos::new(line, end_col),
+        hint,
+    })
 }
 
 /// State for hint selection mode
@@ -123,16 +158,17 @@ impl HintState {
             }
         };
 
-        // Find regex matches if regex is specified
+        // Find OSC 8 hyperlinks if enabled
+        if hint.hyperlinks {
+            self.find_hyperlink_matches(term, hint.clone());
+        }
+
+        // Insert hyperlinks first so they win deduplication when a regex match
+        // starts on the same cell.
         if let Some(regex_pattern) = &hint.regex {
             if let Ok(regex) = onig::Regex::new(regex_pattern) {
                 self.find_regex_matches(term, &regex, hint.clone());
             }
-        }
-
-        // Find OSC 8 hyperlinks if enabled
-        if hint.hyperlinks {
-            self.find_hyperlink_matches(term, hint.clone());
         }
 
         // Cancel hint mode if no matches found
@@ -154,7 +190,7 @@ impl HintState {
         &mut self,
         term: &rio_backend::crosswords::Crosswords<T>,
         c: char,
-    ) -> Option<HintMatch> {
+    ) -> Option<(HintMatch, bool)> {
         match c {
             // Use backspace to remove the last character pressed
             '\x08' | '\x1f' => {
@@ -171,29 +207,37 @@ impl HintState {
             _ => (),
         }
 
-        let hint = self.active_hint.as_ref()?;
-
-        // Get visible labels (labels filtered by keys pressed so far)
-        let visible_labels = self.visible_labels();
+        let persist = self.active_hint.as_ref()?.persist;
 
         // Find the last label starting with the input character
-        let mut matching_labels = visible_labels.iter().rev();
-        let (index, remaining_label) = matching_labels
-            .find(|(_, remaining)| !remaining.is_empty() && remaining[0] == c)?;
+        let (index, remaining_len) = self
+            .visible_labels()
+            .rev()
+            .find(|(_, remaining)| {
+                remaining
+                    .first()
+                    .is_some_and(|label| key_matches(*label, c))
+            })
+            .map(|(index, remaining)| (index, remaining.len()))?;
 
         // Check if this completes the label (only one character remaining)
-        if remaining_label.len() == 1 {
-            let hint_match = self.matches.get(*index)?.clone();
-            let hint_config = hint.clone();
+        if remaining_len == 1 {
+            let hint_match = self.matches.get(index)?.clone();
+            let paste = self.labels[index]
+                .iter()
+                .zip(self.keys.iter().copied().chain(std::iter::once(c)))
+                .filter(|(label, _)| label.is_lowercase())
+                .all(|(label, input)| is_uppercase_variant(*label, input))
+                && self.labels[index].iter().any(|label| label.is_lowercase());
 
             // Exit hint mode unless it requires explicit dismissal
-            if hint_config.persist {
+            if persist {
                 self.keys.clear();
             } else {
                 self.stop();
             }
 
-            Some(hint_match)
+            Some((hint_match, paste))
         } else {
             // Store character to preserve the selection
             self.keys.push(c);
@@ -207,20 +251,23 @@ impl HintState {
     }
 
     /// Get visible labels (filtered by current input)
-    pub fn visible_labels(&self) -> Vec<(usize, Vec<char>)> {
+    pub fn visible_labels(&self) -> impl DoubleEndedIterator<Item = (usize, &[char])> {
         let keys_len = self.keys.len();
         self.labels
             .iter()
             .enumerate()
-            .filter_map(|(i, label)| {
-                if label.len() >= keys_len && label[..keys_len] == self.keys[..] {
-                    let remaining: Vec<char> = label[keys_len..].to_vec();
-                    Some((i, remaining))
+            .filter_map(move |(i, label)| {
+                if label.len() >= keys_len
+                    && label
+                        .iter()
+                        .zip(&self.keys)
+                        .all(|(label, input)| key_matches(*label, *input))
+                {
+                    Some((i, &label[keys_len..]))
                 } else {
                     None
                 }
             })
-            .collect()
     }
 
     fn find_regex_matches<T: EventListener>(
@@ -244,37 +291,17 @@ impl HintState {
 
             // Find all matches in this line. Onig yields (byte_start, byte_end);
             for (start, end) in regex.find_iter(&line_text) {
-                if start == end || end > byte_to_col.len() {
-                    continue;
+                if let Some(hint_match) = regex_match(
+                    term,
+                    line,
+                    &line_text,
+                    &byte_to_col,
+                    start,
+                    end,
+                    hint.clone(),
+                ) {
+                    self.matches.push(hint_match);
                 }
-                let mut match_text = line_text[start..end].to_string();
-
-                // Apply post-processing if enabled
-                if hint.post_processing {
-                    match_text = post_process_hyperlink_uri(&match_text);
-                }
-                if match_text.is_empty() {
-                    continue;
-                }
-
-                let last_byte = start + match_text.len() - 1;
-                let start_col = byte_to_col[start];
-                let mut end_col = byte_to_col[last_byte];
-                // If the match ends on a wide glyph, extend the
-                // highlight to its spacer cell so the click target
-                // covers the full visible glyph.
-                if grid[line][end_col].is_wide() {
-                    end_col += 1;
-                }
-
-                let hint_match = HintMatch {
-                    text: match_text,
-                    start: Pos::new(line, start_col),
-                    end: Pos::new(line, end_col),
-                    hint: hint.clone(),
-                };
-
-                self.matches.push(hint_match);
             }
         }
     }
@@ -324,6 +351,10 @@ impl HintState {
                     if hint.post_processing {
                         uri = post_process_hyperlink_uri(&uri);
                     }
+                    if uri.is_empty() {
+                        col = end_col;
+                        continue;
+                    }
                     self.matches.push(HintMatch {
                         text: uri,
                         start: Pos::new(line, Column(start_col)),
@@ -348,9 +379,26 @@ impl HintState {
     }
 }
 
+fn is_uppercase_variant(label: char, input: char) -> bool {
+    let mut lowercase = input.to_lowercase();
+    input.is_uppercase() && lowercase.next() == Some(label) && lowercase.next().is_none()
+}
+
+fn key_matches(label: char, input: char) -> bool {
+    label == input || is_uppercase_variant(label, input)
+}
+
 fn hint_labels(alphabet: &str, count: usize) -> Option<Vec<Vec<char>>> {
+    let alphabet_len = alphabet.chars().count();
     let mut seen = HashSet::new();
-    let alphabet: Vec<char> = alphabet.chars().filter(|c| seen.insert(*c)).collect();
+    let alphabet: Vec<char> = alphabet
+        .chars()
+        .filter(|c| seen.insert(c.to_lowercase().collect::<String>()))
+        .collect();
+
+    if alphabet.len() != alphabet_len {
+        return None;
+    }
 
     if alphabet.is_empty() || (alphabet.len() == 1 && count > 1) {
         return None;
@@ -536,6 +584,7 @@ mod tests {
             .iter()
             .all(|other| label == other || !other.starts_with(label))));
         assert_eq!(hint_labels("aaa", 2), None);
+        assert_eq!(hint_labels("aA", 2), None);
     }
 
     #[test]
@@ -544,7 +593,68 @@ mod tests {
         state.labels = vec![vec!['a', 'a'], vec!['a', 'b'], vec!['b', 'a']];
 
         state.keys = vec!['a'];
-        assert_eq!(state.visible_labels(), vec![(0, vec!['a']), (1, vec!['b'])]);
+        assert_eq!(
+            state.visible_labels().collect::<Vec<_>>(),
+            vec![(0, &['a'][..]), (1, &['b'][..])]
+        );
+    }
+
+    #[test]
+    fn extraction_renders_empty_cells_as_spaces() {
+        let terminal = mock_term_with_line("");
+        let (text, columns) = extract_line_text_with_cols(&terminal, Line(0));
+
+        assert_eq!(text, " ".repeat(terminal.grid.columns()));
+        assert_eq!(columns.len(), terminal.grid.columns());
+    }
+
+    #[test]
+    fn uppercase_label_selects_copy_and_paste_variant() {
+        let hint = hint();
+        let terminal = mock_term_with_line("test");
+        let mut state = HintState::new("ab".to_string());
+        state.active_hint = Some(hint.clone());
+        state.matches = vec![hint_match("test", 0, &hint)];
+        state.labels = vec![vec!['a', 'b']];
+
+        assert!(state.keyboard_input(&terminal, 'A').is_none());
+        let (selected, paste) = state.keyboard_input(&terminal, 'B').unwrap();
+
+        assert_eq!(selected.text, "test");
+        assert!(paste);
+    }
+
+    #[test]
+    fn lowercase_or_mixed_case_label_only_selects() {
+        let hint = hint();
+        let terminal = mock_term_with_line("test");
+
+        for input in [['a', 'b'], ['A', 'b']] {
+            let mut state = HintState::new("ab".to_string());
+            state.active_hint = Some(hint.clone());
+            state.matches = vec![hint_match("test", 0, &hint)];
+            state.labels = vec![vec!['a', 'b']];
+
+            assert!(state.keyboard_input(&terminal, input[0]).is_none());
+            let (_, paste) = state.keyboard_input(&terminal, input[1]).unwrap();
+            assert!(!paste);
+        }
+    }
+
+    #[test]
+    fn persistent_hint_remains_active_after_selection() {
+        let mut config = (*hint()).clone();
+        config.persist = true;
+        let hint = Rc::new(config);
+        let terminal = mock_term_with_line("test");
+        let mut state = HintState::new("ab".to_string());
+        state.active_hint = Some(hint.clone());
+        state.matches = vec![hint_match("test", 0, &hint)];
+        state.labels = vec![vec!['a']];
+
+        assert!(state.keyboard_input(&terminal, 'a').is_some());
+        assert!(state.is_active());
+        assert!(state.keys.is_empty());
     }
 
     #[test]
