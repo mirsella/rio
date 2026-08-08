@@ -704,7 +704,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         tracing::warn!(
                             "config.toml failed to parse; keeping the previous config"
                         );
-                        for (_id, route) in self.router.routes.iter_mut() {
+                        for route in self.router.routes.values_mut() {
                             route.report_error(&error.to_owned().into());
                             route.request_redraw();
                         }
