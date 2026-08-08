@@ -2,7 +2,7 @@ use rio_backend::config::hints::Hint;
 use rio_backend::crosswords::grid::Dimensions;
 use rio_backend::crosswords::pos::{Column, Line, Pos};
 use rio_backend::event::EventListener;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -363,30 +363,13 @@ impl HintState {
     }
 
     fn generate_labels(&mut self) {
-        let unique_matches = self
-            .matches
-            .iter()
-            .map(|hint_match| hint_match.text.as_str())
-            .collect::<HashSet<_>>()
-            .len();
-        let Some(labels) = hint_labels(&self.alphabet, unique_matches) else {
+        let Some(labels) = hint_labels(&self.alphabet, self.matches.len()) else {
             tracing::error!("hint alphabet must contain enough unique characters");
             self.stop();
             return;
         };
-        let mut labels = labels.into_iter();
-        let mut labels_by_text = HashMap::<&str, Vec<char>>::new();
 
-        self.labels = self
-            .matches
-            .iter()
-            .map(|hint_match| {
-                labels_by_text
-                    .entry(&hint_match.text)
-                    .or_insert_with(|| labels.next().expect("one label per unique match"))
-                    .clone()
-            })
-            .collect();
+        self.labels = labels;
     }
 }
 
@@ -591,6 +574,7 @@ mod tests {
 
         let labels = hint_labels("abc", 7).unwrap();
         assert_eq!(labels.len(), 7);
+        assert_eq!(labels.iter().collect::<HashSet<_>>().len(), labels.len());
         assert!(labels.iter().all(|label| labels
             .iter()
             .all(|other| label == other || !other.starts_with(label))));
@@ -628,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repeated_matches_share_labels() {
+    fn test_repeated_matches_get_distinct_labels() {
         let hint = hint();
         let mut state = HintState::new("abc".to_string());
         state.matches = ["foo.txt", "foo.txt", "bar.txt"]
@@ -640,7 +624,7 @@ mod tests {
         state.generate_labels();
 
         assert_eq!(state.matches.len(), 3);
-        assert_eq!(state.labels, vec![vec!['a'], vec!['a'], vec!['b']]);
+        assert_eq!(state.labels, vec![vec!['a'], vec!['b'], vec!['c']]);
     }
 
     #[test]
