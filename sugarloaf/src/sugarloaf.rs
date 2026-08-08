@@ -9,7 +9,7 @@ use crate::font::{fonts::SugarloafFont, FontLibrary};
 use crate::font_cache::{compute_advance, resolve_with, FontCache, ResolvedGlyph};
 use crate::layout::RootStyle;
 use crate::renderer::Renderer;
-use crate::sugarloaf::graphics::{GraphicDataEntry, Graphics};
+use crate::sugarloaf::graphics::GraphicDataEntry;
 use swash::Attributes;
 
 use crate::context::Context;
@@ -35,7 +35,6 @@ pub struct Sugarloaf<'a> {
     colorspace: Colorspace,
     pub background_color: Option<Color>,
     pub background_image: Option<ImageProperties>,
-    pub graphics: Graphics,
     #[cfg(feature = "wgpu")]
     filters_brush: Option<FiltersBrush>,
     /// Pixel data for standalone image textures, keyed by image key
@@ -124,7 +123,6 @@ pub use rio_graphics::Color;
 
 pub struct SugarloafRenderer {
     pub backend: SugarloafBackend,
-    pub font_features: Option<Vec<String>>,
     pub colorspace: Colorspace,
 }
 
@@ -181,7 +179,6 @@ impl Default for SugarloafRenderer {
 
         SugarloafRenderer {
             backend: default_backend,
-            font_features: None,
             colorspace: Colorspace::default(),
         }
     }
@@ -221,12 +218,11 @@ impl Sugarloaf<'_> {
         font_library: &FontLibrary,
         layout: RootStyle,
     ) -> Result<Sugarloaf<'a>, Box<SugarloafWithErrors<'a>>> {
-        let font_features = renderer.font_features.to_owned();
         let colorspace = renderer.colorspace;
         let ctx = Context::new(window, renderer);
 
         let renderer = Renderer::new(&ctx, colorspace);
-        let state = SugarState::new(layout, font_library, &font_features);
+        let state = SugarState::new(layout, font_library);
 
         let font_cache = FontCache::new();
 
@@ -243,7 +239,6 @@ impl Sugarloaf<'_> {
             background_color: Some(Color::BLACK),
             background_image: None,
             renderer,
-            graphics: Graphics::default(),
             #[cfg(feature = "wgpu")]
             filters_brush: None,
             image_data: rustc_hash::FxHashMap::default(),
@@ -281,10 +276,9 @@ impl Sugarloaf<'_> {
         self.cpu_cache.clear();
         // Glyph resolutions point at the old font ids — drop them.
         self.font_cache.clear();
-
         self.text.update_font_library(font_library);
-        self.state.reset();
-        self.state.set_fonts(font_library, &mut self.renderer);
+
+        self.state.fonts = font_library.clone();
     }
 
     /// Look up a single glyph in the font cache without performing
@@ -814,11 +808,6 @@ impl Sugarloaf<'_> {
     }
 
     #[inline]
-    pub fn clear(&mut self) {
-        self.state.clean_screen();
-    }
-
-    #[inline]
     pub fn window_size(&self) -> SugarloafWindowSize {
         self.ctx.size()
     }
@@ -844,11 +833,7 @@ impl Sugarloaf<'_> {
     }
 
     #[inline]
-    pub fn add_layers(&mut self, _quantity: usize) {}
-
-    #[inline]
     pub fn reset(&mut self) {
-        self.state.reset();
         // Drop this frame's UI text instances — overlays re-record
         // next frame (immediate mode).
         self.text.clear();
@@ -873,7 +858,6 @@ impl Sugarloaf<'_> {
     #[inline]
     pub fn discard_frame(&mut self) {
         self.renderer.discard_frame_batches();
-        self.state.reset();
         self.text.clear();
     }
 
@@ -902,14 +886,8 @@ impl Sugarloaf<'_> {
         &mut self,
         grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
     ) {
-        self.state.compute_dimensions();
-        self.state.compute_updates(
-            &mut self.renderer,
-            &mut self.ctx,
-            &mut self.graphics,
-            &mut self.image_data,
-            &self.image_overlays,
-        );
+        self.renderer
+            .prepare(&mut self.ctx, &mut self.image_data, &self.image_overlays);
 
         match self.ctx.inner {
             #[cfg(feature = "wgpu")]

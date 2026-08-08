@@ -12,7 +12,6 @@ use crate::context::{Context, ContextType};
 use crate::font::FontLibrary;
 use crate::layout::TextDimensions;
 use crate::renderer::image_cache::ImageCache;
-use crate::Graphics;
 use compositor::{Compositor, Rect, Vertex};
 use rustc_hash::FxHashMap;
 // Only the macOS Metal path and the wgpu path use bare `mem::` (they
@@ -1075,8 +1074,6 @@ impl Renderer {
     pub fn prepare(
         &mut self,
         context: &mut crate::context::Context,
-        _state: &crate::sugarloaf::state::SugarState,
-        _graphics: &mut Graphics,
         image_data: &mut rustc_hash::FxHashMap<
             u64,
             crate::sugarloaf::graphics::GraphicDataEntry,

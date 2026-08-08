@@ -178,7 +178,6 @@ impl Screen<'_> {
 
         let sugarloaf_renderer = SugarloafRenderer {
             backend,
-            font_features: config.fonts.features.clone(),
             colorspace: config.window.colorspace.to_sugarloaf_colorspace(),
         };
 
