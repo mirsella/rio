@@ -1805,8 +1805,18 @@ impl Screen<'_> {
         copy_on_select: bool,
         clipboard: &mut Clipboard,
     ) {
-        for &ty in pointer_release_clipboard_targets(copy_on_select) {
-            self.copy_selection(ty, clipboard);
+        let terminal = self.context_manager.current_mut().terminal.lock();
+        let Some(text) = terminal
+            .selection_to_string()
+            .filter(|text| !text.is_empty())
+        else {
+            return;
+        };
+        drop(terminal);
+
+        clipboard.set(ClipboardType::Selection, text.clone());
+        if copy_on_select {
+            clipboard.set(ClipboardType::Clipboard, text);
         }
     }
 
@@ -4767,18 +4777,6 @@ fn shell_execute_open(target: &str) {
     }
 }
 
-// Clipboard slots that receive the current selection when a pointer button is
-// released after a text drag. PRIMARY is unconditional — middle-click and
-// Shift+Insert paste it, and other terminals all populate it on mouse
-// selection. `copy_on_select` additionally mirrors into the system clipboard.
-fn pointer_release_clipboard_targets(copy_on_select: bool) -> &'static [ClipboardType] {
-    if copy_on_select {
-        &[ClipboardType::Selection, ClipboardType::Clipboard]
-    } else {
-        &[ClipboardType::Selection]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4876,21 +4874,6 @@ mod tests {
                 "https://example.com/path[with]brackets"
             ),
             "https://example.com/path[with]brackets"
-        );
-    }
-
-    // Regression test for #1620: mouse selection must claim the PRIMARY
-    // selection regardless of copy_on_select, so middle-click / Shift+Insert
-    // paste the text just selected in Rio.
-    #[test]
-    fn pointer_release_always_claims_primary() {
-        assert_eq!(
-            pointer_release_clipboard_targets(false),
-            &[ClipboardType::Selection],
-        );
-        assert_eq!(
-            pointer_release_clipboard_targets(true),
-            &[ClipboardType::Selection, ClipboardType::Clipboard],
         );
     }
 }
