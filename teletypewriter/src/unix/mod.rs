@@ -54,7 +54,7 @@ extern "C" {
 
 }
 
-fn reset_child_signals() {
+fn reset_child_signals() -> io::Result<()> {
     unsafe {
         for signal in [
             libc::SIGABRT,
@@ -74,12 +74,19 @@ fn reset_child_signals() {
             libc::SIGTTIN,
             libc::SIGTTOU,
         ] {
-            libc::signal(signal, libc::SIG_DFL);
+            if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(io::Error::last_os_error());
+            }
         }
         let mut mask = std::mem::zeroed();
-        libc::sigemptyset(&mut mask);
-        libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+        if libc::sigemptyset(&mut mask) == -1
+            || libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
     }
+
+    Ok(())
 }
 
 /// Expand a leading `~` against the current user's home directory.
@@ -175,7 +182,9 @@ impl ShellCommand {
     }
 
     fn exec(&self) -> ! {
-        reset_child_signals();
+        if reset_child_signals().is_err() {
+            unsafe { libc::_exit(126) };
+        }
         unsafe {
             libc::execvp(self.program.as_ptr(), self.argv_ptrs.as_ptr());
             libc::_exit(127);
@@ -695,7 +704,7 @@ pub fn create_pty_with_spawn(
                 set_controlling_terminal(child)?;
             }
 
-            reset_child_signals();
+            reset_child_signals()?;
 
             Ok(())
         });
@@ -717,6 +726,7 @@ pub fn create_pty_with_spawn(
 
     match builder.spawn() {
         Ok(child_process) => {
+            // Establish lifecycle ownership before any fallible parent-side setup.
             let child_unix = Child::new(
                 main,
                 child_process.id() as libc::pid_t,
@@ -755,6 +765,7 @@ pub fn default_shell_program() -> String {
         .map(|user| user.shell)
         .unwrap_or_default()
 }
+
 
 pub fn create_pty_with_fork(
     shell: Option<&str>,
