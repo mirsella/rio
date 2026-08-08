@@ -287,6 +287,13 @@ pub fn create_config_file(path: Option<PathBuf>) {
 }
 
 impl Config {
+    fn parse_and_finalize(content: &str) -> Result<Self, ConfigError> {
+        let mut config = toml::from_str::<Self>(content)
+            .map_err(|error| ConfigError::ErrLoadingConfig(error.to_string()))?;
+        config.overwrite_based_on_platform();
+        Ok(config)
+    }
+
     #[cfg(test)]
     fn load_from_path(path: &PathBuf) -> Self {
         if path.exists() {
@@ -376,9 +383,8 @@ impl Config {
         let path = config_file_path();
         if path.exists() {
             let content = std::fs::read_to_string(path).unwrap();
-            match toml::from_str::<Config>(&content) {
+            match Self::parse_and_finalize(&content) {
                 Ok(mut decoded) => {
-                    decoded.overwrite_based_on_platform();
                     let theme = &decoded.theme;
                     if theme.is_empty() {
                         return decoded;
@@ -396,8 +402,10 @@ impl Config {
 
                     decoded
                 }
-                Err(err_message) => {
-                    warn!("failure to parse config file, falling back to default...\n{err_message:?}");
+                Err(error) => {
+                    warn!(
+                        "failure to load config file, falling back to default: {error:?}"
+                    );
                     Config::default()
                 }
             }
@@ -410,9 +418,8 @@ impl Config {
         let path = config_file_path();
         if path.exists() {
             match std::fs::read_to_string(path) {
-                Ok(content) => match toml::from_str::<Config>(&content) {
+                Ok(content) => match Self::parse_and_finalize(&content) {
                     Ok(mut decoded) => {
-                        decoded.overwrite_based_on_platform();
                         let theme = &decoded.theme;
                         let theme_path = config_dir_path().join("themes");
                         if !theme.is_empty() {
@@ -474,9 +481,7 @@ impl Config {
 
                         Ok(decoded)
                     }
-                    Err(err_message) => {
-                        Err(ConfigError::ErrLoadingConfig(err_message.to_string()))
-                    }
+                    Err(error) => Err(error),
                 },
                 Err(err_message) => {
                     Err(ConfigError::ErrLoadingConfig(err_message.to_string()))

@@ -40,7 +40,17 @@ pub fn default_tab_bar_height() -> f32 {
 /// setting.
 #[inline]
 pub fn clamp_unfocused_split_opacity(v: f32) -> f32 {
-    v.clamp(0.15, 1.0)
+    if !v.is_finite() {
+        tracing::warn!("invalid navigation.unfocused-split-opacity {v}; using default");
+        return default_unfocused_split_opacity();
+    }
+    let result = v.clamp(0.15, 1.0);
+    if result != v {
+        tracing::warn!(
+            "navigation.unfocused-split-opacity {v} is out of range; using {result}"
+        );
+    }
+    result
 }
 
 /// Sanitize tab-strip geometry after load: NaN and negative or zero
@@ -140,7 +150,7 @@ impl std::str::FromStr for NavigationMode {
             Self::TAB_STR => Ok(NavigationMode::Tab),
             #[cfg(target_os = "macos")]
             Self::NATIVE_TAB_STR => Ok(NavigationMode::NativeTab),
-            _ => Ok(NavigationMode::default()),
+            _ => Err(ParseNavigationModeError),
         }
     }
 }
