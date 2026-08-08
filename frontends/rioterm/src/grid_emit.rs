@@ -1227,10 +1227,6 @@ pub struct GridGlyphRasterizer {
     /// after `clear_font_caches` so shaping and rasterization don't
     /// take the library lock per run.
     lib_settings: Option<LibrarySettings>,
-    /// Per-font `wght` axis pin, mirrored from `FontData.wght_variation`.
-    #[cfg(not(target_os = "macos"))]
-    wght_cache: FxHashMap<u32, Option<f32>>,
-
     // non-macOS: swash wants UTF-8, so keep a `String` scratch.
     #[cfg(not(target_os = "macos"))]
     run_str_scratch: String,
@@ -1245,6 +1241,7 @@ pub struct GridGlyphRasterizer {
             rio_backend::sugarloaf::font::SharedData,
             u32,
             rio_backend::sugarloaf::swash::CacheKey,
+            Option<f32>,
         ),
     >,
 }
@@ -1276,8 +1273,6 @@ impl GridGlyphRasterizer {
             handle_cache: FxHashMap::default(),
             lib_settings: None,
             #[cfg(not(target_os = "macos"))]
-            wght_cache: FxHashMap::default(),
-            #[cfg(not(target_os = "macos"))]
             shape_ctx: rio_backend::sugarloaf::swash::shape::ShapeContext::new(),
             #[cfg(not(target_os = "macos"))]
             scale_ctx: rio_backend::sugarloaf::swash::scale::ScaleContext::new(),
@@ -1299,10 +1294,7 @@ impl GridGlyphRasterizer {
         #[cfg(target_os = "macos")]
         self.handle_cache.clear();
         #[cfg(not(target_os = "macos"))]
-        {
-            self.wght_cache.clear();
-            self.font_data_cache.clear();
-        }
+        self.font_data_cache.clear();
     }
 
     /// Library-wide `(hinting, features)`, cached until the next
@@ -1563,20 +1555,20 @@ fn shape_run_swash(
     use rio_backend::sugarloaf::swash::{FontRef, Setting};
 
     let features = rasterizer.library_settings(font_library).features;
-    let wght = *rasterizer.wght_cache.entry(font_id).or_insert_with(|| {
-        let lib = font_library.inner.read();
-        lib.try_get(&(font_id as usize))
-            .and_then(|f| f.wght_variation)
-    });
-
     let font_entry = rasterizer
         .font_data_cache
         .entry(font_id)
         .or_insert_with(|| {
             let lib = font_library.inner.read();
-            lib.get_data(&(font_id as usize))
-                .expect("font id resolved but get_data returned None")
+            let data = lib
+                .get_data(&(font_id as usize))
+                .expect("font id resolved but get_data returned None");
+            let wght = lib
+                .try_get(&(font_id as usize))
+                .and_then(|font| font.wght_variation);
+            (data.0, data.1, data.2, wght)
         });
+    let wght = font_entry.3;
     let font_ref = FontRef {
         data: font_entry.0.as_ref(),
         offset: font_entry.1,
@@ -2611,23 +2603,17 @@ fn rasterize_glyph_native(
         key: font_entry.2,
     };
 
-    // Shaping runs before rasterization, so `lib_settings` and
-    // `wght_cache` are already populated for this font.
+    // Shaping runs before rasterization, so these caches are populated.
     let (hinting, antialias) = rasterizer
         .lib_settings
         .as_ref()
         .map(|s| (s.hinting, s.antialias))
         .unwrap_or((true, true));
     const WGHT_TAG: u32 = u32::from_be_bytes(*b"wght");
-    let wght_var = rasterizer
-        .wght_cache
-        .get(&font_id)
-        .copied()
-        .flatten()
-        .map(|v| Setting {
-            tag: WGHT_TAG,
-            value: v,
-        });
+    let wght_var = font_entry.3.map(|v| Setting {
+        tag: WGHT_TAG,
+        value: v,
+    });
     let mut scaler = rasterizer
         .scale_ctx
         .builder(font_ref)
@@ -2784,112 +2770,47 @@ mod glyph_registry_resolution_tests {
 mod wght_coord_leak_tests {
     use super::*;
     use rio_backend::sugarloaf::font::constants::FONT_CASCADIA_CODE_NF;
-    use rio_backend::sugarloaf::font::{FontData, FontLibrary, FontLibraryData};
+    use rio_backend::sugarloaf::font::{FontData, FontLibraryData};
     use rio_backend::sugarloaf::swash::FontRef;
-    use std::sync::Arc;
 
-    fn ink_mass(g: &RawGlyph) -> u64 {
-        g.bytes.iter().map(|&b| b as u64).sum()
-    }
-
-    /// swash's `ScaleContext` keeps a single coordinate buffer that
-    /// `variations()` resizes and overwrites but never clears. A glyph from a
-    /// slot with no `wght` override, rasterized after one that pins `wght`,
-    /// would inherit the stale coordinate and render as a false bold.
     #[test]
     fn unweighted_slot_unaffected_by_prior_bold_rasterize() {
-        let mut data = FontLibraryData::default();
-        // id 0: bold slot (wght 700).
-        data.insert(
+        let mut fonts = FontLibraryData::default();
+        fonts.insert(
             FontData::from_static_slice_with_wght(FONT_CASCADIA_CODE_NF, Some(700.0))
-                .expect("load bold slot"),
+                .unwrap(),
         );
-        // id 1: unweighted slot (wght None) — same upright face, default
-        // instance, mirroring how the italic / regular-default slots load.
-        data.insert(
-            FontData::from_static_slice_with_wght(FONT_CASCADIA_CODE_NF, None)
-                .expect("load unweighted slot"),
+        fonts.insert(
+            FontData::from_static_slice_with_wght(FONT_CASCADIA_CODE_NF, None).unwrap(),
         );
-        let lib = FontLibrary {
-            inner: Arc::new(parking_lot::RwLock::new(data)),
-        };
-        assert_eq!(lib.inner.read().get(&0).wght_variation, Some(700.0));
-        assert_eq!(lib.inner.read().get(&1).wght_variation, None);
-
         let glyph_id = FontRef::from_index(FONT_CASCADIA_CODE_NF, 0)
-            .expect("font ref")
+            .unwrap()
             .charmap()
             .map('a' as u32);
-        assert_ne!(glyph_id, 0, "'a' must be present in Cascadia Code");
+        let bold = fonts.get_data(&0).unwrap();
+        let plain = fonts.get_data(&1).unwrap();
+        let render = |rasterizer: &mut GridGlyphRasterizer, font_id| {
+            rasterize_glyph_native(rasterizer, font_id, glyph_id, 32, false, false, false)
+                .unwrap()
+        };
 
-        let size_u16 = 32u16;
-        let bold_entry = lib.inner.read().get_data(&0).expect("bold data");
-        let plain_entry = lib.inner.read().get_data(&1).expect("plain data");
-
-        // Baseline: rasterize the unweighted glyph on a fresh rasterizer
-        // with no prior build polluting the shared ScaleContext. This is the
-        // correct default-instance reference.
         let mut clean = GridGlyphRasterizer::new();
-        clean.font_data_cache.insert(1, plain_entry.clone());
-        clean.wght_cache.insert(1, None);
-        let plain_ref = rasterize_glyph_native(
-            &mut clean, 1, glyph_id, size_u16, false, false, false,
-        )
-        .expect("baseline rasterize");
+        clean
+            .font_data_cache
+            .insert(1, (plain.0.clone(), plain.1, plain.2, None));
+        let plain_ref = render(&mut clean, 1);
 
-        // Leak path: rasterize the BOLD glyph first (seeds the shared
-        // scale_ctx coords with wght 700), then the unweighted glyph through
-        // the SAME rasterizer. Without the fix, the unweighted build inherits
-        // the stale 700 coordinate and renders bold.
         let mut shared = GridGlyphRasterizer::new();
-        shared.font_data_cache.insert(0, bold_entry);
-        shared.wght_cache.insert(0, Some(700.0));
-        shared.font_data_cache.insert(1, plain_entry);
-        shared.wght_cache.insert(1, None);
-        let bold_first = rasterize_glyph_native(
-            &mut shared,
-            0,
-            glyph_id,
-            size_u16,
-            false,
-            false,
-            false,
-        )
-        .expect("bold rasterize");
-        let plain_after = rasterize_glyph_native(
-            &mut shared,
-            1,
-            glyph_id,
-            size_u16,
-            false,
-            false,
-            false,
-        )
-        .expect("post-bold unweighted rasterize");
+        shared
+            .font_data_cache
+            .insert(0, (bold.0, bold.1, bold.2, Some(700.0)));
+        shared
+            .font_data_cache
+            .insert(1, (plain.0, plain.1, plain.2, None));
+        let bold_first = render(&mut shared, 0);
+        let plain_after = render(&mut shared, 1);
 
-        assert!(ink_mass(&plain_ref) > 0, "baseline glyph must have ink");
-        // Sanity: bold really is heavier than the unweighted default, so the
-        // assertion below can actually distinguish a leak.
-        assert!(
-            ink_mass(&bold_first) > ink_mass(&plain_ref),
-            "bold glyph (ink {}) must be heavier than the unweighted default \
-             (ink {}) for this test to be meaningful",
-            ink_mass(&bold_first),
-            ink_mass(&plain_ref),
-        );
-        assert_eq!(
-            (
-                plain_after.width,
-                plain_after.height,
-                ink_mass(&plain_after)
-            ),
-            (plain_ref.width, plain_ref.height, ink_mass(&plain_ref)),
-            "an unweighted (wght None) glyph must rasterize at the default \
-             instance regardless of a preceding bold rasterize through the \
-             shared ScaleContext. It instead inherited the stale wght 700 \
-             coordinate (ink {} vs the correct {}), rendering a false bold.",
-            ink_mass(&plain_after),
-            ink_mass(&plain_ref),
-        );
+        assert_ne!(bold_first.bytes, plain_ref.bytes);
+        assert_eq!(plain_after.bytes, plain_ref.bytes);
     }
 }
