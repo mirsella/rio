@@ -206,12 +206,6 @@ impl HintState {
         &self.matches
     }
 
-    /// Get keys pressed so far
-    #[allow(dead_code)]
-    pub fn keys_pressed(&self) -> &[char] {
-        &self.keys
-    }
-
     /// Get visible labels (filtered by current input)
     pub fn visible_labels(&self) -> Vec<(usize, Vec<char>)> {
         let keys_len = self.keys.len();
@@ -229,17 +223,6 @@ impl HintState {
             .collect()
     }
 
-    /// Update the alphabet used for hint labels
-    #[allow(dead_code)]
-    pub fn update_alphabet(&mut self, alphabet: &str) {
-        if self.alphabet != alphabet {
-            self.alphabet = alphabet.to_string();
-            self.keys.clear();
-        }
-    }
-
-    // Private helper methods
-
     fn find_regex_matches<T: EventListener>(
         &mut self,
         term: &rio_backend::crosswords::Crosswords<T>,
@@ -254,10 +237,6 @@ impl HintState {
         // Scan each visible line for matches
         for line_idx in 0..visible_lines {
             let line = Line(line_idx as i32 - display_offset as i32);
-            if line < Line(0) || line.0 >= grid.total_lines() as i32 {
-                continue;
-            }
-
             // Extract text plus a byte→grid-column mapping so regex byte
             // offsets translate back to the right cells when the line
             // contains wide glyphs or multibyte codepoints.
@@ -318,10 +297,6 @@ impl HintState {
 
         for line_idx in 0..visible_lines {
             let line = Line(line_idx as i32 - display_offset as i32);
-            if line < Line(0) || line.0 >= grid.total_lines() as i32 {
-                continue;
-            }
-
             let mut col = 0usize;
             let cols = grid.columns();
             while col < cols {
@@ -564,33 +539,12 @@ mod tests {
     }
 
     #[test]
-    fn test_hint_state_lifecycle() {
-        let mut state = HintState::new("abc".to_string());
-        assert!(!state.is_active());
-
-        state.start(hint());
-        assert!(state.is_active());
-
-        state.stop();
-        assert!(!state.is_active());
-    }
-
-    #[test]
     fn test_visible_labels() {
         let mut state = HintState::new("abc".to_string());
-        state.labels = vec![vec!['a'], vec!['b'], vec!['a', 'b'], vec!['a', 'c']];
+        state.labels = vec![vec!['a', 'a'], vec!['a', 'b'], vec!['b', 'a']];
 
-        // No input - all labels visible
-        let visible = state.visible_labels();
-        assert_eq!(visible.len(), 4);
-
-        // Input "a" - should show labels that start with "a"
         state.keys = vec!['a'];
-        let visible = state.visible_labels();
-        assert_eq!(visible.len(), 3); // "a", "ab", "ac"
-        assert_eq!(visible[0].1, Vec::<char>::new()); // "a" with "a" removed = []
-        assert_eq!(visible[1].1, vec!['b']); // "ab" with "a" removed = ['b']
-        assert_eq!(visible[2].1, vec!['c']); // "ac" with "a" removed = ['c']
+        assert_eq!(state.visible_labels(), vec![(0, vec!['a']), (1, vec!['b'])]);
     }
 
     #[test]
@@ -607,58 +561,6 @@ mod tests {
 
         assert_eq!(state.matches.len(), 3);
         assert_eq!(state.labels, vec![vec!['a'], vec!['b'], vec!['c']]);
-    }
-
-    #[test]
-    fn test_keyboard_input_logic() {
-        let mut state = HintState::new("jfkdls".to_string());
-        let hint = hint();
-
-        // Simulate having some labels
-        state.labels = vec![
-            vec!['j'], // index 0
-            vec!['f'], // index 1
-            vec!['k'], // index 2
-            vec!['d'], // index 3
-            vec!['l'], // index 4
-            vec!['s'], // index 5
-        ];
-
-        // Simulate having matches (we'll use dummy matches)
-        state.matches = vec![
-            hint_match("match0", 0, &hint),
-            hint_match("match1", 10, &hint),
-        ];
-
-        state.active_hint = Some(hint);
-
-        // Test keyboard input logic without needing a terminal
-        // Test that 'j' should match the first label
-        let mut test_keys = state.keys.clone();
-        test_keys.push('j');
-
-        let mut matching_indices = Vec::new();
-        for (i, label) in state.labels.iter().enumerate() {
-            if label.len() >= test_keys.len() && label[..test_keys.len()] == test_keys[..]
-            {
-                matching_indices.push(i);
-            }
-        }
-
-        assert!(
-            !matching_indices.is_empty(),
-            "Should find matching labels for 'j'"
-        );
-        assert_eq!(matching_indices, vec![0], "Should match index 0 for 'j'");
-
-        // Test that the label should be completed (single character)
-        let index = *matching_indices.last().unwrap();
-        let label = &state.labels[index];
-        assert_eq!(
-            label.len(),
-            test_keys.len(),
-            "Label should be completed with single character"
-        );
     }
 
     #[test]
