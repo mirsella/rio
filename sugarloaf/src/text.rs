@@ -154,8 +154,6 @@ pub struct Text {
     font_library: FontLibrary,
     font_resolve: FxHashMap<(char, u8), (u32, bool)>,
     synthesis_cache: FxHashMap<u32, (bool, bool)>,
-    #[cfg(not(target_os = "macos"))]
-    wght_variation_cache: FxHashMap<u32, Option<f32>>,
     ascent_cache: FxHashMap<(u32, u16), i16>,
     shape_cache: FxHashMap<u64, ShapedRun>,
 
@@ -169,7 +167,8 @@ pub struct Text {
     #[cfg(not(target_os = "macos"))]
     scale_ctx: swash::scale::ScaleContext,
     #[cfg(not(target_os = "macos"))]
-    font_data_cache: FxHashMap<u32, (crate::font::SharedData, u32, swash::CacheKey)>,
+    font_data_cache:
+        FxHashMap<u32, (crate::font::SharedData, u32, swash::CacheKey, Option<f32>)>,
     #[cfg(all(feature = "wgpu", not(target_os = "macos")))]
     wgpu: Option<TextWgpuState>,
     #[cfg(target_os = "linux")]
@@ -185,8 +184,6 @@ impl Text {
             font_library: font_library.clone(),
             font_resolve: FxHashMap::default(),
             synthesis_cache: FxHashMap::default(),
-            #[cfg(not(target_os = "macos"))]
-            wght_variation_cache: FxHashMap::default(),
             ascent_cache: FxHashMap::default(),
             shape_cache: FxHashMap::default(),
             #[cfg(target_os = "macos")]
@@ -212,8 +209,6 @@ impl Text {
         self.instances.clear();
         self.font_resolve.clear();
         self.synthesis_cache.clear();
-        #[cfg(not(target_os = "macos"))]
-        self.wght_variation_cache.clear();
         self.ascent_cache.clear();
         self.shape_cache.clear();
         #[cfg(target_os = "macos")]
@@ -392,8 +387,14 @@ impl Text {
             // font_id to avoid the RwLock read-lock per shape.
             let font_entry = self.font_data_cache.entry(font_id).or_insert_with(|| {
                 let lib = self.font_library.inner.read();
-                lib.get_data(&(font_id as usize)).expect(
+                let data = lib.get_data(&(font_id as usize)).expect(
                     "font id resolved but get_data returned None — cache invariant",
+                );
+                (
+                    data.0,
+                    data.1,
+                    data.2,
+                    lib.get(&(font_id as usize)).wght_variation,
                 )
             });
             let font_ref = FontRef {
@@ -404,14 +405,7 @@ impl Text {
 
             // `wght` axis value to apply to the face (variable-font
             // fallback slots only — `None` for normal fonts).
-            let wght = match self.wght_variation_cache.entry(font_id) {
-                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let lib = self.font_library.inner.read();
-                    let v = lib.get(&(font_id as usize)).wght_variation;
-                    *e.insert(v)
-                }
-            };
+            let wght = font_entry.3;
             // wght axis tag as a swash u32 Tag — 'w','g','h','t' big-endian.
             const WGHT_TAG: swash::Tag = u32::from_be_bytes(*b"wght");
             let wght_var = wght.map(|v| Setting {
@@ -442,6 +436,7 @@ impl Text {
                 .shape_ctx
                 .builder(font_ref)
                 .size(size_u16 as f32)
+                .normalized_coords(std::iter::empty::<i16>())
                 .variations(var_slice.iter().copied())
                 .build();
             shaper.add_str(text);
@@ -1249,7 +1244,7 @@ struct SwashRawGlyph {
 #[allow(clippy::too_many_arguments)]
 fn rasterize_swash_glyph(
     scale_ctx: &mut swash::scale::ScaleContext,
-    font_entry: &(crate::font::SharedData, u32, swash::CacheKey),
+    font_entry: &(crate::font::SharedData, u32, swash::CacheKey, Option<f32>),
     glyph_id: u16,
     size_px: f32,
     synthetic_bold: bool,
@@ -1287,6 +1282,7 @@ fn rasterize_swash_glyph(
         .builder(font_ref)
         .hint(hint)
         .size(size_px)
+        .normalized_coords(std::iter::empty::<i16>())
         .variations(var_slice.iter().copied())
         .build();
 
