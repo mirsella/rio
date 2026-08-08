@@ -8,7 +8,7 @@ use crate::context::title::{
 use crate::event::sync::FairMutex;
 use crate::event::{Msg, RioEvent};
 use crate::ime::Ime;
-pub use crate::layout::{ContextDimension, ContextGrid, ContextGridItem};
+pub use crate::layout::{ContextDimension, ContextGrid};
 use crate::messenger::Messenger;
 use crate::performer::{self, Machine};
 use renderable::Cursor;
@@ -791,9 +791,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             for grid in self.contexts.iter_mut() {
                 let content = update_title(&self.config.title.content, grid.current());
 
-                self.event_proxy
-                    .send_event(RioEvent::Title(content.to_owned()), self.window_id);
-
                 let extra = if self.config.should_update_title_extra {
                     create_title_extra_from_context(grid.current())
                 } else {
@@ -802,17 +799,21 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
                 grid.current_mut().title = ContextTitle { content, extra };
             }
+            self.event_proxy.send_event(
+                RioEvent::Title(
+                    self.current().route_id,
+                    self.current().title.content.clone(),
+                ),
+                self.window_id,
+            );
         }
     }
 
     #[inline]
-    pub fn get_by_route_id(
-        &mut self,
-        route_id: usize,
-    ) -> Option<&mut ContextGridItem<T>> {
+    pub fn get_by_route_id(&mut self, route_id: usize) -> Option<&mut Context<T>> {
         self.contexts
             .iter_mut()
-            .find_map(|grid| grid.get_by_route_id(route_id))
+            .find_map(|grid| grid.get_by_route_id(route_id).map(|item| &mut item.val))
     }
 
     #[inline]
@@ -863,6 +864,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if context_id < self.contexts.len() {
             self.current_index = context_id;
             self.current_route = self.current().route_id;
+            self.event_proxy.send_event(
+                RioEvent::Title(self.current_route, self.current().title.content.clone()),
+                self.window_id,
+            );
         }
     }
 
@@ -926,13 +931,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return;
         }
 
-        if self.contexts.len() - 1 == self.current_index {
-            self.current_index = 0;
+        let next = if self.contexts.len() - 1 == self.current_index {
+            0
         } else {
-            self.current_index += 1;
-        }
-
-        self.current_route = self.current().route_id;
+            self.current_index + 1
+        };
+        self.set_current(next);
     }
 
     #[inline]
@@ -943,13 +947,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return;
         }
 
-        if self.current_index == 0 {
-            self.current_index = self.contexts.len() - 1;
+        let previous = if self.current_index == 0 {
+            self.contexts.len() - 1
         } else {
-            self.current_index -= 1;
-        }
-
-        self.current_route = self.current().route_id;
+            self.current_index - 1
+        };
+        self.set_current(previous);
     }
 
     #[inline]
@@ -1000,30 +1003,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         split_down: bool,
         sugarloaf: &mut Sugarloaf,
     ) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Some(path) = current_context.foreground_process_path() {
-                    working_dir = Some(path.to_string_lossy().to_string());
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
-            }
-        }
-
         let mut cloned_config = self.config.clone();
-        if working_dir.is_some() {
-            cloned_config.working_dir = working_dir;
-        }
+        cloned_config.working_dir = self.working_dir_for_new_context();
 
         let current = self.current();
         let cursor = current.cursor_from_ref();
@@ -1116,25 +1097,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn add_context(&mut self, redirect: bool, rich_text_id: usize) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Some(path) = current_context.foreground_process_path() {
-                    working_dir = Some(path.to_string_lossy().to_string());
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
-            }
-        }
+        let working_dir = self.working_dir_for_new_context();
 
         if self.config.is_native {
             self.event_proxy
@@ -1147,9 +1110,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             let last_index = self.contexts.len();
 
             let mut cloned_config = self.config.clone();
-            if working_dir.is_some() {
-                cloned_config.working_dir = working_dir;
-            }
+            cloned_config.working_dir = working_dir;
 
             let current = self.current();
             let cursor = current.cursor_from_ref();
@@ -1187,6 +1148,17 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     tracing::error!("not able to create a new context");
                 }
             }
+        }
+    }
+
+    fn working_dir_for_new_context(&self) -> Option<String> {
+        if self.config.cwd {
+            self.current()
+                .foreground_process_path()
+                .map(|path| path.to_string_lossy().into_owned())
+                .or_else(|| self.config.working_dir.clone())
+        } else {
+            self.config.working_dir.clone()
         }
     }
 
@@ -1255,6 +1227,18 @@ pub fn process_open_url(
 pub mod test {
     use super::*;
     use crate::event::VoidListener;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct TitleListener(Arc<Mutex<Vec<(usize, String)>>>);
+
+    impl EventListener for TitleListener {
+        fn send_event(&self, event: RioEvent, _id: WindowId) {
+            if let RioEvent::Title(route_id, title) = event {
+                self.0.lock().unwrap().push((route_id, title));
+            }
+        }
+    }
 
     #[test]
     fn test_capacity() {
@@ -1294,7 +1278,34 @@ pub mod test {
         let found = context_manager
             .get_by_route_id(hidden_route_id)
             .expect("hidden tab's route_id must still resolve via get_by_route_id");
-        assert_eq!(found.val.route_id, hidden_route_id);
+        assert_eq!(found.route_id, hidden_route_id);
+    }
+
+    #[test]
+    fn update_titles_emits_only_the_current_tab() {
+        let listener = TitleListener::default();
+        let events = Arc::clone(&listener.0);
+        let mut manager =
+            ContextManager::start_with_capacity(3, listener, WindowId::from(0)).unwrap();
+        manager.add_context(true, 0);
+        manager.config.title.content = "{{columns}}".into();
+        manager.contexts[0].current_mut().dimension.columns = 80;
+        manager.contexts[1].current_mut().dimension.columns = 120;
+        manager.update_titles();
+
+        assert_eq!(manager.title(0).unwrap().content, "80");
+        assert_eq!(manager.title(1).unwrap().content, "120");
+        assert_eq!(
+            *events.lock().unwrap(),
+            [(manager.current().route_id, "120".into())]
+        );
+
+        events.lock().unwrap().clear();
+        manager.set_current(0);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [(manager.current().route_id, "80".into())]
+        );
     }
 
     #[test]

@@ -407,10 +407,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         }
 
                         // Mark the renderable content as needing to render
-                        if let Some(ctx_item) =
+                        if let Some(context) =
                             route.window.screen.ctx_mut().get_by_route_id(route_id)
                         {
-                            ctx_item.val.renderable_content.pending_update.set_dirty();
+                            context.renderable_content.pending_update.set_dirty();
                         }
 
                         // Check if we need to throttle based on timing
@@ -454,12 +454,12 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             return;
                         }
 
-                        if let Some(ctx_item) =
+                        if let Some(context) =
                             route.window.screen.ctx_mut().get_by_route_id(route_id)
                         {
                             // Just mark dirty — damage will be extracted from
                             // the terminal when the renderer locks it.
-                            ctx_item.val.renderable_content.pending_update.set_dirty();
+                            context.renderable_content.pending_update.set_dirty();
                             route.request_redraw();
                         }
                     }
@@ -504,10 +504,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     // panels, so a bare redraw after the pixels arrive
                     // would no-op and leave the image blank until the
                     // next unrelated damage.
-                    if let Some(ctx_item) =
+                    if let Some(context) =
                         route.window.screen.ctx_mut().get_by_route_id(route_id)
                     {
-                        ctx_item.val.renderable_content.pending_update.set_dirty();
+                        context.renderable_content.pending_update.set_dirty();
                     }
 
                     // Request a redraw to display the updated graphics
@@ -651,13 +651,13 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         (false, false) => QueryStatus::Free,
                     };
                     let resp = format_query_response(cp, status);
-                    if let Some(item) = route
+                    if let Some(context) = route
                         .window
                         .screen
                         .context_manager
                         .get_by_route_id(route_id)
                     {
-                        item.context_mut().messenger.send_bytes(resp.into_bytes());
+                        context.messenger.send_bytes(resp.into_bytes());
                     }
                 }
             }
@@ -803,15 +803,12 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     );
                 }
             }
-            RioEventType::Rio(RioEvent::Title(title)) => {
+            RioEventType::Rio(RioEvent::Title(route_id, title)) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    route.set_window_title(&title);
-                }
-            }
-            RioEventType::Rio(RioEvent::TitleWithSubtitle(title, subtitle)) => {
-                if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    route.set_window_title(&title);
-                    route.set_window_subtitle(&subtitle);
+                    if route.window.screen.context_manager.current().route_id == route_id
+                    {
+                        route.set_window_title(&title);
+                    }
                 }
             }
             RioEventType::Rio(RioEvent::UpdateTitles) => {
@@ -849,13 +846,13 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         // Route the paste back to the panel that asked for it
                         // (OSC 52 reply), not whichever panel happens to be
                         // focused now.
-                        if let Some(item) = route
+                        if let Some(context) = route
                             .window
                             .screen
                             .context_manager
                             .get_by_route_id(route_id)
                         {
-                            item.val.messenger.send_bytes(text.into_bytes());
+                            context.messenger.send_bytes(text.into_bytes());
                         }
                     }
                 }
@@ -875,29 +872,29 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     // Route reply bytes (CSI / OSC responses) back to the
                     // PTY of the panel that emitted them, not whichever
                     // panel happens to be focused.
-                    if let Some(item) = route
+                    if let Some(context) = route
                         .window
                         .screen
                         .context_manager
                         .get_by_route_id(route_id)
                     {
-                        item.val.messenger.send_bytes(text.into_bytes());
+                        context.messenger.send_bytes(text.into_bytes());
                     }
                 }
             }
             RioEventType::Rio(RioEvent::TextAreaSizeRequest(route_id, format)) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    if let Some(item) = route
+                    if let Some(context) = route
                         .window
                         .screen
                         .context_manager
                         .get_by_route_id(route_id)
                     {
-                        let dimension = item.val.dimension;
+                        let dimension = context.dimension;
                         let text = format(crate::renderer::utils::terminal_dimensions(
                             &dimension,
                         ));
-                        item.val.messenger.send_bytes(text.into_bytes());
+                        context.messenger.send_bytes(text.into_bytes());
                     }
                 }
             }
@@ -910,7 +907,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     // mis-report when the user has focused a different
                     // split mid-flight.
                     let renderer_color = route.window.screen.renderer.colors[index];
-                    let Some(item) = route
+                    let Some(context) = route
                         .window
                         .screen
                         .context_manager
@@ -918,7 +915,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     else {
                         return;
                     };
-                    let terminal = item.val.terminal.lock();
+                    let terminal = context.terminal.lock();
                     let color: ColorRgb = match terminal.colors()[index] {
                         Some(color) => ColorRgb::from_color_arr(color),
                         // Ignore cursor color requests unless it was changed.
@@ -931,7 +928,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     };
                     drop(terminal);
 
-                    item.val.messenger.send_bytes(format(color).into_bytes());
+                    context.messenger.send_bytes(format(color).into_bytes());
                 }
             }
             RioEventType::Rio(RioEvent::CreateWindow) => {
@@ -1074,15 +1071,14 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     let screen = &mut route.window.screen;
                     // Background color is index 1 relative to NamedColor::Foreground
                     if index == NamedColor::Foreground as usize + 1 {
-                        if let Some(context_item) =
+                        if let Some(context) =
                             screen.context_manager.get_by_route_id(route_id)
                         {
                             use crate::context::renderable::BackgroundState;
-                            context_item.context_mut().renderable_content.background =
-                                Some(match color {
-                                    Some(c) => BackgroundState::Set(c.to_wgpu()),
-                                    None => BackgroundState::Reset,
-                                });
+                            context.renderable_content.background = Some(match color {
+                                Some(c) => BackgroundState::Set(c.to_wgpu()),
+                                None => BackgroundState::Reset,
+                            });
                         }
                     }
                 }
