@@ -400,8 +400,9 @@ impl VulkanRenderer {
         slot: usize,
         viewport: [f32; 2],
         draws: &[(vk::DescriptorSet, ImageInstance)],
+        range: std::ops::Range<usize>,
     ) {
-        if draws.is_empty() {
+        if range.is_empty() {
             return;
         }
         debug_assert!(slot < FRAMES_IN_FLIGHT);
@@ -423,7 +424,6 @@ impl VulkanRenderer {
         // Grow the per-slot kitty/sixel instance buffer if needed.
         let count = draws.len();
         let stride = std::mem::size_of::<ImageInstance>();
-        let needed_bytes = count * stride;
         if count > self.image_instance_capacity[slot] {
             let new_cap = count.next_power_of_two().max(16);
             self.image_instance_buffers[slot] = Some(allocate_host_visible_buffer_raw(
@@ -457,7 +457,9 @@ impl VulkanRenderer {
                 &[self.image_uniform_descriptor_sets[slot]],
                 &[],
             );
-            for (i, (texture_set, _inst)) in draws.iter().enumerate() {
+            for (i, (texture_set, _inst)) in
+                draws.iter().enumerate().take(range.end).skip(range.start)
+            {
                 // Set 1 (texture) changes per-draw — rebind.
                 self.shared.cmd_bind_descriptor_sets(
                     cmd,
@@ -474,7 +476,6 @@ impl VulkanRenderer {
                     &[buf.handle()],
                     &[byte_offset],
                 );
-                let _ = needed_bytes; // shut up unused warning
                 self.shared.cmd_draw(cmd, 4, 1, 0, 0);
             }
         }

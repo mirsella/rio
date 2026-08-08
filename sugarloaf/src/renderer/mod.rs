@@ -2496,34 +2496,28 @@ impl Renderer {
         // texture lookup needs an immutable borrow on
         // `self.image_textures` which would conflict with the
         // brush's `&mut self`.
-        // Collect both image layers into a SINGLE list, BelowText first
-        // then AboveText. `render_image_overlays` writes every instance
-        // from offset 0 of one shared per-slot instance buffer, so two
-        // separate calls in one frame clobber each other — the second
-        // call's write lands before the GPU executes the first call's
-        // draw, so only the last-submitted layer renders and the other
-        // draws blank (a kitty image and a sixel on screen together, or
-        // one then the other, each hid the earlier one). One call keeps
-        // every instance at its own offset; painter order is list order,
-        // so BelowText still draws under AboveText.
-        let ordered: Vec<(ash::vk::DescriptorSet, ImageInstance)> = self
+        // Keep both layers in one shared instance buffer, then draw each
+        // range at its proper point in the painter order.
+        let resolve_draw = |draw: &ImageDraw| {
+            let entry = self.image_textures.get(&draw.image_id)?;
+            let ImageTexture::Vulkan(texture) = &entry.gpu else {
+                return None;
+            };
+            Some((texture.descriptor_set, draw.instance))
+        };
+        let mut ordered: Vec<(ash::vk::DescriptorSet, ImageInstance)> = self
             .image_draws
             .iter()
             .filter(|d| d.layer == ImageLayer::BelowText)
-            .chain(
-                self.image_draws
-                    .iter()
-                    .filter(|d| d.layer == ImageLayer::AboveText),
-            )
-            .filter_map(|d| {
-                let entry = self.image_textures.get(&d.image_id)?;
-                if let ImageTexture::Vulkan(tex) = &entry.gpu {
-                    Some((tex.descriptor_set, d.instance))
-                } else {
-                    None
-                }
-            })
+            .filter_map(resolve_draw)
             .collect();
+        let below_count = ordered.len();
+        ordered.extend(
+            self.image_draws
+                .iter()
+                .filter(|d| d.layer == ImageLayer::AboveText)
+                .filter_map(resolve_draw),
+        );
 
         if let RendererType::Vulkan(brush) = &mut self.brush_type {
             if let Some(bg) = &self.background_image_texture {
@@ -2537,9 +2531,16 @@ impl Renderer {
                 }
             }
 
-            brush.render_image_overlays(cmd, slot, viewport, &ordered);
+            brush.render_image_overlays(cmd, slot, viewport, &ordered, 0..below_count);
             brush.render_quads(cmd, slot, viewport, &self.instances);
             brush.render_geometry(cmd, slot, viewport, &self.vertices);
+            brush.render_image_overlays(
+                cmd,
+                slot,
+                viewport,
+                &ordered,
+                below_count..ordered.len(),
+            );
             brush.draw_bootstrap(cmd);
         }
     }
