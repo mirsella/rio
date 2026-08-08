@@ -594,7 +594,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     Ok(config) => config,
                     Err(error) => {
                         tracing::warn!(
-                            "config.toml failed to parse; keeping the previous config"
+                            "config.toml failed to parse; keeping the previous config: {error:?}"
                         );
                         for route in self.router.routes.values_mut() {
                             route.report_error(&error.to_owned().into());
@@ -623,6 +623,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
                 let mut has_checked_adaptive_colors = false;
                 for route in self.router.routes.values_mut() {
+                    route.clear_errors();
                     // Apply system theme to ensure colors are consistent
                     if !has_checked_adaptive_colors {
                         let system_theme = event_loop.system_theme();
@@ -656,10 +657,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         route.window.screen.context_manager.clear_all_bells();
                     }
                     route.window.configure_window(&self.config);
-
-                    // The reload parsed: drop any error screen left from a
-                    // previously broken save.
-                    route.clear_errors();
 
                     route.request_redraw();
                 }
