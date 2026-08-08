@@ -15,7 +15,6 @@ pub mod metrics;
 // Lives in rio-fonts so librio's CPU renderers share the same table;
 // re-exported here to keep the sugarloaf-internal path stable.
 pub use rio_fonts::nerd_font as nerd_font_attributes;
-pub mod text_run_cache;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
