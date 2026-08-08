@@ -383,26 +383,14 @@ impl VulkanRenderer {
         }
     }
 
-    /// Draw a batch of image overlays (kitty / sixel placements) for
-    /// one layer (BelowText or AboveText). Each `(descriptor_set,
-    /// instance)` pair is one image placement — caller has resolved
-    /// the per-image descriptor set ahead of time. Writes all
-    /// instances into the per-slot ring buffer in order, then issues
-    /// one `cmd_draw(4, 1, ...)` per placement, binding the buffer
-    /// at the matching byte offset.
-    ///
-    /// Pre-binds the uniform set + image pipeline once, then loops
-    /// per-image just to update the texture descriptor + vertex
-    /// buffer offset.
-    pub fn render_image_overlays(
+    /// Upload all image overlay instances once before the render pass.
+    pub fn prepare_image_overlays(
         &mut self,
-        cmd: vk::CommandBuffer,
         slot: usize,
         viewport: [f32; 2],
         draws: &[(vk::DescriptorSet, ImageInstance)],
-        range: std::ops::Range<usize>,
     ) {
-        if range.is_empty() {
+        if draws.is_empty() {
             return;
         }
         debug_assert!(slot < FRAMES_IN_FLIGHT);
@@ -441,7 +429,25 @@ impl VulkanRenderer {
                 std::ptr::write(dst.add(i), *inst);
             }
         }
+    }
 
+    /// Draw one contiguous painter phase from the instances uploaded by
+    /// `prepare_image_overlays`; this never rewrites the shared buffer.
+    pub fn draw_image_overlays(
+        &self,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        draws: &[(vk::DescriptorSet, ImageInstance)],
+        range: std::ops::Range<usize>,
+    ) {
+        if range.is_empty() {
+            return;
+        }
+        let Some(buf) = self.image_instance_buffers[slot].as_ref() else {
+            tracing::error!("Vulkan image draw requested before instance upload");
+            return;
+        };
+        let stride = std::mem::size_of::<ImageInstance>();
         unsafe {
             self.shared.cmd_bind_pipeline(
                 cmd,
