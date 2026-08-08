@@ -785,6 +785,24 @@ mod tests {
     }
 
     #[test]
+    fn test_font_raster_options() {
+        let defaults = create_temporary_config("font-raster-defaults", "");
+        assert_eq!(
+            (defaults.fonts.hinting, defaults.fonts.antialias),
+            (None, None)
+        );
+
+        let configured = create_temporary_config(
+            "font-raster-options",
+            "[fonts]\nhinting = false\nantialias = false",
+        );
+        assert_eq!(
+            (configured.fonts.hinting, configured.fonts.antialias),
+            (Some(false), Some(false))
+        );
+    }
+
+    #[test]
     fn test_if_explicit_defaults_match() {
         let result = create_temporary_config("defaults", &default_config_file_content());
 
