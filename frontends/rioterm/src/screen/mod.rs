@@ -448,21 +448,12 @@ impl Screen<'_> {
         // rest of the config instead of waiting for a new window.
         self.bindings = crate::bindings::default_key_bindings(config);
 
-        // Preserve existing Island (tab state) and update its colors
         let old_island = self.renderer.island.take();
         let was_focused = self.renderer.is_window_focused;
         self.renderer = Renderer::new(config);
         self.renderer.is_window_focused = was_focused;
-        if let Some(mut island) = old_island {
-            island.update_colors(config.colors.tabs, config.colors.tabs_active);
-            island.title_font_size = config.navigation.tab_font_size;
-            island.geom =
-                crate::renderer::island::TabGeom::from_navigation(&config.navigation);
-            island.fill_override = (
-                config.navigation.tab_fill,
-                config.navigation.tab_fill_active,
-            );
-            self.renderer.island = Some(island);
+        if self.renderer.island.is_some() {
+            self.renderer.island = Some(old_island.unwrap_or_else(island::Island::new));
         }
 
         let scale = self.sugarloaf.scale_factor();
@@ -1503,8 +1494,6 @@ impl Screen<'_> {
     pub fn split_right_with_config(&mut self, config: rio_backend::config::Config) {
         // Allocate panel id; position lands on `ContextDimension`
         // through the Taffy layout pass (`apply_taffy_layout`).
-        let _ = self.renderer.margin.top
-            + self.renderer.island.as_ref().map_or(0.0, |i| i.height());
         let _ = config.margin.left;
         let rich_text_id = next_rich_text_id();
         self.context_manager.split_from_config(
@@ -1591,8 +1580,6 @@ impl Screen<'_> {
         // Allocate panel id; the layout pass handles positioning via
         // `ContextDimension` once the new tab's grid is built.
         let _ = self.context_manager.current_grid().scaled_margin.left;
-        let _ = self.renderer.margin.top
-            + self.renderer.island.as_ref().map_or(0.0, |i| i.height());
         let rich_text_id = next_rich_text_id();
         self.context_manager.add_context(redirect, rich_text_id);
         let new_index = self.context_manager.current_index();
@@ -2709,17 +2696,11 @@ impl Screen<'_> {
 
     #[inline]
     fn island_tab_layout(&self, num_tabs: usize) -> TabStripLayout {
-        let max_tab_width = self
-            .renderer
-            .island
-            .as_ref()
-            .map(|island| island.geom.max_tab_width)
-            .unwrap_or_else(rio_backend::config::navigation::default_tab_max_width);
         island::tab_strip_layout(
             self.sugarloaf.window_size().width,
             self.sugarloaf.scale_factor(),
             num_tabs,
-            max_tab_width,
+            self.renderer.navigation.tab_max_width,
         )
     }
 
@@ -2789,7 +2770,7 @@ impl Screen<'_> {
                 &self.island_tab_layout(num_tabs),
                 self.context_manager.current_index(),
                 mouse_x as f32 / scale_factor,
-                island::TabGeom::from_navigation(&self.renderer.navigation),
+                &self.renderer.navigation,
             );
 
         self.apply_close_hover(hovering)
@@ -2831,6 +2812,7 @@ impl Screen<'_> {
                     scale_factor,
                     window_width,
                     num_tabs,
+                    &self.renderer.navigation,
                     &mut self.context_manager,
                 );
                 if consumed {
@@ -2877,7 +2859,7 @@ impl Screen<'_> {
                 &layout,
                 self.context_manager.current_index(),
                 mouse_x_unscaled,
-                island::TabGeom::from_navigation(&self.renderer.navigation),
+                &self.renderer.navigation,
             )
         {
             return true;
@@ -2948,7 +2930,7 @@ impl Screen<'_> {
                 &layout,
                 clicked_tab,
                 mouse_x_unscaled,
-                island::TabGeom::from_navigation(&self.renderer.navigation),
+                &self.renderer.navigation,
             )
         {
             self.stop_hint_mode_if_active();

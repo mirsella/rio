@@ -121,24 +121,7 @@ impl Renderer {
             dynamic_background.2 = true;
         }
 
-        let island = if config.navigation.is_enabled() {
-            Some({
-                let mut island = island::Island::new(
-                    named_colors.tabs,
-                    named_colors.tabs_active,
-                    config.navigation.hide_if_single,
-                    config.navigation.tab_font_size,
-                    island::TabGeom::from_navigation(&config.navigation),
-                );
-                island.fill_override = (
-                    config.navigation.tab_fill,
-                    config.navigation.tab_fill_active,
-                );
-                island
-            })
-        } else {
-            None
-        };
+        let island = config.navigation.is_enabled().then(island::Island::new);
 
         Renderer {
             unfocused_split_opacity: config.navigation.unfocused_split_opacity,
@@ -672,6 +655,9 @@ impl Renderer {
                 sugarloaf,
                 (window_size.width, window_size.height, scale_factor),
                 context_manager,
+                &self.navigation,
+                self.named_colors.tabs,
+                self.named_colors.tabs_active,
                 island_bg,
             );
         }

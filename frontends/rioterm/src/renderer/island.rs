@@ -8,6 +8,7 @@
 
 use crate::context::ContextManager;
 use crate::renderer::helpers::spring::Spring;
+use rio_backend::config::navigation::Navigation;
 use rio_backend::event::{EventProxy, ProgressReport, ProgressState};
 use rio_backend::sugarloaf::text::DrawOpts;
 use rio_backend::sugarloaf::{Attributes, Sugarloaf};
@@ -15,67 +16,11 @@ use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::time::Instant;
 
-#[cfg(test)]
-const ISLAND_HEIGHT: f32 = 38.0;
 const PROGRESS_BAR_HEIGHT: f32 = 3.0;
 
 const PROGRESS_BAR_TIMEOUT_SECS: u64 = 15;
 
-/// Configurable tab-strip geometry ([navigation] tab-bar-height /
-/// tab-gap / tab-inset-y / tab-radius). Defaults reproduce the stock
-/// floating-island look; gap = inset = radius = 0 gives a flat strip.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TabGeom {
-    pub bar_height: f32,
-    pub gap: f32,
-    pub inset_y: f32,
-    pub radius: f32,
-    /// Per-tab width cap; `0` disables the cap so tabs expand to
-    /// fill the strip.
-    pub max_tab_width: f32,
-}
-
-impl TabGeom {
-    pub fn from_navigation(nav: &rio_backend::config::navigation::Navigation) -> Self {
-        // Defend the renderer against unclamped config: negative or NaN
-        // sizes here would yield garbage padding / an inverted island.
-        let non_negative = |v: f32| if v.is_finite() { v.max(0.0) } else { 0.0 };
-        Self {
-            bar_height: if nav.tab_bar_height.is_finite() {
-                nav.tab_bar_height.max(1.0)
-            } else {
-                1.0
-            },
-            gap: non_negative(nav.tab_gap),
-            inset_y: non_negative(nav.tab_inset_y),
-            radius: non_negative(nav.tab_radius),
-            max_tab_width: non_negative(nav.tab_max_width),
-        }
-    }
-}
-
-#[cfg(test)]
-impl Default for TabGeom {
-    fn default() -> Self {
-        Self {
-            bar_height: ISLAND_HEIGHT,
-            gap: TAB_GAP,
-            inset_y: TAB_INSET_Y,
-            radius: TAB_RADIUS,
-            max_tab_width: MAX_TAB_WIDTH,
-        }
-    }
-}
-
 const TAB_PADDING_X: f32 = 27.0;
-#[cfg(test)]
-const MAX_TAB_WIDTH: f32 = 180.0;
-#[cfg(test)]
-const TAB_GAP: f32 = 6.0;
-#[cfg(test)]
-const TAB_INSET_Y: f32 = 7.0;
-#[cfg(test)]
-const TAB_RADIUS: f32 = 6.0;
 const TITLE_ELLIPSIS: char = '…';
 const DRAG_THRESHOLD: f32 = 4.0;
 const DRAG_ANIMATION_LENGTH: f32 = 0.15;
@@ -289,14 +234,17 @@ fn draw_island(
 }
 
 #[inline]
-fn island_rect(slot_x: f32, tab_width: f32, geom: TabGeom) -> (f32, f32, f32, f32, f32) {
-    let x = slot_x + geom.gap / 2.0;
-    let w = (tab_width - geom.gap).max(0.0);
-    let y = geom.inset_y;
-    // A bar-height smaller than twice the inset would make the island
-    // height negative; floor it so the rect and its radius stay valid.
-    let h = (geom.bar_height - geom.inset_y * 2.0).max(0.0);
-    let radius = geom.radius.max(0.0).min(w / 2.0).min(h / 2.0);
+fn island_rect(
+    slot_x: f32,
+    tab_width: f32,
+    navigation: &Navigation,
+) -> (f32, f32, f32, f32, f32) {
+    let gap = navigation.tab_gap.min(tab_width);
+    let x = slot_x + gap / 2.0;
+    let w = tab_width - gap;
+    let y = navigation.tab_inset_y;
+    let h = navigation.tab_bar_height - navigation.tab_inset_y * 2.0;
+    let radius = navigation.tab_radius.min(w / 2.0).min(h / 2.0);
     (x, y, w, h, radius)
 }
 
@@ -336,10 +284,10 @@ fn close_button_center(island_x: f32, island_w: f32) -> Option<f32> {
 fn close_button_center_x(
     layout: &TabStripLayout,
     tab_index: usize,
-    geom: TabGeom,
+    navigation: &Navigation,
 ) -> Option<f32> {
     let slot_x = layout.left_margin + tab_index as f32 * layout.tab_width;
-    let (ix, _, iw, _, _) = island_rect(slot_x, layout.tab_width, geom);
+    let (ix, _, iw, _, _) = island_rect(slot_x, layout.tab_width, navigation);
     close_button_center(ix, iw)
 }
 
@@ -348,9 +296,9 @@ pub fn close_button_hit(
     layout: &TabStripLayout,
     tab_index: usize,
     x_unscaled: f32,
-    geom: TabGeom,
+    navigation: &Navigation,
 ) -> bool {
-    close_button_center_x(layout, tab_index, geom)
+    close_button_center_x(layout, tab_index, navigation)
         .is_some_and(|cx| (x_unscaled - cx).abs() <= CLOSE_HIT_HALF_WIDTH)
 }
 
@@ -393,14 +341,6 @@ fn draw_close_button(
 }
 
 pub struct Island {
-    pub hide_if_single: bool,
-    /// Tab-title font size in logical pixels (`navigation.tab-font-size`).
-    pub title_font_size: f32,
-    pub geom: TabGeom,
-    /// Explicit (inactive, active) island fills; None = adaptive.
-    pub fill_override: (Option<[f32; 4]>, Option<[f32; 4]>),
-    pub inactive_text_color: [f32; 4],
-    pub active_text_color: [f32; 4],
     /// Current progress bar state
     progress_state: Option<ProgressState>,
     /// Current progress value (0-100)
@@ -436,20 +376,8 @@ pub struct Island {
 }
 
 impl Island {
-    pub fn new(
-        inactive_text_color: [f32; 4],
-        active_text_color: [f32; 4],
-        hide_if_single: bool,
-        title_font_size: f32,
-        geom: TabGeom,
-    ) -> Self {
+    pub fn new() -> Self {
         Self {
-            hide_if_single,
-            title_font_size,
-            geom,
-            fill_override: (None, None),
-            inactive_text_color,
-            active_text_color,
             progress_state: None,
             progress_value: None,
             progress_started_at: None,
@@ -474,15 +402,6 @@ impl Island {
         let changed = self.close_hover != hover;
         self.close_hover = hover;
         changed
-    }
-
-    pub fn update_colors(
-        &mut self,
-        inactive_text_color: [f32; 4],
-        active_text_color: [f32; 4],
-    ) {
-        self.inactive_text_color = inactive_text_color;
-        self.active_text_color = active_text_color;
     }
 
     /// Update the progress bar state from an OSC 9;4 report.
@@ -721,6 +640,7 @@ impl Island {
         sugarloaf: &mut Sugarloaf,
         window_width: f32,
         scale_factor: f32,
+        bar_height: f32,
     ) {
         // Check for timeout first
         self.check_progress_timeout();
@@ -731,7 +651,7 @@ impl Island {
         };
 
         let width = window_width / scale_factor;
-        let y_position = self.geom.bar_height;
+        let y_position = bar_height;
 
         // Determine color based on state
         let color = match state {
@@ -793,12 +713,6 @@ impl Island {
         }
     }
 
-    /// Get the height of the island
-    #[inline]
-    pub fn height(&self) -> f32 {
-        self.geom.bar_height
-    }
-
     /// Render tabs using equal-width layout
     #[inline]
     pub fn render(
@@ -806,6 +720,9 @@ impl Island {
         sugarloaf: &mut Sugarloaf,
         dimensions: (f32, f32, f32),
         context_manager: &ContextManager<EventProxy>,
+        navigation: &Navigation,
+        inactive_text_color: [f32; 4],
+        active_text_color: [f32; 4],
         bg_color: [f32; 4],
     ) {
         let (window_width, _window_height, scale_factor) = dimensions;
@@ -814,13 +731,18 @@ impl Island {
 
         // Immediate-mode: no cached ids to hide. If we early-return
         // without drawing, the tabs just don't appear this frame.
-        if self.hide_if_single && num_tabs == 1 {
+        if navigation.hide_if_single && num_tabs == 1 {
             // No tab strip — drop any leftover drag/slide state so
             // `needs_redraw` doesn't keep frames alive for invisible
             // tabs.
             self.drag = None;
             self.slide_springs.clear();
-            self.render_progress_bar(sugarloaf, window_width, scale_factor);
+            self.render_progress_bar(
+                sugarloaf,
+                window_width,
+                scale_factor,
+                navigation.tab_bar_height,
+            );
             return;
         }
 
@@ -860,7 +782,7 @@ impl Island {
             window_width,
             scale_factor,
             num_tabs,
-            self.geom.max_tab_width,
+            navigation.tab_max_width,
         );
         let TabStripLayout {
             left_margin,
@@ -881,11 +803,11 @@ impl Island {
         // strip itself keeps the plain window background — the islands
         // float directly on it, with no strip tint or border lines.
         let mut fills = island_fills(bg_color);
-        if let Some(inactive) = self.fill_override.0 {
+        if let Some(inactive) = navigation.tab_fill {
             fills.inactive = inactive;
             fills.outline = None;
         }
-        if let Some(active) = self.fill_override.1 {
+        if let Some(active) = navigation.tab_fill_active {
             fills.active = active;
         }
 
@@ -930,7 +852,7 @@ impl Island {
                 sugarloaf,
                 &raw_title,
                 max_text_width,
-                self.title_font_size,
+                navigation.tab_font_size,
             );
 
             let text_color = if single {
@@ -939,16 +861,16 @@ impl Island {
                         custom[3] = 1.0;
                         custom
                     }
-                    None => self.active_text_color,
+                    None => active_text_color,
                 }
             } else if is_active {
-                self.active_text_color
+                active_text_color
             } else {
-                self.inactive_text_color
+                inactive_text_color
             };
 
             let title_opts = DrawOpts {
-                font_size: self.title_font_size,
+                font_size: navigation.tab_font_size,
                 color: color_u8(text_color),
                 ..DrawOpts::default()
             };
@@ -973,7 +895,7 @@ impl Island {
                 } else {
                     tab_x + (tab_width - text_width) / 2.0
                 };
-                let text_y = (self.geom.bar_height / 2.0) - (self.title_font_size / 2.);
+                let text_y = (navigation.tab_bar_height - navigation.tab_font_size) / 2.0;
                 ui.draw(text_x, text_y, &title, &title_opts);
             }
 
@@ -989,7 +911,7 @@ impl Island {
             // toward the strip — a white "active" overlay would
             // bleach custom colors to pastel on light themes, so the
             // hierarchy is carried by the mute instead.
-            let (ix, iy, iw, ih, radius) = island_rect(tab_x, tab_width, self.geom);
+            let (ix, iy, iw, ih, radius) = island_rect(tab_x, tab_width, navigation);
             let fill = match context_manager.custom_color(tab_index) {
                 Some(mut custom) => {
                     if !is_active {
@@ -1024,7 +946,7 @@ impl Island {
                         sugarloaf.rounded_rect(
                             None,
                             cx - CLOSE_HOVER_HALF,
-                            self.geom.bar_height / 2.0 - CLOSE_HOVER_HALF,
+                            navigation.tab_bar_height / 2.0 - CLOSE_HOVER_HALF,
                             CLOSE_HOVER_HALF * 2.0,
                             CLOSE_HOVER_HALF * 2.0,
                             fills.close_hover,
@@ -1036,10 +958,10 @@ impl Island {
                     draw_close_button(
                         sugarloaf,
                         cx,
-                        self.active_text_color,
+                        active_text_color,
                         self.close_hover,
                         2,
-                        self.geom.bar_height,
+                        navigation.tab_bar_height,
                     );
                 }
             }
@@ -1050,7 +972,7 @@ impl Island {
 
         // Draw the floating (dragged) tab above the slot tabs.
         if let (Some(drag_idx), Some(floating_x)) = (drag_index, floating_left) {
-            let (ix, iy, iw, ih, radius) = island_rect(floating_x, tab_width, self.geom);
+            let (ix, iy, iw, ih, radius) = island_rect(floating_x, tab_width, navigation);
 
             // Soft elevation: a slightly inflated dark halo behind the
             // lifted island so it reads as floating over the strip.
@@ -1094,10 +1016,10 @@ impl Island {
                 draw_close_button(
                     sugarloaf,
                     cx,
-                    self.active_text_color,
+                    active_text_color,
                     false,
                     12,
-                    self.geom.bar_height,
+                    navigation.tab_bar_height,
                 );
             }
 
@@ -1108,17 +1030,17 @@ impl Island {
                     sugarloaf,
                     &raw_title,
                     max_text_width,
-                    self.title_font_size,
+                    navigation.tab_font_size,
                 );
                 let title_opts = DrawOpts {
-                    font_size: self.title_font_size,
-                    color: color_u8(self.active_text_color),
+                    font_size: navigation.tab_font_size,
+                    color: color_u8(active_text_color),
                     ..DrawOpts::default()
                 };
                 let ui = sugarloaf.text_mut();
                 let text_width = ui.measure(&title, &title_opts);
                 let text_x = floating_x + (tab_width - text_width) / 2.0;
-                let text_y = (self.geom.bar_height / 2.0) - (self.title_font_size / 2.);
+                let text_y = (navigation.tab_bar_height - navigation.tab_font_size) / 2.0;
                 ui.draw(text_x, text_y, &title, &title_opts);
             }
         }
@@ -1128,12 +1050,23 @@ impl Island {
             if picker_tab < num_tabs {
                 let picker_tab_x = left_margin + picker_tab as f32 * tab_width;
                 let selected = context_manager.custom_color(picker_tab);
-                self.render_color_picker(sugarloaf, picker_tab_x, tab_width, selected);
+                self.render_color_picker(
+                    sugarloaf,
+                    picker_tab_x,
+                    tab_width,
+                    navigation.tab_bar_height,
+                    selected,
+                );
             }
         }
 
         // Render the progress bar below the island
-        self.render_progress_bar(sugarloaf, window_width, scale_factor);
+        self.render_progress_bar(
+            sugarloaf,
+            window_width,
+            scale_factor,
+            navigation.tab_bar_height,
+        );
     }
 
     /// Toggle the color picker for a given tab index
@@ -1238,6 +1171,7 @@ impl Island {
         scale_factor: f32,
         window_width: f32,
         num_tabs: usize,
+        navigation: &Navigation,
         context_manager: &mut ContextManager<EventProxy>,
     ) -> bool {
         let picker_tab = match self.color_picker_tab {
@@ -1257,12 +1191,12 @@ impl Island {
             window_width,
             scale_factor,
             num_tabs,
-            self.geom.max_tab_width,
+            navigation.tab_max_width,
         );
         let tab_x = left_margin + picker_tab as f32 * tab_width;
 
         // Picker is rendered just below the island
-        let picker_y = self.geom.bar_height;
+        let picker_y = navigation.tab_bar_height;
 
         // Check if click is within picker vertical range
         if mouse_y_unscaled < picker_y || mouse_y_unscaled > picker_y + PICKER_HEIGHT {
@@ -1320,10 +1254,11 @@ impl Island {
         sugarloaf: &mut Sugarloaf,
         tab_x: f32,
         tab_width: f32,
+        bar_height: f32,
         selected_color: Option<[f32; 4]>,
     ) {
         let padding = PICKER_PADDING;
-        let bg_y = self.geom.bar_height;
+        let bg_y = bar_height;
 
         // Compute total swatches width to derive the consistent inner content width
         // N color swatches + 1 reset swatch
@@ -1563,16 +1498,6 @@ fn color_u8(c: [f32; 4]) -> [u8; 4] {
 mod tests {
     use super::*;
 
-    #[test]
-    fn island_geometry_invariants() {
-        const {
-            assert!(TAB_INSET_Y * 2.0 < ISLAND_HEIGHT);
-            assert!(TAB_GAP < MAX_TAB_WIDTH);
-            assert!(CLOSE_MARGIN_RIGHT + CLOSE_HIT_HALF_WIDTH < CLOSE_MIN_ISLAND_WIDTH);
-            assert!(CLOSE_HOVER_HALF * 2.0 <= ISLAND_HEIGHT - TAB_INSET_Y * 2.0);
-        }
-    }
-
     /// The regression that shipped: `window_width` is physical while draws
     /// are logical, so centring on it put the title off the right edge of a
     /// 2x display and nothing appeared at all.
@@ -1629,16 +1554,17 @@ mod tests {
 
     #[test]
     fn island_rect_insets_slot_and_clamps_radius() {
+        let navigation = Navigation::default();
         // Slot at x=100, width 180 → island inset by half the gap on
         // each side and TAB_INSET_Y vertically.
-        let (x, y, w, h, radius) = island_rect(100.0, 180.0, TabGeom::default());
-        assert_eq!(x, 100.0 + TAB_GAP / 2.0);
-        assert_eq!(y, TAB_INSET_Y);
-        assert_eq!(w, 180.0 - TAB_GAP);
-        assert_eq!(h, ISLAND_HEIGHT - TAB_INSET_Y * 2.0);
-        assert_eq!(radius, TAB_RADIUS);
+        let (x, y, w, h, radius) = island_rect(100.0, 180.0, &navigation);
+        assert_eq!(x, 100.0 + navigation.tab_gap / 2.0);
+        assert_eq!(y, navigation.tab_inset_y);
+        assert_eq!(w, 180.0 - navigation.tab_gap);
+        assert_eq!(h, navigation.tab_bar_height - navigation.tab_inset_y * 2.0);
+        assert_eq!(radius, navigation.tab_radius);
 
-        let (_, _, w, h, radius) = island_rect(0.0, 4.0, TabGeom::default());
+        let (_, _, w, h, radius) = island_rect(0.0, 4.0, &navigation);
         assert_eq!(w, 0.0);
         assert_eq!(radius, 0.0);
         assert!(radius <= h / 2.0);
@@ -1681,39 +1607,8 @@ mod tests {
         assert_eq!(over(dst, [0.9, 0.1, 0.3, 1.0]), [0.9, 0.1, 0.3, 1.0]);
     }
 
-    #[test]
-    fn test_island_initialization() {
-        let inactive_color = [0.5, 0.5, 0.5, 1.0];
-        let active_color = [0.9, 0.9, 0.9, 1.0];
-
-        let island =
-            Island::new(inactive_color, active_color, true, 12.0, TabGeom::default());
-
-        assert_eq!(island.inactive_text_color, inactive_color);
-        assert_eq!(island.active_text_color, active_color);
-        assert!(island.hide_if_single);
-    }
-
-    #[test]
-    fn test_island_height() {
-        let island = Island::new(
-            [0.8, 0.8, 0.8, 1.0],
-            [1.0, 1.0, 1.0, 1.0],
-            false,
-            12.0,
-            TabGeom::default(),
-        );
-        assert_eq!(island.height(), ISLAND_HEIGHT);
-    }
-
     fn test_island() -> Island {
-        Island::new(
-            [0.5, 0.5, 0.5, 1.0],
-            [0.9, 0.9, 0.9, 1.0],
-            false,
-            12.0,
-            TabGeom::default(),
-        )
+        Island::new()
     }
 
     #[test]
@@ -1906,10 +1801,11 @@ mod tests {
 
     #[test]
     fn tab_strip_layout_geometry() {
+        let max_tab_width = Navigation::default().tab_max_width;
         // 1000 physical px @ 2x scale → 500 logical px window. Slots
         // stay below the cap here, so the math matches the old
         // fill-the-strip layout.
-        let layout = tab_strip_layout(1000.0, 2.0, 4, MAX_TAB_WIDTH);
+        let layout = tab_strip_layout(1000.0, 2.0, 4, max_tab_width);
         #[cfg(target_os = "macos")]
         {
             assert_eq!(layout.left_margin, ISLAND_MARGIN_LEFT_MACOS);
@@ -1923,22 +1819,23 @@ mod tests {
             assert_eq!(layout.tabs_width, 492.0);
         }
         // Zero tabs clamps the divisor.
-        assert!(tab_strip_layout(1000.0, 2.0, 0, MAX_TAB_WIDTH)
+        assert!(tab_strip_layout(1000.0, 2.0, 0, max_tab_width)
             .tab_width
             .is_finite());
     }
 
     #[test]
     fn tab_strip_layout_caps_slot_width() {
-        let layout = tab_strip_layout(3000.0, 2.0, 2, MAX_TAB_WIDTH);
-        assert_eq!(layout.tab_width, MAX_TAB_WIDTH);
-        assert_eq!(layout.tabs_width, MAX_TAB_WIDTH * 2.0);
+        let max_tab_width = Navigation::default().tab_max_width;
+        let layout = tab_strip_layout(3000.0, 2.0, 2, max_tab_width);
+        assert_eq!(layout.tab_width, max_tab_width);
+        assert_eq!(layout.tabs_width, max_tab_width * 2.0);
         // The tabs region ends well before the 1500 logical px strip.
         assert!(layout.left_margin + layout.tabs_width < 1500.0);
 
         // Pathologically narrow window: width clamps at 0 instead of
         // going negative.
-        let layout = tab_strip_layout(10.0, 2.0, 4, MAX_TAB_WIDTH);
+        let layout = tab_strip_layout(10.0, 2.0, 4, max_tab_width);
         assert_eq!(layout.tab_width, 0.0);
         assert_eq!(layout.tabs_width, 0.0);
     }
@@ -2004,6 +1901,7 @@ mod tests {
 
     #[test]
     fn close_button_anchors_to_island_right_edge() {
+        let navigation = Navigation::default();
         // Full-width slot: slot 1 spans 180..360, island 183..354, so
         // the button centers at 354 - CLOSE_MARGIN_RIGHT.
         let layout = TabStripLayout {
@@ -2011,13 +1909,14 @@ mod tests {
             tab_width: 180.0,
             tabs_width: 360.0,
         };
-        let cx = close_button_center_x(&layout, 1, TabGeom::default()).unwrap();
+        let cx = close_button_center_x(&layout, 1, &navigation).unwrap();
         assert_eq!(
             cx,
-            180.0 + TAB_GAP / 2.0 + (180.0 - TAB_GAP) - CLOSE_MARGIN_RIGHT
+            180.0 + navigation.tab_gap / 2.0 + (180.0 - navigation.tab_gap)
+                - CLOSE_MARGIN_RIGHT
         );
         // The whole forgiving hit box stays inside the island.
-        assert!(cx + CLOSE_HIT_HALF_WIDTH <= 360.0 - TAB_GAP / 2.0);
+        assert!(cx + CLOSE_HIT_HALF_WIDTH <= 360.0 - navigation.tab_gap / 2.0);
 
         // Narrow islands (many tabs) drop the button — no hit box, so
         // rendering and click handling agree via the shared helper.
@@ -2026,7 +1925,7 @@ mod tests {
             tab_width: 60.0,
             tabs_width: 600.0,
         };
-        assert_eq!(close_button_center_x(&narrow, 3, TabGeom::default()), None);
+        assert_eq!(close_button_center_x(&narrow, 3, &navigation), None);
     }
 
     #[test]
@@ -2040,7 +1939,7 @@ mod tests {
             tab_width: 180.0,
             tabs_width: 360.0,
         };
-        let cx = close_button_center_x(&layout, 0, TabGeom::default()).unwrap();
+        let cx = close_button_center_x(&layout, 0, &Navigation::default()).unwrap();
         let title_max_right = layout.tab_width - TAB_PADDING_X;
         assert!(cx - CLOSE_HIT_HALF_WIDTH >= title_max_right);
     }
