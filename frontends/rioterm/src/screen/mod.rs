@@ -2705,6 +2705,14 @@ impl Screen<'_> {
         self.apply_close_hover(false)
     }
 
+    pub fn tab_bar_contains_y(&self, y: f64) -> bool {
+        self.renderer
+            .navigation
+            .island_visible(self.context_manager.len())
+            && y <= (self.renderer.navigation.tab_bar_height
+                * self.sugarloaf.scale_factor()) as f64
+    }
+
     pub fn handle_island_click(
         &mut self,
         window: &rio_window::window::Window,
