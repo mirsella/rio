@@ -23,23 +23,22 @@ use std::rc::Rc;
 pub(crate) fn extract_line_text_with_cols<T: EventListener>(
     term: &rio_backend::crosswords::Crosswords<T>,
     line: Line,
-) -> (String, Vec<usize>) {
+) -> (String, Vec<Column>) {
     let grid = &term.grid;
-    let cols = grid.columns();
-    let mut text = String::with_capacity(cols);
-    let mut byte_to_col: Vec<usize> = Vec::with_capacity(cols);
+    let mut text = String::with_capacity(grid.columns());
+    let mut byte_to_col = Vec::with_capacity(grid.columns());
 
-    for col in 0..cols {
-        let cell = &grid[line][Column(col)];
+    for col in (0..grid.columns()).map(Column) {
+        let pos = Pos::new(line, col);
+        let cell = &grid[pos];
         if cell.is_spacer() || cell.is_leading_spacer() {
             continue;
         }
-        let c = cell.c();
-        let len = c.len_utf8();
-        for _ in 0..len {
-            byte_to_col.push(col);
+
+        for c in grid.cell_text(pos) {
+            text.push(c);
+            byte_to_col.extend(std::iter::repeat_n(col, c.len_utf8()));
         }
-        text.push(c);
     }
 
     (text, byte_to_col)
@@ -266,6 +265,9 @@ impl HintState {
 
             // Find all matches in this line. Onig yields (byte_start, byte_end);
             for (start, end) in regex.find_iter(&line_text) {
+                if start == end || end > byte_to_col.len() {
+                    continue;
+                }
                 let mut match_text = line_text[start..end].to_string();
 
                 // Apply post-processing if enabled
@@ -277,21 +279,19 @@ impl HintState {
                 }
 
                 let last_byte = start + match_text.len() - 1;
-                let start_col_idx = byte_to_col[start];
-                let last_col_idx = byte_to_col[last_byte];
+                let start_col = byte_to_col[start];
+                let mut end_col = byte_to_col[last_byte];
                 // If the match ends on a wide glyph, extend the
                 // highlight to its spacer cell so the click target
                 // covers the full visible glyph.
-                let end_col_idx = if grid[line][Column(last_col_idx)].is_wide() {
-                    last_col_idx + 1
-                } else {
-                    last_col_idx
-                };
+                if grid[line][end_col].is_wide() {
+                    end_col += 1;
+                }
 
                 let hint_match = HintMatch {
                     text: match_text,
-                    start: Pos::new(line, Column(start_col_idx)),
-                    end: Pos::new(line, Column(end_col_idx)),
+                    start: Pos::new(line, start_col),
+                    end: Pos::new(line, end_col),
                     hint: hint.clone(),
                 };
 
@@ -906,114 +906,23 @@ mod tests {
     }
 
     #[test]
-    fn issue_1619_plain_ascii_url_unchanged() {
-        // Control: bare URL with no prefix. Must already work and
-        // continue working. Underline covers cols 0..=18.
-        assert_single_url("https://example.com", "https://example.com");
-    }
-
-    #[test]
-    fn issue_1619_ascii_prefix_unchanged() {
-        // Control: ASCII text before the URL. Byte offset == cell
-        // offset, so the pre-fix path also produced the right answer.
-        assert_single_url("ab https://example.com/ascii", "https://example.com/ascii");
-    }
-
-    #[test]
-    fn issue_1619_emoji_prefix_aligns() {
-        // Reproduces the canonical failure: one wide emoji before the
-        // URL. The pre-fix code mapped byte offset 6 (4 bytes for 😀
-        // + 2 spaces) to Column(6), but the URL actually starts at
-        // grid column 3.
-        assert_single_url("😀 https://example.com/emoji", "https://example.com/emoji");
-    }
-
-    #[test]
-    fn issue_1619_cjk_prefix_aligns() {
-        // Two CJK glyphs before the URL — each is width-2 and 3 bytes
-        // in UTF-8, compounding the shift. The pre-fix code computed
-        // start_col = 11; the correct grid column is 5.
-        assert_single_url("世界 https://example.com/cjk", "https://example.com/cjk");
-    }
-
-    #[test]
-    fn issue_1619_real_world_bullet_trigger() {
-        // The exact pattern from the bug report: Claude Code's "⏺ "
-        // bullet (U+25CF, width 1 but 3 bytes in UTF-8) prefixing a
-        // URL. Pre-fix: byte-offset URL start = 4, but its grid
-        // column is 2. Tests the "multibyte but NOT wide" branch.
-        assert_single_url("⏺ https://linear.app/ENG-993", "https://linear.app/ENG-993");
-    }
-
-    #[test]
-    fn issue_1619_multiple_emoji_prefix_aligns() {
-        // Multiple wide glyphs stack the shift. Demonstrates the
-        // mapping handles repeated wide cells correctly.
-        assert_single_url(
-            "🎉🎉🎉 https://example.com/party",
-            "https://example.com/party",
-        );
-    }
-
-    #[test]
-    fn issue_1619_mixed_wide_and_narrow_prefix() {
-        // Mix of wide emoji and narrow multibyte glyphs before the
-        // URL, exercising every branch of the byte→col map in one
-        // line.
-        assert_single_url("a😀b⏺c https://example.com/mix", "https://example.com/mix");
-    }
-
-    #[test]
-    fn issue_1619_url_after_wide_in_paren_post_processed() {
-        // Wide-prefix + post_processing trailing-delimiter strip.
-        // The trailing ')' is unmatched, so post_process_hyperlink_uri
-        // truncates it. The end_col must point at the last cell of
-        // the *trimmed* URL, not the original byte length.
-        assert_single_url("(😀 https://example.com/end)", "https://example.com/end");
-    }
-
-    #[test]
-    fn issue_1619_no_wide_chars_post_processing_trim() {
-        // Control for the post-processing path with no wide chars:
-        // trailing '.' should be trimmed and end_col adjusted.
-        assert_single_url("see https://example.com/page.", "https://example.com/page");
-    }
-
-    #[test]
-    fn issue_1619_extract_line_text_skips_spacer_cells() {
-        // Direct test of the helper: a wide glyph followed by text
-        // produces a buffer with the wide char once (not the spacer
-        // placeholder space) and a byte→col map that points at the
-        // wide cell's column for every byte of the codepoint.
-        let term = mock_term_with_line("😀ab");
-        let (text, byte_to_col) = extract_line_text_with_cols(&term, Line(0));
-        // After the trailing reserve cells in `mock_term_with_line`,
-        // the line text includes trailing '\0' chars; assert only the
-        // leading content.
-        assert!(text.starts_with("😀ab"), "got text {:?}", text);
-        // 😀 is 4 UTF-8 bytes, all mapping to grid column 0.
-        assert_eq!(&byte_to_col[..4], &[0, 0, 0, 0]);
-        // 'a' is at grid column 2 (col 1 is the spacer, skipped).
-        assert_eq!(byte_to_col[4], 2);
-        // 'b' is at grid column 3.
-        assert_eq!(byte_to_col[5], 3);
-    }
-
-    #[test]
-    fn issue_1619_byte_to_col_map_handles_leading_wide_chain() {
-        // A chain of three wide CJK glyphs: each is 3 UTF-8 bytes and
-        // 2 grid cells. Verifies the map walks cells correctly.
-        let term = mock_term_with_line("世界好x");
-        let (text, byte_to_col) = extract_line_text_with_cols(&term, Line(0));
-        assert!(text.starts_with("世界好x"));
-        // 世 → cols 0..2 (cell 0 + spacer 1)
-        assert_eq!(&byte_to_col[..3], &[0, 0, 0]);
-        // 界 → cols 2..4
-        assert_eq!(&byte_to_col[3..6], &[2, 2, 2]);
-        // 好 → cols 4..6
-        assert_eq!(&byte_to_col[6..9], &[4, 4, 4]);
-        // x → col 6
-        assert_eq!(byte_to_col[9], 6);
+    fn issue_1619_url_hitboxes_follow_visible_columns() {
+        for (content, url) in [
+            ("https://example.com", "https://example.com"),
+            ("ab https://example.com/ascii", "https://example.com/ascii"),
+            ("😀 https://example.com/emoji", "https://example.com/emoji"),
+            ("世界 https://example.com/cjk", "https://example.com/cjk"),
+            ("⏺ https://linear.app/ENG-993", "https://linear.app/ENG-993"),
+            (
+                "🎉🎉🎉 https://example.com/party",
+                "https://example.com/party",
+            ),
+            ("a😀b⏺c https://example.com/mix", "https://example.com/mix"),
+            ("(😀 https://example.com/end)", "https://example.com/end"),
+            ("see https://example.com/page.", "https://example.com/page"),
+        ] {
+            assert_single_url(content, url);
+        }
     }
 
     #[test]

@@ -2189,21 +2189,16 @@ impl Screen<'_> {
         // Find all matches in this line and check if point is within any of them.
         // Onig yields (byte_start, byte_end); we slice the source ourselves.
         for (start, end) in regex.find_iter(&line_text) {
-            if end == 0 || end > byte_to_col.len() {
+            if start == end || end > byte_to_col.len() {
                 continue;
             }
-            let start_col_idx = byte_to_col[start];
-            let last_col_idx = byte_to_col[end - 1];
-            let end_col_idx = if grid[point.row]
-                [rio_backend::crosswords::pos::Column(last_col_idx)]
-            .is_wide()
-            {
-                last_col_idx + 1
+            let start_col = byte_to_col[start];
+            let last_col = byte_to_col[end - 1];
+            let end_col = if grid[point.row][last_col].is_wide() {
+                last_col + 1
             } else {
-                last_col_idx
+                last_col
             };
-            let start_col = rio_backend::crosswords::pos::Column(start_col_idx);
-            let end_col = rio_backend::crosswords::pos::Column(end_col_idx);
 
             // Check if the point is within this match
             if point.col >= start_col && point.col <= end_col {
