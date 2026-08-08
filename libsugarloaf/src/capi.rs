@@ -197,7 +197,6 @@ pub unsafe extern "C" fn sl_new(
         };
         let renderer = SugarloafRenderer {
             backend: default_backend(),
-            font_features: None,
             colorspace: colorspace_from_u32(colorspace),
             ..Default::default()
         };
