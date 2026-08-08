@@ -5004,63 +5004,6 @@ impl Screen<'_> {
             .renderable_content
             .hint_labels = hint_labels;
     }
-
-    /// Find regex match at the specified point
-    fn find_regex_match_at_point(
-        &self,
-        terminal: &rio_backend::crosswords::Crosswords<EventProxy>,
-        point: rio_backend::crosswords::pos::Pos,
-        regex: &onig::Regex,
-        hint_config: std::rc::Rc<rio_backend::config::hints::Hint>,
-    ) -> Option<crate::hints::HintMatch> {
-        let grid = &terminal.grid;
-
-        // Check if the point is within grid bounds
-        if point.row >= grid.total_lines() as i32 || point.col.0 >= grid.columns() {
-            return None;
-        }
-
-        // Extract text plus a byte→grid-column mapping so regex byte
-        // offsets translate back to the right cells when the line
-        // contains wide glyphs or multibyte codepoints. Without the
-        // mapping, `Column(byte_offset)` lands inside the URL when a
-        // wide glyph (emoji/CJK) precedes it, and the click target
-        // slides off the visible underline (see issue #1619).
-        let (line_text, byte_to_col) =
-            crate::hints::extract_line_text_with_cols(terminal, point.row);
-
-        // Find all matches in this line and check if point is within any of them.
-        // Onig yields (byte_start, byte_end); we slice the source ourselves.
-        for (start, end) in regex.find_iter(&line_text) {
-            if start == end || end > byte_to_col.len() {
-                continue;
-            }
-            let start_col = byte_to_col[start];
-            let mut match_text = line_text[start..end].to_string();
-            if hint_config.post_processing {
-                match_text = crate::hints::trim_match(&match_text).to_string();
-            }
-            if match_text.is_empty() {
-                continue;
-            }
-
-            let mut end_col = byte_to_col[start + match_text.len() - 1];
-            if grid[point.row][end_col].is_wide() {
-                end_col += 1;
-            }
-
-            if point.col >= start_col && point.col <= end_col {
-                return Some(crate::hints::HintMatch {
-                    text: match_text,
-                    start: rio_backend::crosswords::pos::Pos::new(point.row, start_col),
-                    end: rio_backend::crosswords::pos::Pos::new(point.row, end_col),
-                    hint: hint_config,
-                });
-            }
-        }
-
-        None
-    }
 }
 
 /// Open `target` with whatever Windows has registered for it, without a
@@ -5141,69 +5084,6 @@ mod tests {
             at: std::time::Instant::now() - crate::constants::MULTI_CLICK_THRESHOLD * 2,
         };
         assert!(!stale.validates_double_click(origin));
-    }
-
-    #[test]
-    fn test_trim_match() {
-        assert_eq!(crate::hints::trim_match(")"), "");
-
-        // Test removing trailing parenthesis
-        assert_eq!(
-            crate::hints::trim_match("https://example.com)"),
-            "https://example.com"
-        );
-
-        // Test removing trailing comma
-        assert_eq!(
-            crate::hints::trim_match("https://example.com,"),
-            "https://example.com"
-        );
-
-        // Test removing trailing period
-        assert_eq!(
-            crate::hints::trim_match("https://example.com."),
-            "https://example.com"
-        );
-
-        // Test handling balanced parentheses (should keep them)
-        assert_eq!(
-            crate::hints::trim_match(
-                "https://example.com/path(with)parens"
-            ),
-            "https://example.com/path(with)parens"
-        );
-
-        // Test handling unbalanced parentheses
-        assert_eq!(
-            crate::hints::trim_match("https://example.com/path)"),
-            "https://example.com/path"
-        );
-
-        // Test handling multiple trailing delimiters
-        assert_eq!(
-            crate::hints::trim_match("https://example.com.'),"),
-            "https://example.com"
-        );
-
-        // Test markdown-style URLs
-        assert_eq!(
-            crate::hints::trim_match("https://example.com)"),
-            "https://example.com"
-        );
-
-        // Test handling unbalanced brackets
-        assert_eq!(
-            crate::hints::trim_match("https://example.com/path]"),
-            "https://example.com/path"
-        );
-
-        // Test balanced brackets (should keep them)
-        assert_eq!(
-            crate::hints::trim_match(
-                "https://example.com/path[with]brackets"
-            ),
-            "https://example.com/path[with]brackets"
-        );
     }
 
     // Regression test for #1620: mouse selection must claim the PRIMARY
