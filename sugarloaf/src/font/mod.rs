@@ -1775,6 +1775,167 @@ pub fn threshold_mask(data: &mut [u8]) {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone)]
+pub struct SwashFontData {
+    data: SharedData,
+    offset: u32,
+    key: CacheKey,
+    wght: Option<f32>,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl SwashFontData {
+    pub fn from_library(library: &FontLibraryData, font_id: usize) -> Option<Self> {
+        let (data, offset, key) = library.get_data(&font_id)?;
+        let wght = library.try_get(&font_id)?.wght_variation;
+        Some(Self {
+            data,
+            offset,
+            key,
+            wght,
+        })
+    }
+
+    #[inline]
+    pub fn font_ref(&self) -> FontRef<'_> {
+        FontRef {
+            data: self.data.as_ref(),
+            offset: self.offset,
+            key: self.key,
+        }
+    }
+
+    #[inline]
+    pub fn wght_setting(&self) -> Option<swash::Setting<f32>> {
+        self.wght.map(|value| swash::Setting {
+            tag: u32::from_be_bytes(*b"wght"),
+            value,
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub struct SwashRasterizedGlyph {
+    pub width: u32,
+    pub height: u32,
+    pub left: i32,
+    pub top: i32,
+    pub is_color: bool,
+    pub bytes: Vec<u8>,
+}
+
+/// Canonical non-macOS glyph rasterization boundary. Color bitmap strikes are
+/// normalized to the premultiplied RGBA representation expected by every Rio
+/// atlas before pixels leave this function.
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn rasterize_swash_glyph(
+    scale_ctx: &mut swash::scale::ScaleContext,
+    font: &SwashFontData,
+    glyph_id: u16,
+    size_px: f32,
+    synthetic_bold: bool,
+    synthetic_italic: bool,
+    hint: bool,
+    antialias: bool,
+) -> Option<SwashRasterizedGlyph> {
+    use swash::scale::{
+        image::{Content, Image},
+        Render, Source, StrikeWith,
+    };
+    use swash::zeno::{Angle, Format, Transform};
+
+    let wght = font.wght_setting();
+    let mut scaler = scale_ctx
+        .builder(font.font_ref())
+        .hint(hint)
+        .size(size_px)
+        .normalized_coords(core::iter::empty::<i16>())
+        .variations(wght.iter().copied())
+        .build();
+    let sources = [
+        Source::ColorOutline(0),
+        Source::ColorBitmap(StrikeWith::BestFit),
+        Source::Outline,
+    ];
+    let mut image = Image::new();
+    let embolden = synthetic_bold
+        .then(|| (size_px / 14.0).max(1.0))
+        .unwrap_or(0.0);
+    if !Render::new(&sources)
+        .format(Format::Alpha)
+        .embolden(embolden)
+        .transform(synthetic_italic.then(|| {
+            Transform::skew(Angle::from_degrees(14.0), Angle::from_degrees(0.0))
+        }))
+        .render_into(&mut scaler, glyph_id, &mut image)
+    {
+        return None;
+    }
+
+    premultiply_color_bitmap(&mut image);
+    let is_color = image.content == Content::Color;
+    if !antialias && !is_color {
+        threshold_mask(&mut image.data);
+    }
+    Some(SwashRasterizedGlyph {
+        width: image.placement.width,
+        height: image.placement.height,
+        left: image.placement.left,
+        top: image.placement.top,
+        is_color,
+        bytes: image.data,
+    })
+}
+
+/// Convert Swash bitmap strikes from straight to premultiplied RGBA.
+///
+/// Swash's color-outline renderer already produces premultiplied pixels, so
+/// only decoded color bitmaps must be converted before entering our atlases.
+#[cfg(not(target_os = "macos"))]
+fn premultiply_color_bitmap(image: &mut swash::scale::image::Image) {
+    if !matches!(image.source, swash::scale::Source::ColorBitmap(_)) {
+        return;
+    }
+
+    debug_assert_eq!(image.data.len() % 4, 0);
+    for pixel in image.data.chunks_exact_mut(4) {
+        let alpha = pixel[3] as u16;
+        for channel in &mut pixel[..3] {
+            *channel = ((*channel as u16 * alpha + 127) / 255) as u8;
+        }
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod color_bitmap_tests {
+    use super::premultiply_color_bitmap;
+    use swash::scale::{image::Image, Source, StrikeWith};
+
+    #[test]
+    fn premultiplies_color_bitmap_pixels() {
+        let mut image = Image::new();
+        image.source = Source::ColorBitmap(StrikeWith::BestFit);
+        image.data = vec![71, 112, 76, 0, 200, 100, 50, 128, 9, 8, 7, 255];
+
+        premultiply_color_bitmap(&mut image);
+
+        assert_eq!(image.data, [0, 0, 0, 0, 100, 50, 25, 128, 9, 8, 7, 255]);
+    }
+
+    #[test]
+    fn leaves_color_outline_pixels_unchanged() {
+        let mut image = Image::new();
+        image.source = Source::ColorOutline(0);
+        image.data = vec![100, 50, 25, 128];
+
+        premultiply_color_bitmap(&mut image);
+
+        assert_eq!(image.data, [100, 50, 25, 128]);
+    }
+}
+
 /// Parse `fonts.features` entries into OpenType feature settings.
 /// Accepts `"ss01"`, `"+ss01"`, `"-liga"` and `"cv01=2"` forms.
 pub fn parse_font_features(entries: &[String]) -> Vec<swash::Setting<u16>> {

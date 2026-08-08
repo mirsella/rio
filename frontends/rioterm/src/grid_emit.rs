@@ -1230,15 +1230,7 @@ pub struct GridGlyphRasterizer {
     #[cfg(not(target_os = "macos"))]
     scale_ctx: rio_backend::sugarloaf::swash::scale::ScaleContext,
     #[cfg(not(target_os = "macos"))]
-    font_data_cache: FxHashMap<
-        u32,
-        (
-            rio_backend::sugarloaf::font::SharedData,
-            u32,
-            rio_backend::sugarloaf::swash::CacheKey,
-            Option<f32>,
-        ),
-    >,
+    font_data_cache: FxHashMap<u32, rio_backend::sugarloaf::font::SwashFontData>,
 }
 
 impl Default for GridGlyphRasterizer {
@@ -1544,28 +1536,19 @@ fn shape_run_swash(
     size_bucket: u16,
     font_library: &FontLibrary,
 ) -> Option<(Vec<ShapedGlyph>, i16)> {
-    use rio_backend::sugarloaf::swash::{FontRef, Setting};
-
     let features = rasterizer.library_settings(font_library).features;
     let font_entry = rasterizer
         .font_data_cache
         .entry(font_id)
         .or_insert_with(|| {
             let lib = font_library.inner.read();
-            let data = lib
-                .get_data(&(font_id as usize))
-                .expect("font id resolved but get_data returned None");
-            let wght = lib
-                .try_get(&(font_id as usize))
-                .and_then(|font| font.wght_variation);
-            (data.0, data.1, data.2, wght)
+            rio_backend::sugarloaf::font::SwashFontData::from_library(
+                &lib,
+                font_id as usize,
+            )
+            .expect("font id resolved but get_data returned None")
         });
-    let wght = font_entry.3;
-    let font_ref = FontRef {
-        data: font_entry.0.as_ref(),
-        offset: font_entry.1,
-        key: font_entry.2,
-    };
+    let font_ref = font_entry.font_ref();
 
     let ascent_px = *rasterizer
         .ascent_cache
@@ -1575,11 +1558,7 @@ fn shape_run_swash(
             m.ascent.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
         });
 
-    const WGHT_TAG: u32 = u32::from_be_bytes(*b"wght");
-    let wght_var = wght.map(|v| Setting {
-        tag: WGHT_TAG,
-        value: v,
-    });
+    let wght = font_entry.wght_setting();
     let mut shaper = rasterizer
         .shape_ctx
         .builder(font_ref)
@@ -1592,7 +1571,7 @@ fn shape_run_swash(
         // otherwise inherit the previous build's coordinates and shape with
         // the prior run's weight.
         .normalized_coords(core::iter::empty::<i16>())
-        .variations(wght_var.iter().copied())
+        .variations(wght.iter().copied())
         .build();
     shaper.add_str(&rasterizer.run_str_scratch);
     let mut glyphs: Vec<ShapedGlyph> = Vec::new();
@@ -2576,83 +2555,30 @@ fn rasterize_glyph_native(
     synthetic_bold: bool,
     synthetic_italic: bool,
 ) -> Option<RawGlyph> {
-    use rio_backend::sugarloaf::swash::{
-        scale::{
-            image::{Content, Image as GlyphImage},
-            Render, Source, StrikeWith,
-        },
-        zeno::{Angle, Format, Transform},
-        FontRef, Setting,
-    };
-
     let font_entry = rasterizer.font_data_cache.get(&font_id)?.clone();
-    let font_ref = FontRef {
-        data: font_entry.0.as_ref(),
-        offset: font_entry.1,
-        key: font_entry.2,
-    };
-
     // Shaping runs before rasterization, so these caches are populated.
     let (hinting, antialias) = rasterizer
         .lib_settings
         .as_ref()
         .map(|s| (s.hinting, s.antialias))
         .unwrap_or((true, true));
-    const WGHT_TAG: u32 = u32::from_be_bytes(*b"wght");
-    let wght_var = font_entry.3.map(|v| Setting {
-        tag: WGHT_TAG,
-        value: v,
-    });
-    let mut scaler = rasterizer
-        .scale_ctx
-        .builder(font_ref)
-        .hint(hinting)
-        .size(size_u16 as f32)
-        // Same shared-coordinate hazard as the shaper above: the
-        // `ScaleContext` keeps one coord buffer that `variations()` never
-        // clears, so an unweighted glyph rasterized right after a weighted
-        // one would inherit the prior `wght` and come out bold.
-        .normalized_coords(core::iter::empty::<i16>())
-        .variations(wght_var.iter().copied())
-        .build();
-
-    let sources: &[Source] = &[
-        Source::ColorOutline(0),
-        Source::ColorBitmap(StrikeWith::BestFit),
-        Source::Outline,
-    ];
-    let mut image = GlyphImage::new();
-    let embolden_amount = if synthetic_bold {
-        (size_u16 as f32 / 14.0).max(1.0)
-    } else {
-        0.0
-    };
-    let ok = Render::new(sources)
-        .format(Format::Alpha)
-        .embolden(embolden_amount)
-        .transform(if synthetic_italic {
-            Some(Transform::skew(
-                Angle::from_degrees(14.0),
-                Angle::from_degrees(0.0),
-            ))
-        } else {
-            None
-        })
-        .render_into(&mut scaler, glyph_id, &mut image);
-    if !ok {
-        return None;
-    }
-    let is_color = image.content == Content::Color;
-    if !antialias && !is_color {
-        rio_backend::sugarloaf::font::threshold_mask(&mut image.data);
-    }
+    let raw = rio_backend::sugarloaf::font::rasterize_swash_glyph(
+        &mut rasterizer.scale_ctx,
+        &font_entry,
+        glyph_id,
+        size_u16 as f32,
+        synthetic_bold,
+        synthetic_italic,
+        hinting,
+        antialias,
+    )?;
     Some(RawGlyph {
-        width: image.placement.width,
-        height: image.placement.height,
-        left: image.placement.left,
-        top: image.placement.top,
-        is_color,
-        bytes: image.data,
+        width: raw.width,
+        height: raw.height,
+        left: raw.left,
+        top: raw.top,
+        is_color: raw.is_color,
+        bytes: raw.bytes,
     })
 }
 
@@ -2776,26 +2702,22 @@ mod wght_coord_leak_tests {
             .unwrap()
             .charmap()
             .map('a' as u32);
-        let bold = fonts.get_data(&0).unwrap();
-        let plain = fonts.get_data(&1).unwrap();
+        let bold =
+            rio_backend::sugarloaf::font::SwashFontData::from_library(&fonts, 0).unwrap();
+        let plain =
+            rio_backend::sugarloaf::font::SwashFontData::from_library(&fonts, 1).unwrap();
         let render = |rasterizer: &mut GridGlyphRasterizer, font_id| {
             rasterize_glyph_native(rasterizer, font_id, glyph_id, 32, false, false, false)
                 .unwrap()
         };
 
         let mut clean = GridGlyphRasterizer::new();
-        clean
-            .font_data_cache
-            .insert(1, (plain.0.clone(), plain.1, plain.2, None));
+        clean.font_data_cache.insert(1, plain.clone());
         let plain_ref = render(&mut clean, 1);
 
         let mut shared = GridGlyphRasterizer::new();
-        shared
-            .font_data_cache
-            .insert(0, (bold.0, bold.1, bold.2, Some(700.0)));
-        shared
-            .font_data_cache
-            .insert(1, (plain.0, plain.1, plain.2, None));
+        shared.font_data_cache.insert(0, bold);
+        shared.font_data_cache.insert(1, plain);
         let bold_first = render(&mut shared, 0);
         let plain_after = render(&mut shared, 1);
 

@@ -74,11 +74,6 @@ struct ShapedRun {
     size_bucket: u16,
     synthetic_bold: bool,
     synthetic_italic: bool,
-    /// `wght` axis value to apply when rasterizing this run's glyphs
-    /// (variable-font fallback faces only). On macOS the variation is
-    /// already baked into the CTFont handle, so this stays unused.
-    #[cfg(not(target_os = "macos"))]
-    wght_variation: Option<f32>,
     ascent_px: i16,
     glyphs: Vec<ShapedGlyph>,
 }
@@ -167,8 +162,7 @@ pub struct Text {
     #[cfg(not(target_os = "macos"))]
     scale_ctx: swash::scale::ScaleContext,
     #[cfg(not(target_os = "macos"))]
-    font_data_cache:
-        FxHashMap<u32, (crate::font::SharedData, u32, swash::CacheKey, Option<f32>)>,
+    font_data_cache: FxHashMap<u32, crate::font::SwashFontData>,
     #[cfg(all(feature = "wgpu", not(target_os = "macos")))]
     wgpu: Option<TextWgpuState>,
     #[cfg(target_os = "linux")]
@@ -379,43 +373,17 @@ impl Text {
         };
 
         #[cfg(not(target_os = "macos"))]
-        let (glyphs, ascent_px, wght_variation) = {
-            use swash::FontRef;
-            use swash::Setting;
-
-            // Pull (or cache) the font bytes + offset + key once per
+        let (glyphs, ascent_px) = {
+            // Pull (or cache) the font bytes + face metadata once per
             // font_id to avoid the RwLock read-lock per shape.
             let font_entry = self.font_data_cache.entry(font_id).or_insert_with(|| {
                 let lib = self.font_library.inner.read();
-                let data = lib.get_data(&(font_id as usize)).expect(
+                crate::font::SwashFontData::from_library(&lib, font_id as usize).expect(
                     "font id resolved but get_data returned None — cache invariant",
-                );
-                (
-                    data.0,
-                    data.1,
-                    data.2,
-                    lib.get(&(font_id as usize)).wght_variation,
                 )
             });
-            let font_ref = FontRef {
-                data: font_entry.0.as_ref(),
-                offset: font_entry.1,
-                key: font_entry.2,
-            };
-
-            // `wght` axis value to apply to the face (variable-font
-            // fallback slots only — `None` for normal fonts).
-            let wght = font_entry.3;
-            // wght axis tag as a swash u32 Tag — 'w','g','h','t' big-endian.
-            const WGHT_TAG: swash::Tag = u32::from_be_bytes(*b"wght");
-            let wght_var = wght.map(|v| Setting {
-                tag: WGHT_TAG,
-                value: v,
-            });
-            let var_slice: &[Setting<f32>] = match wght_var {
-                Some(ref s) => std::slice::from_ref(s),
-                None => &[],
-            };
+            let font_ref = font_entry.font_ref();
+            let wght = font_entry.wght_setting();
 
             // Ascent — via swash metrics scaled to device-px size.
             // `metrics` wants normalized variation coords (`&[i16]`),
@@ -437,7 +405,7 @@ impl Text {
                 .builder(font_ref)
                 .size(size_u16 as f32)
                 .normalized_coords(std::iter::empty::<i16>())
-                .variations(var_slice.iter().copied())
+                .variations(wght.iter().copied())
                 .build();
             shaper.add_str(text);
             let mut glyphs: Vec<ShapedGlyph> = Vec::new();
@@ -453,7 +421,7 @@ impl Text {
                     });
                 }
             });
-            (glyphs, ascent_px, wght)
+            (glyphs, ascent_px)
         };
 
         let run = ShapedRun {
@@ -462,8 +430,6 @@ impl Text {
             size_bucket,
             synthetic_bold,
             synthetic_italic,
-            #[cfg(not(target_os = "macos"))]
-            wght_variation,
             ascent_px,
             glyphs,
         };
@@ -619,7 +585,7 @@ impl Text {
                 }
 
                 let font_entry = self.font_data_cache.get(&run.font_id)?.clone();
-                let raw = rasterize_swash_glyph(
+                let raw = crate::font::rasterize_swash_glyph(
                     &mut self.scale_ctx,
                     &font_entry,
                     glyph_id,
@@ -628,7 +594,6 @@ impl Text {
                     run.synthetic_italic,
                     self.font_library.inner.read().hinting,
                     self.font_library.inner.read().antialias,
-                    run.wght_variation,
                 )?;
                 let is_color = raw.is_color;
                 let raster = crate::grid::RasterizedGlyph {
@@ -665,7 +630,7 @@ impl Text {
                 }
 
                 let font_entry = self.font_data_cache.get(&run.font_id)?.clone();
-                let raw = rasterize_swash_glyph(
+                let raw = crate::font::rasterize_swash_glyph(
                     &mut self.scale_ctx,
                     &font_entry,
                     glyph_id,
@@ -674,7 +639,6 @@ impl Text {
                     run.synthetic_italic,
                     self.font_library.inner.read().hinting,
                     self.font_library.inner.read().antialias,
-                    run.wght_variation,
                 )?;
                 let is_color = raw.is_color;
 
@@ -754,7 +718,7 @@ impl Text {
         #[cfg(not(target_os = "macos"))]
         let (raw_w, raw_h, raw_left, raw_top, raw_is_color, raw_bytes) = {
             let font_entry = self.font_data_cache.get(&run.font_id)?.clone();
-            let raw = rasterize_swash_glyph(
+            let raw = crate::font::rasterize_swash_glyph(
                 &mut self.scale_ctx,
                 &font_entry,
                 glyph_id,
@@ -763,7 +727,6 @@ impl Text {
                 run.synthetic_italic,
                 self.font_library.inner.read().hinting,
                 self.font_library.inner.read().antialias,
-                run.wght_variation,
             )?;
             (
                 raw.width,
@@ -1226,106 +1189,6 @@ fn bytemuck_instances(insts: &[TextInstance]) -> &[u8] {
             std::mem::size_of_val(insts),
         )
     }
-}
-
-//  Swash rasterize — non-macOS
-
-#[cfg(not(target_os = "macos"))]
-struct SwashRawGlyph {
-    width: u32,
-    height: u32,
-    left: i32,
-    top: i32,
-    is_color: bool,
-    bytes: Vec<u8>,
-}
-
-#[cfg(not(target_os = "macos"))]
-#[allow(clippy::too_many_arguments)]
-fn rasterize_swash_glyph(
-    scale_ctx: &mut swash::scale::ScaleContext,
-    font_entry: &(crate::font::SharedData, u32, swash::CacheKey, Option<f32>),
-    glyph_id: u16,
-    size_px: f32,
-    synthetic_bold: bool,
-    synthetic_italic: bool,
-    hint: bool,
-    antialias: bool,
-    wght_variation: Option<f32>,
-) -> Option<SwashRawGlyph> {
-    use swash::scale::{
-        image::{Content, Image as GlyphImage},
-        Render, Source, StrikeWith,
-    };
-    use swash::zeno::{Angle, Format, Transform};
-    use swash::{FontRef, Setting};
-
-    let font_ref = FontRef {
-        data: font_entry.0.as_ref(),
-        offset: font_entry.1,
-        key: font_entry.2,
-    };
-
-    // wght axis tag — variable-font fallback faces use this to pick the
-    // right outlines (regular vs. bold) from a single source file.
-    const WGHT_TAG: swash::Tag = u32::from_be_bytes(*b"wght");
-    let wght_var = wght_variation.map(|v| Setting {
-        tag: WGHT_TAG,
-        value: v,
-    });
-    let var_slice: &[Setting<f32>] = match wght_var {
-        Some(ref s) => std::slice::from_ref(s),
-        None => &[],
-    };
-
-    let mut scaler = scale_ctx
-        .builder(font_ref)
-        .hint(hint)
-        .size(size_px)
-        .normalized_coords(std::iter::empty::<i16>())
-        .variations(var_slice.iter().copied())
-        .build();
-
-    let mut image = GlyphImage::new();
-    let sources: &[Source] = &[
-        Source::ColorOutline(0),
-        Source::ColorBitmap(StrikeWith::BestFit),
-        Source::Outline,
-    ];
-    let embolden_amount = if synthetic_bold {
-        (size_px / 14.0).max(1.0)
-    } else {
-        0.0
-    };
-    let rendered = Render::new(sources)
-        .format(Format::Alpha)
-        .embolden(embolden_amount)
-        .transform(if synthetic_italic {
-            Some(Transform::skew(
-                Angle::from_degrees(14.0),
-                Angle::from_degrees(0.0),
-            ))
-        } else {
-            None
-        })
-        .render_into(&mut scaler, glyph_id, &mut image);
-
-    if !rendered {
-        return None;
-    }
-
-    let is_color = image.content == Content::Color;
-    if !antialias && !is_color {
-        crate::font::threshold_mask(&mut image.data);
-    }
-    Some(SwashRawGlyph {
-        width: image.placement.width,
-        height: image.placement.height,
-        left: image.placement.left,
-        top: image.placement.top,
-        is_color,
-        bytes: image.data,
-    })
 }
 
 //  Metal pipeline construction
