@@ -2,7 +2,7 @@ use rio_backend::config::hints::Hint;
 use rio_backend::crosswords::grid::Dimensions;
 use rio_backend::crosswords::pos::{Column, Line, Pos};
 use rio_backend::event::EventListener;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -363,7 +363,18 @@ impl HintState {
     }
 
     fn generate_labels(&mut self) {
-        let mut generator = LabelGenerator::new(&self.alphabet);
+        let unique_matches = self
+            .matches
+            .iter()
+            .map(|hint_match| hint_match.text.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        let Some(labels) = hint_labels(&self.alphabet, unique_matches) else {
+            tracing::error!("hint alphabet must contain enough unique characters");
+            self.stop();
+            return;
+        };
+        let mut labels = labels.into_iter();
         let mut labels_by_text = HashMap::<&str, Vec<char>>::new();
 
         self.labels = self
@@ -372,59 +383,32 @@ impl HintState {
             .map(|hint_match| {
                 labels_by_text
                     .entry(&hint_match.text)
-                    .or_insert_with(|| generator.next())
+                    .or_insert_with(|| labels.next().expect("one label per unique match"))
                     .clone()
             })
             .collect();
     }
 }
 
-/// Generates hint labels using the specified alphabet
-struct LabelGenerator {
-    alphabet: Vec<char>,
-    indices: Vec<usize>,
-}
+fn hint_labels(alphabet: &str, count: usize) -> Option<Vec<Vec<char>>> {
+    let mut seen = HashSet::new();
+    let alphabet: Vec<char> = alphabet.chars().filter(|c| seen.insert(*c)).collect();
 
-impl LabelGenerator {
-    fn new(alphabet: &str) -> Self {
-        Self {
-            alphabet: alphabet.chars().collect(),
-            indices: vec![0],
+    if alphabet.is_empty() || (alphabet.len() == 1 && count > 1) {
+        return None;
+    }
+
+    let mut labels: VecDeque<Vec<char>> = alphabet.iter().map(|c| vec![*c]).collect();
+    while labels.len() < count {
+        let parent = labels.pop_front()?;
+        for c in &alphabet {
+            let mut child = parent.clone();
+            child.push(*c);
+            labels.push_back(child);
         }
     }
 
-    fn next(&mut self) -> Vec<char> {
-        let label = self.current_label();
-        self.increment();
-        label
-    }
-
-    fn current_label(&self) -> Vec<char> {
-        self.indices
-            .iter()
-            .rev()
-            .map(|&i| self.alphabet[i])
-            .collect()
-    }
-
-    fn increment(&mut self) {
-        let mut carry = true;
-        let mut pos = 0;
-
-        while carry && pos < self.indices.len() {
-            self.indices[pos] += 1;
-            if self.indices[pos] >= self.alphabet.len() {
-                self.indices[pos] = 0;
-                pos += 1;
-            } else {
-                carry = false;
-            }
-        }
-
-        if carry {
-            self.indices.push(0);
-        }
-    }
+    Some(labels.into_iter().take(count).collect())
 }
 
 /// URI scheme prefixes that should never be resolved as file paths.
@@ -600,14 +584,17 @@ mod tests {
 
     #[test]
     fn test_label_generator() {
-        let mut gen = LabelGenerator::new("abc");
-        assert_eq!(gen.next(), vec!['a']);
-        assert_eq!(gen.next(), vec!['b']);
-        assert_eq!(gen.next(), vec!['c']);
-        assert_eq!(gen.next(), vec!['a', 'a']);
-        assert_eq!(gen.next(), vec!['a', 'b']);
-        assert_eq!(gen.next(), vec!['a', 'c']);
-        assert_eq!(gen.next(), vec!['b', 'a']);
+        assert_eq!(
+            hint_labels("abc", 3),
+            Some(vec![vec!['a'], vec!['b'], vec!['c']])
+        );
+
+        let labels = hint_labels("abc", 7).unwrap();
+        assert_eq!(labels.len(), 7);
+        assert!(labels.iter().all(|label| labels
+            .iter()
+            .all(|other| label == other || !other.starts_with(label))));
+        assert_eq!(hint_labels("aaa", 2), None);
     }
 
     #[test]
