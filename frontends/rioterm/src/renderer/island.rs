@@ -737,12 +737,7 @@ impl Island {
             // tabs.
             self.drag = None;
             self.slide_springs.clear();
-            self.render_progress_bar(
-                sugarloaf,
-                window_width,
-                scale_factor,
-                navigation.tab_bar_height,
-            );
+            self.render_progress_bar(sugarloaf, window_width, scale_factor, 0.0);
             return;
         }
 
