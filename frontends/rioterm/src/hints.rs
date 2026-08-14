@@ -2,7 +2,7 @@ use rio_backend::config::hints::Hint;
 use rio_backend::crosswords::grid::Dimensions;
 use rio_backend::crosswords::pos::{Column, Line, Pos};
 use rio_backend::event::EventListener;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -369,13 +369,49 @@ impl HintState {
     }
 
     fn generate_labels(&mut self) {
-        let Some(labels) = hint_labels(&self.alphabet, self.matches.len()) else {
+        use rio_backend::config::hints::{HintAction, HintInternalAction::*};
+
+        let action = &self
+            .active_hint
+            .as_ref()
+            .expect("label generation requires an active hint")
+            .action;
+        let share_by_text = match action {
+            HintAction::Action {
+                action: Copy | Paste | Open,
+            }
+            | HintAction::Command { .. } => true,
+            HintAction::Action {
+                action: Select | MoveViModeCursor,
+            } => false,
+        };
+        let mut index_by_text = HashMap::new();
+        let label_indices: Vec<_> = self
+            .matches
+            .iter()
+            .enumerate()
+            .map(|(index, hint_match)| {
+                if share_by_text {
+                    let next_index = index_by_text.len();
+                    *index_by_text
+                        .entry(hint_match.text.as_str())
+                        .or_insert(next_index)
+                } else {
+                    index
+                }
+            })
+            .collect();
+        let label_count = label_indices.iter().max().map_or(0, |index| *index + 1);
+        let Some(labels) = hint_labels(&self.alphabet, label_count) else {
             tracing::error!("hint alphabet must contain enough unique characters");
             self.stop();
             return;
         };
 
-        self.labels = labels;
+        self.labels = label_indices
+            .into_iter()
+            .map(|index| labels[index].clone())
+            .collect();
     }
 }
 
@@ -658,19 +694,40 @@ mod tests {
     }
 
     #[test]
-    fn test_repeated_matches_get_distinct_labels() {
-        let hint = hint();
-        let mut state = HintState::new("abc".to_string());
-        state.matches = ["foo.txt", "foo.txt", "bar.txt"]
-            .into_iter()
-            .enumerate()
-            .map(|(col, text)| hint_match(text, col, &hint))
-            .collect();
+    fn repeated_matches_share_labels_unless_position_sensitive() {
+        use rio_backend::config::hints::HintCommand;
+        use HintAction::{Action, Command};
+        use HintInternalAction::*;
 
-        state.generate_labels();
+        let labels_for = |action| {
+            let mut config = (*hint()).clone();
+            config.action = action;
+            let hint = Rc::new(config);
+            let mut state = HintState::new("abc".to_string());
+            state.start(hint.clone());
+            state.matches = ["foo", "bar", "foo"]
+                .into_iter()
+                .enumerate()
+                .map(|(col, text)| hint_match(text, col, &hint))
+                .collect();
 
-        assert_eq!(state.matches.len(), 3);
-        assert_eq!(state.labels, vec![vec!['a'], vec!['b'], vec!['c']]);
+            state.generate_labels();
+
+            state.labels.into_iter().flatten().collect::<String>()
+        };
+
+        for action in [Copy, Paste, Open] {
+            assert_eq!(labels_for(Action { action }), "aba");
+        }
+        assert_eq!(
+            labels_for(Command {
+                command: HintCommand::Simple("open".into()),
+            }),
+            "aba"
+        );
+        for action in [Select, MoveViModeCursor] {
+            assert_eq!(labels_for(Action { action }), "abc");
+        }
     }
 
     #[test]
