@@ -657,6 +657,7 @@ impl Screen<'_> {
             terminal.scroll_display(Scroll::Bottom);
         }
         drop(terminal);
+        self.refresh_hints_after_scroll();
     }
 
     #[inline]
@@ -679,6 +680,37 @@ impl Screen<'_> {
         let mode = terminal.mode();
         drop(terminal);
         mode
+    }
+
+    pub fn scroll_page(&mut self, up: bool) {
+        let current = self.context_manager.current_mut();
+        let rich_text_id = current.rich_text_id;
+        {
+            let mut terminal = current.terminal.lock();
+            let scroll_lines =
+                terminal.grid.screen_lines() as i32 * if up { 1 } else { -1 };
+            terminal.vi_mode_cursor =
+                terminal.vi_mode_cursor.scroll(&terminal, scroll_lines);
+            terminal.scroll_display(if up { Scroll::PageUp } else { Scroll::PageDown });
+        }
+        self.renderer.scrollbar.notify_scroll(rich_text_id);
+        self.refresh_hints_after_scroll();
+        self.mark_dirty();
+    }
+
+    pub fn refresh_hints_after_scroll(&mut self) {
+        let quick_select_active = self.hint_state.is_active();
+        if quick_select_active {
+            {
+                let terminal = self.context_manager.current().terminal.lock();
+                self.hint_state.refresh_matches_for_scroll(&*terminal);
+            }
+            self.update_hint_state();
+        }
+
+        if quick_select_active || self.update_highlighted_hints() {
+            self.mark_dirty();
+        }
     }
 
     #[inline]
@@ -749,6 +781,18 @@ impl Screen<'_> {
                     self.mark_dirty();
                     return;
                 }
+                rio_window::keyboard::Key::Named(
+                    rio_window::keyboard::NamedKey::PageUp,
+                ) => {
+                    self.scroll_page(true);
+                    return;
+                }
+                rio_window::keyboard::Key::Named(
+                    rio_window::keyboard::NamedKey::PageDown,
+                ) => {
+                    self.scroll_page(false);
+                    return;
+                }
                 _ => {}
             }
 
@@ -773,7 +817,7 @@ impl Screen<'_> {
         }
 
         let ignore_chars = self.process_key_bindings(key, &mode, mods, clipboard);
-        if ignore_chars {
+        if ignore_chars || self.hint_state.is_active() {
             return;
         }
 
@@ -1068,22 +1112,26 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::Vi(ViAction::CenterAroundViCursor) => {
-                        let context = self.context_manager.current_mut();
-                        let mut terminal = context.terminal.lock();
-                        let display_offset = terminal.display_offset() as i32;
-                        let target =
-                            -display_offset + terminal.grid.screen_lines() as i32 / 2 - 1;
-                        let line = terminal.vi_mode_cursor.pos.row;
-                        let scroll_lines = target - line.0;
+                        {
+                            let context = self.context_manager.current_mut();
+                            let mut terminal = context.terminal.lock();
+                            let display_offset = terminal.display_offset() as i32;
+                            let target = -display_offset
+                                + terminal.grid.screen_lines() as i32 / 2
+                                - 1;
+                            let line = terminal.vi_mode_cursor.pos.row;
+                            let scroll_lines = target - line.0;
 
-                        terminal.scroll_display(Scroll::Delta(scroll_lines));
-                        drop(terminal);
-                        context
-                            .renderable_content
-                            .pending_update
-                            .set_terminal_damage(
-                                rio_backend::event::TerminalDamage::Full,
-                            );
+                            terminal.scroll_display(Scroll::Delta(scroll_lines));
+                            drop(terminal);
+                            context
+                                .renderable_content
+                                .pending_update
+                                .set_terminal_damage(
+                                    rio_backend::event::TerminalDamage::Full,
+                                );
+                        }
+                        self.refresh_hints_after_scroll();
                         self.mark_dirty();
                     }
                     Act::Vi(ViAction::ToggleNormalSelection) => {
@@ -1215,6 +1263,7 @@ impl Screen<'_> {
                         let mut terminal = current.terminal.lock();
                         terminal.scroll_to_prompt(false);
                         drop(terminal);
+                        self.refresh_hints_after_scroll();
                         self.renderer.scrollbar.notify_scroll(rtid);
                         self.mark_dirty();
                     }
@@ -1224,36 +1273,15 @@ impl Screen<'_> {
                         let mut terminal = current.terminal.lock();
                         terminal.scroll_to_prompt(true);
                         drop(terminal);
+                        self.refresh_hints_after_scroll();
                         self.renderer.scrollbar.notify_scroll(rtid);
                         self.mark_dirty();
                     }
                     Act::ScrollPageUp => {
-                        // Move vi mode cursor.
-                        let current = self.context_manager.current_mut();
-                        let rtid = current.rich_text_id;
-                        let mut terminal = current.terminal.lock();
-                        let scroll_lines = terminal.grid.screen_lines() as i32;
-                        terminal.vi_mode_cursor =
-                            terminal.vi_mode_cursor.scroll(&terminal, scroll_lines);
-                        terminal.scroll_display(Scroll::PageUp);
-                        drop(terminal);
-                        self.renderer.scrollbar.notify_scroll(rtid);
-                        self.mark_dirty();
+                        self.scroll_page(true);
                     }
                     Act::ScrollPageDown => {
-                        // Move vi mode cursor.
-                        let current = self.context_manager.current_mut();
-                        let rtid = current.rich_text_id;
-                        let mut terminal = current.terminal.lock();
-                        let scroll_lines = -(terminal.grid.screen_lines() as i32);
-
-                        terminal.vi_mode_cursor =
-                            terminal.vi_mode_cursor.scroll(&terminal, scroll_lines);
-
-                        terminal.scroll_display(Scroll::PageDown);
-                        drop(terminal);
-                        self.renderer.scrollbar.notify_scroll(rtid);
-                        self.mark_dirty();
+                        self.scroll_page(false);
                     }
                     Act::ScrollHalfPageUp => {
                         // Move vi mode cursor.
@@ -1267,6 +1295,7 @@ impl Screen<'_> {
 
                         terminal.scroll_display(Scroll::Delta(scroll_lines));
                         drop(terminal);
+                        self.refresh_hints_after_scroll();
                         self.renderer.scrollbar.notify_scroll(rtid);
                         self.mark_dirty();
                     }
@@ -1282,6 +1311,7 @@ impl Screen<'_> {
 
                         terminal.scroll_display(Scroll::Delta(scroll_lines));
                         drop(terminal);
+                        self.refresh_hints_after_scroll();
                         self.renderer.scrollbar.notify_scroll(rtid);
                         self.mark_dirty();
                     }
@@ -1295,6 +1325,7 @@ impl Screen<'_> {
                         terminal.vi_mode_cursor.pos.row = topmost_line;
                         terminal.vi_motion(ViMotion::FirstOccupied);
                         drop(terminal);
+                        self.refresh_hints_after_scroll();
                         self.renderer.scrollbar.notify_scroll(rtid);
                         self.mark_dirty();
                     }
@@ -1311,6 +1342,7 @@ impl Screen<'_> {
                         terminal.vi_motion(ViMotion::FirstOccupied);
                         terminal.vi_motion(ViMotion::FirstOccupied);
                         drop(terminal);
+                        self.refresh_hints_after_scroll();
                         self.renderer.scrollbar.notify_scroll(rtid);
                         self.mark_dirty();
                     }
@@ -1320,6 +1352,7 @@ impl Screen<'_> {
                         let mut terminal = current.terminal.lock();
                         terminal.scroll_display(Scroll::Delta(*delta));
                         drop(terminal);
+                        self.refresh_hints_after_scroll();
                         self.renderer.scrollbar.notify_scroll(rtid);
                         self.mark_dirty();
                     }
@@ -2315,6 +2348,7 @@ impl Screen<'_> {
         let point = self.mouse_position(display_offset);
         let side = self.mouse.square_side;
         self.update_selection(point, side);
+        self.refresh_hints_after_scroll();
     }
 
     #[inline]
@@ -2552,6 +2586,7 @@ impl Screen<'_> {
                     let delta = new_offset as i32 - current as i32;
                     terminal.scroll_display(Scroll::Delta(delta));
                     drop(terminal);
+                    self.refresh_hints_after_scroll();
                 }
             }
             self.mark_dirty();
@@ -2574,6 +2609,9 @@ impl Screen<'_> {
                 terminal.scroll_display(Scroll::Delta(delta));
             }
             drop(terminal);
+            if delta != 0 {
+                self.refresh_hints_after_scroll();
+            }
             self.mark_dirty();
         }
         true
@@ -3506,6 +3544,9 @@ impl Screen<'_> {
                 terminal.scroll_display(Scroll::Delta(lines));
                 drop(terminal);
                 self.renderer.scrollbar.notify_scroll(rich_text_id);
+            }
+            if old_display_offset != self.display_offset() {
+                self.refresh_hints_after_scroll();
             }
         }
 
@@ -4523,7 +4564,10 @@ impl Screen<'_> {
     ) {
         self.hint_state.start(hint);
         let terminal = self.context_manager.current().terminal.lock();
-        self.hint_state.update_matches(&*terminal);
+        // Keep hint mode active when this viewport has no matches; the user
+        // can scroll to a matching line without the activation key reaching
+        // the terminal and forcing the view to the bottom.
+        self.hint_state.refresh_matches_for_scroll(&*terminal);
         drop(terminal);
 
         // Update hint state and trigger damage tracking

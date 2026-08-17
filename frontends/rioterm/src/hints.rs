@@ -149,6 +149,23 @@ impl HintState {
         &mut self,
         term: &rio_backend::crosswords::Crosswords<T>,
     ) {
+        self.update_matches_inner(term, false);
+    }
+
+    /// Refresh matches after the viewport moved without leaving hint mode.
+    pub fn refresh_matches_for_scroll<T: EventListener>(
+        &mut self,
+        term: &rio_backend::crosswords::Crosswords<T>,
+    ) {
+        self.keys.clear();
+        self.update_matches_inner(term, true);
+    }
+
+    fn update_matches_inner<T: EventListener>(
+        &mut self,
+        term: &rio_backend::crosswords::Crosswords<T>,
+        keep_active_when_empty: bool,
+    ) {
         self.matches.clear();
 
         let hint = match &self.active_hint {
@@ -173,7 +190,10 @@ impl HintState {
 
         // Cancel hint mode if no matches found
         if self.matches.is_empty() {
-            self.stop();
+            self.labels.clear();
+            if !keep_active_when_empty {
+                self.stop();
+            }
             return;
         }
 
@@ -691,6 +711,24 @@ mod tests {
         assert!(state.keyboard_input(&terminal, 'a').is_some());
         assert!(state.is_active());
         assert!(state.keys.is_empty());
+    }
+
+    #[test]
+    fn scrolling_keeps_hint_mode_active_until_matches_reappear() {
+        let hint = hint();
+        let empty = mock_term_with_line("");
+        let matching = mock_term_with_line("test");
+        let mut state = HintState::new("ab".to_string());
+        state.start(hint);
+
+        state.refresh_matches_for_scroll(&empty);
+        assert!(state.is_active());
+        assert!(state.matches().is_empty());
+
+        state.refresh_matches_for_scroll(&matching);
+        assert!(state.is_active());
+        assert_eq!(state.matches().len(), 1);
+        assert_eq!(state.visible_labels().count(), 1);
     }
 
     #[test]
