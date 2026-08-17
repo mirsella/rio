@@ -1018,6 +1018,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         .lock();
                     terminal.scroll_display(scroll);
                     drop(terminal);
+                    route.window.screen.refresh_hints_after_scroll();
                 }
             }
             RioEventType::Rio(RioEvent::ClipboardLoad(
