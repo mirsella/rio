@@ -3193,6 +3193,9 @@ impl Screen<'_> {
         is_right_click: bool,
         chrome_press: Option<ChromePress>,
     ) -> bool {
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        use rio_window::platform::wayland::WindowExtWayland;
+
         // Only handle if navigation is enabled
         if !self.renderer.navigation.is_enabled() {
             return false;
@@ -3245,6 +3248,27 @@ impl Screen<'_> {
             let top_chrome_height =
                 self.renderer.navigation.tab_inset_y as f64 * scale_factor as f64;
             if !is_right_click && mouse_y < top_chrome_height {
+                let double = num_tabs == 1
+                    && matches!(self.mouse.click_state, ClickState::DoubleClick)
+                    && chrome_press.as_ref().is_some_and(|press| {
+                        press.validates_double_click(window.outer_position().ok())
+                    });
+                if num_tabs == 1 && !double {
+                    self.on_chrome_press(window, chrome_press);
+                    let tab_id = self
+                        .context_manager
+                        .tab_id_at(0)
+                        .expect("singleton tab must exist");
+                    if let Some(island) = self.renderer.island.as_mut() {
+                        island.start_drag(
+                            tab_id,
+                            0,
+                            mouse_x as f32 / scale_factor,
+                            mouse_x as f32 / scale_factor,
+                        );
+                    }
+                    return true;
+                }
                 self.handle_chrome_press(
                     window,
                     chrome_press,
@@ -3338,7 +3362,6 @@ impl Screen<'_> {
         if num_tabs == 1 {
             #[cfg(all(feature = "wayland", target_os = "linux"))]
             {
-                use rio_window::platform::wayland::WindowExtWayland;
                 let double = matches!(self.mouse.click_state, ClickState::DoubleClick)
                     && chrome_press.as_ref().is_some_and(|press| {
                         press.validates_double_click(window.outer_position().ok())

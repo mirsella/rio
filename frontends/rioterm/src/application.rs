@@ -522,11 +522,11 @@ impl<'a> Application<'a> {
             return false;
         };
         if route.path != RoutePath::Terminal
-            || !route.window.winit_window.supports_toplevel_drag()
             || !route.window.screen.mouse.left_button_state.is_pressed()
         {
             return false;
         }
+        let supports_toplevel_drag = route.window.winit_window.supports_toplevel_drag();
 
         let scale = route.window.screen.sugarloaf.scale_factor();
         route
@@ -548,6 +548,22 @@ impl<'a> Application<'a> {
             &handoff,
             crate::renderer::island::ExternalDragHandoff::Window { .. }
         );
+        let tab_id = match &handoff {
+            crate::renderer::island::ExternalDragHandoff::Tab { tab_id, .. } => {
+                Some(*tab_id)
+            }
+            crate::renderer::island::ExternalDragHandoff::Window { .. } => None,
+        };
+        if !supports_toplevel_drag {
+            if let Some(island) = route.window.screen.renderer.island.as_mut() {
+                island.cancel_drag();
+            }
+            if let Some(tab_id) = tab_id {
+                self.detach_tab_from_window(event_loop, source_id, tab_id);
+                return true;
+            }
+            return false;
+        }
         let tab_count = route.window.screen.context_manager.len();
         let (source_index, transition) = match handoff {
             crate::renderer::island::ExternalDragHandoff::Tab { tab_id, .. } => {
@@ -622,8 +638,41 @@ impl<'a> Application<'a> {
                 if let Some(island) = route.window.screen.renderer.island.as_mut() {
                     island.cancel_drag();
                 }
+                if let Some(tab_id) = tab_id {
+                    self.detach_tab_from_window(event_loop, source_id, tab_id);
+                    return true;
+                }
                 false
             }
+        }
+    }
+
+    fn detach_tab_from_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        source_window: rio_backend::event::WindowId,
+        tab_id: crate::layout::TabId,
+    ) {
+        use rio_window::platform::wayland::WindowExtWayland;
+
+        let Some(destination_id) =
+            self.move_tab_to_new_window(event_loop, source_window, tab_id)
+        else {
+            return;
+        };
+        let Some(route) = self.router.routes.get(&destination_id) else {
+            return;
+        };
+        let result = if route.window.winit_window.supports_toplevel_drag() {
+            route
+                .window
+                .winit_window
+                .drag_window_from_active_grab(u64::from(source_window))
+        } else {
+            route.window.winit_window.drag_window()
+        };
+        if let Err(error) = result {
+            tracing::debug!(%error, "could not continue detached tab drag");
         }
     }
 
@@ -1309,14 +1358,13 @@ impl<'a> Application<'a> {
         let whole_window = drag.whole_window;
         let source_window = drag.source_window.into();
         let frame_grab = drag.frame_grab();
-        let detached_tab = match drag.lifecycle {
-            TabDragLifecycle::Complete(crate::tab_drag::Outcome::Outside)
-                if !drag.whole_window =>
-            {
-                Some(drag.tab_id)
-            }
-            _ => None,
-        };
+        let detached_tab = (!drag.whole_window
+            && matches!(
+                drag.lifecycle,
+                TabDragLifecycle::Complete(crate::tab_drag::Outcome::Outside)
+                    | TabDragLifecycle::Cancelled
+            ))
+        .then_some(drag.tab_id);
         let resume_native_window_drag = whole_window
             && matches!(
                 drag.lifecycle,
@@ -1348,19 +1396,7 @@ impl<'a> Application<'a> {
         self.tab_drag = None;
         self.tab_drag_detach_deadline = None;
         if let Some(tab_id) = detached_tab {
-            if let Some(destination_id) =
-                self.move_tab_to_new_window(event_loop, source_window, tab_id)
-            {
-                if let Some(route) = self.router.routes.get(&destination_id) {
-                    if let Err(error) = route
-                        .window
-                        .winit_window
-                        .drag_window_from_active_grab(u64::from(source_window))
-                    {
-                        tracing::debug!(%error, "could not continue detached tab drag");
-                    }
-                }
-            }
+            self.detach_tab_from_window(event_loop, source_window, tab_id);
         }
         if resume_native_window_drag {
             if let Some(route) = self.router.routes.get(&source_window) {
@@ -2974,8 +3010,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
             WindowEvent::CursorLeft { .. } => {
                 #[cfg(all(feature = "wayland", target_os = "linux"))]
-                use rio_window::platform::wayland::WindowExtWayland;
-                #[cfg(all(feature = "wayland", target_os = "linux"))]
                 let start_external_drag = route.path == RoutePath::Terminal
                     && route.window.screen.mouse.left_button_state.is_pressed()
                     && route
@@ -2984,8 +3018,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         .renderer
                         .island
                         .as_ref()
-                        .is_some_and(|island| island.is_dragging())
-                    && route.window.winit_window.supports_toplevel_drag();
+                        .is_some_and(|island| island.is_dragging());
                 let clear_merge_target = self
                     .merge_target
                     .is_some_and(|(target, _)| target == window_id);
