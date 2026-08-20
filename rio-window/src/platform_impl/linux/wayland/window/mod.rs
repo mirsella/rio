@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use sctk::reexports::client::protocol::wl_data_device_manager::DndAction;
 use sctk::reexports::client::protocol::wl_display::WlDisplay;
 use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::{Proxy, QueueHandle};
@@ -18,6 +19,7 @@ use crate::dpi::{LogicalSize, PhysicalPosition, PhysicalSize, Position, Size};
 use crate::error::{ExternalError, NotSupportedError, OsError as RootOsError};
 use crate::event::{Ime, WindowEvent};
 use crate::event_loop::AsyncRequestSerial;
+use crate::platform::wayland::{ToplevelDragId, ToplevelDragOfferId};
 use crate::platform_impl::{
     Fullscreen, MonitorHandle as PlatformMonitorHandle, OsError, PlatformIcon,
 };
@@ -26,11 +28,15 @@ use crate::window::{
     WindowAttributes, WindowButtons, WindowLevel,
 };
 
+use super::data_device::{
+    frame_private_payload, DragSourceState, SourcePhase, ToplevelDragBackend, LEFT_BUTTON,
+};
 use super::event_loop::sink::EventSink;
 use super::output::MonitorHandle;
+use super::seat::WinitPointerDataExt;
 use super::state::WinitState;
 use super::types::xdg_activation::XdgActivationTokenData;
-use super::{ActiveEventLoop, WaylandError, WindowId};
+use super::{make_wid, root_surface, ActiveEventLoop, WaylandError, WindowId};
 
 pub(crate) mod state;
 
@@ -74,6 +80,9 @@ pub struct Window {
 
     /// The event sink to deliver synthetic events.
     window_events_sink: Arc<Mutex<EventSink>>,
+
+    /// Shared private toplevel drag transport.
+    toplevel_drag: Arc<Mutex<ToplevelDragBackend>>,
 }
 
 impl Window {
@@ -83,8 +92,10 @@ impl Window {
     ) -> Result<Self, RootOsError> {
         let queue_handle = event_loop_window_target.queue_handle.clone();
         let mut state = event_loop_window_target.state.borrow_mut();
+        state.process_drag_loop_requests();
 
         let monitors = state.monitors.clone();
+        let toplevel_drag = state.toplevel_drag.clone();
 
         let surface = state.compositor_state.create_surface(&queue_handle);
         let compositor = state.compositor_state.clone();
@@ -98,8 +109,6 @@ impl Window {
             .inner_size
             .unwrap_or(LogicalSize::new(800., 600.).into());
 
-        // We prefer server side decorations, however to not have decorations we ask for client
-        // side decorations instead.
         let default_decorations = if attributes.decorations {
             WindowDecorations::RequestServer
         } else {
@@ -188,6 +197,11 @@ impl Window {
         let window_state = Arc::new(Mutex::new(window_state));
         let window_id = super::make_wid(&surface);
         state
+            .toplevel_drag
+            .lock()
+            .unwrap()
+            .forget_destroyed_window(window_id);
+        state
             .windows
             .get_mut()
             .insert(window_id, window_state.clone());
@@ -242,6 +256,7 @@ impl Window {
             event_loop_awakener,
             window_requests,
             window_events_sink,
+            toplevel_drag,
         })
     }
 }
@@ -606,7 +621,381 @@ impl Window {
 
     #[inline]
     pub fn drag_window(&self) -> Result<(), ExternalError> {
-        self.window_state.lock().unwrap().drag_window()
+        self.drag_window_with_grab(Some(self.window_id.into()), None)
+    }
+
+    pub fn drag_window_from_active_grab(
+        &self,
+        source_window_id: u64,
+    ) -> Result<(), ExternalError> {
+        self.drag_window_with_grab(Some(source_window_id), None)
+    }
+
+    pub fn drag_window_from_frame_grab(
+        &self,
+        source_window_id: u64,
+        seat_id: u32,
+        pointer_id: u32,
+    ) -> Result<(), ExternalError> {
+        self.drag_window_with_grab(Some(source_window_id), Some((seat_id, pointer_id)))
+    }
+
+    fn drag_window_with_grab(
+        &self,
+        source_window: Option<u64>,
+        frame_grab: Option<(u32, u32)>,
+    ) -> Result<(), ExternalError> {
+        let active_grab = self
+            .toplevel_drag
+            .lock()
+            .unwrap()
+            .seats
+            .values()
+            .filter_map(|seat| {
+                let pointer = seat.pointer.as_ref()?;
+                let (_, serial, origin) = pointer
+                    .pointer()
+                    .winit_data()
+                    .active_button_grab(LEFT_BUTTON)?;
+                if source_window.is_some_and(|window_id| {
+                    u64::from(make_wid(&root_surface(&origin))) != window_id
+                }) {
+                    return None;
+                }
+                if frame_grab.is_some_and(|(seat_id, pointer_id)| {
+                    pointer.pointer().winit_data().seat().id().protocol_id() != seat_id
+                        || pointer.pointer().id().protocol_id() != pointer_id
+                }) {
+                    return None;
+                }
+                Some((pointer.pointer().winit_data().seat().clone(), serial))
+            })
+            .max_by_key(|(_, serial)| *serial);
+        let state = self.window_state.lock().unwrap();
+        match active_grab {
+            Some((seat, serial)) => state.drag_window_with_seat(&seat, serial),
+            None => Err(ExternalError::NotSupported(NotSupportedError::new())),
+        }
+    }
+
+    pub(crate) fn supports_toplevel_drag(&self) -> bool {
+        self.toplevel_drag.lock().unwrap().supported()
+    }
+
+    pub(crate) fn forget_frame_drag(&self) {
+        self.toplevel_drag
+            .lock()
+            .unwrap()
+            .forget_frame_drag(self.window_id);
+        self.window_state.lock().unwrap().cancel_pending_move();
+    }
+
+    pub(crate) fn forget_frame_drag_for_pointer(&self, seat_id: u32, pointer_id: u32) {
+        let mut backend = self.toplevel_drag.lock().unwrap();
+        let matching_grab = backend
+            .frame_drag_grabs
+            .iter()
+            .find(|((window_id, _), grab)| {
+                *window_id == self.window_id
+                    && grab.seat_id.protocol_id() == seat_id
+                    && grab.pointer_id.protocol_id() == pointer_id
+            })
+            .map(|(_, grab)| (grab.seat_id.clone(), grab.pointer_id.clone()));
+        let seat = matching_grab
+            .as_ref()
+            .map(|(seat, _)| seat.clone())
+            .or_else(|| {
+                backend
+                    .seats
+                    .keys()
+                    .find(|seat| seat.protocol_id() == seat_id)
+                    .cloned()
+            });
+        let Some(seat) = seat else {
+            return;
+        };
+        if let Some((_, pointer)) = matching_grab {
+            backend.forget_frame_drag_for_pointer(&seat, pointer);
+        }
+        drop(backend);
+        self.window_state
+            .lock()
+            .unwrap()
+            .cancel_pending_move_for_seat(&seat);
+    }
+
+    pub(crate) fn prepare_toplevel_drag(
+        &self,
+        data: Vec<u8>,
+        frame_grab_hint: Option<(u32, u32)>,
+    ) -> Result<ToplevelDragId, crate::platform::wayland::ToplevelDragError> {
+        use crate::platform::wayland::{ToplevelDragError, TOPLEVEL_DRAG_MIME_TYPE};
+
+        let framed_data = frame_private_payload(&data)?;
+        let (
+            data_device_manager,
+            seat_id,
+            data_device,
+            pointer_id,
+            button,
+            serial,
+            origin,
+        ) = {
+            let mut backend = self.toplevel_drag.lock().unwrap();
+            if !backend.supported() {
+                return Err(ToplevelDragError::Unsupported(NotSupportedError::new()));
+            }
+            let data_device_manager = backend
+                .data_device_manager
+                .clone()
+                .expect("supported drag backend must have a data-device manager");
+            let frame_grab_key = backend
+                .frame_drag_grabs
+                .iter()
+                .filter(|(key, grab)| {
+                    key.0 == self.window_id
+                        && frame_grab_hint.is_none_or(|(seat_id, pointer_id)| {
+                            grab.seat_id.protocol_id() == seat_id
+                                && grab.pointer_id.protocol_id() == pointer_id
+                        })
+                })
+                .find_map(|(key, grab)| Some((key, grab)))
+                .and_then(|(key, grab)| {
+                    let active = backend
+                        .seats
+                        .get(&grab.seat_id)
+                        .and_then(|seat| seat.pointer.as_ref())
+                        .filter(|pointer| pointer.pointer().id() == grab.pointer_id)
+                        .and_then(|pointer| {
+                            pointer
+                                .pointer()
+                                .winit_data()
+                                .active_button_grab(LEFT_BUTTON)
+                        });
+                    active
+                        .is_some_and(|(button, serial, origin)| {
+                            button == grab.button
+                                && serial == grab.serial
+                                && origin == grab.origin
+                        })
+                        .then(|| key.clone())
+                });
+            let frame_grab =
+                frame_grab_key.and_then(|key| backend.frame_drag_grabs.remove(&key));
+            let (seat_id, pointer_id, button, serial, origin) = frame_grab
+                .map(|grab| {
+                    (
+                        grab.seat_id,
+                        grab.pointer_id,
+                        grab.button,
+                        grab.serial,
+                        grab.origin,
+                    )
+                })
+                .or_else(|| {
+                    frame_grab_hint
+                        .is_none()
+                        .then(|| {
+                            backend
+                                .seats
+                                .iter()
+                                .filter_map(|(seat_id, seat)| {
+                                    let pointer = seat.pointer.as_ref()?;
+                                    let (button, serial, origin) = pointer
+                                        .pointer()
+                                        .winit_data()
+                                        .active_button_grab(LEFT_BUTTON)?;
+                                    (make_wid(&root_surface(&origin)) == self.window_id)
+                                        .then(|| {
+                                            (
+                                                seat_id.clone(),
+                                                pointer.pointer().id(),
+                                                button,
+                                                serial,
+                                                origin,
+                                            )
+                                        })
+                                })
+                                .max_by_key(|(_, _, _, serial, _)| *serial)
+                        })
+                        .flatten()
+                })
+                .ok_or(ToplevelDragError::NoPointerGrab)?;
+            let data_device = backend
+                .seats
+                .get(&seat_id)
+                .expect("drag grab must refer to a registered seat")
+                .data_device
+                .clone();
+            (
+                data_device_manager,
+                seat_id,
+                data_device,
+                pointer_id,
+                button,
+                serial,
+                origin,
+            )
+        };
+
+        let source = data_device_manager.create_drag_and_drop_source(
+            &self.queue_handle,
+            [TOPLEVEL_DRAG_MIME_TYPE],
+            DndAction::Move,
+        );
+        let mut backend = self.toplevel_drag.lock().unwrap();
+        let drag_id = backend.allocate_drag_id();
+        backend.insert_source(
+            drag_id,
+            DragSourceState {
+                source,
+                window_id: self.window_id,
+                origin,
+                seat_id,
+                pointer_id,
+                button,
+                serial,
+                data_device,
+                framed_data,
+                phase: SourcePhase::Prepared,
+                writer_tokens: Vec::new(),
+            },
+        );
+        Ok(drag_id)
+    }
+
+    pub(crate) fn start_toplevel_drag(
+        &self,
+        drag_id: ToplevelDragId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        use crate::platform::wayland::ToplevelDragError;
+
+        let mut backend = self.toplevel_drag.lock().unwrap();
+        let source = backend
+            .sources
+            .get(&drag_id)
+            .ok_or(ToplevelDragError::InvalidDrag)?;
+        if source.window_id != self.window_id {
+            return Err(ToplevelDragError::WrongOwner);
+        }
+        if !matches!(source.phase, SourcePhase::Prepared) {
+            return Err(ToplevelDragError::InvalidState);
+        }
+        let seat = backend
+            .seats
+            .get(&source.seat_id)
+            .ok_or(ToplevelDragError::NoPointerGrab)?;
+        let pointer = seat
+            .pointer
+            .as_ref()
+            .filter(|pointer| pointer.pointer().id() == source.pointer_id)
+            .ok_or(ToplevelDragError::NoPointerGrab)?;
+        if let Some((button, serial, origin)) = pointer
+            .pointer()
+            .winit_data()
+            .active_button_grab(LEFT_BUTTON)
+        {
+            if button != source.button
+                || serial != source.serial
+                || origin != source.origin
+                || make_wid(&root_surface(&origin)) != source.window_id
+            {
+                return Err(ToplevelDragError::NoPointerGrab);
+            }
+        } else {
+            return Err(ToplevelDragError::NoPointerGrab);
+        }
+
+        self.window_state
+            .lock()
+            .unwrap()
+            .cancel_pending_move_for_seat(&source.seat_id);
+        source.source.start_drag(
+            &source.data_device,
+            &source.origin,
+            None,
+            source.serial,
+        );
+
+        let source = backend
+            .sources
+            .get_mut(&drag_id)
+            .expect("validated source must remain active");
+        source.phase = SourcePhase::Started;
+        Ok(())
+    }
+
+    pub(crate) fn accept_toplevel_drag_offer(
+        &self,
+        offer_id: ToplevelDragOfferId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        self.toplevel_drag
+            .lock()
+            .unwrap()
+            .accept_offer(offer_id, self.window_id)
+    }
+
+    pub(crate) fn reject_toplevel_drag_offer(
+        &self,
+        offer_id: ToplevelDragOfferId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        self.toplevel_drag
+            .lock()
+            .unwrap()
+            .reject_offer(offer_id, self.window_id)
+    }
+
+    pub(crate) fn receive_toplevel_drag_offer(
+        &self,
+        offer_id: ToplevelDragOfferId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        self.toplevel_drag
+            .lock()
+            .unwrap()
+            .queue_offer_transfer(offer_id, self.window_id)?;
+        self.event_loop_awakener.ping();
+        Ok(())
+    }
+
+    pub(crate) fn finish_toplevel_drag_offer(
+        &self,
+        offer_id: ToplevelDragOfferId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        let offer = self
+            .toplevel_drag
+            .lock()
+            .unwrap()
+            .finish_offer(offer_id, self.window_id)?;
+        offer.finish();
+        offer.destroy();
+        self.event_loop_awakener.ping();
+        Ok(())
+    }
+
+    pub(crate) fn cancel_toplevel_drag_offer(
+        &self,
+        offer_id: ToplevelDragOfferId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        let offer = self
+            .toplevel_drag
+            .lock()
+            .unwrap()
+            .cancel_offer(offer_id, self.window_id)?;
+        offer.destroy();
+        self.event_loop_awakener.ping();
+        Ok(())
+    }
+
+    pub(crate) fn cancel_toplevel_drag(
+        &self,
+        drag_id: ToplevelDragId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        self.toplevel_drag
+            .lock()
+            .unwrap()
+            .cancel_source(drag_id, self.window_id)?;
+        self.event_loop_awakener.ping();
+        Ok(())
     }
 
     #[inline]
@@ -725,6 +1114,10 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
+        self.toplevel_drag
+            .lock()
+            .unwrap()
+            .mark_window_destroyed(self.window_id);
         self.window_requests.closed.store(true, Ordering::Relaxed);
         self.event_loop_awakener.ping();
     }

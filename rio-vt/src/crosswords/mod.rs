@@ -2719,21 +2719,19 @@ impl<U: EventListener> Crosswords<U> {
 
 impl<U: EventListener> Crosswords<U> {
     /// Ids of graphics still displayed (atlas placements + kitty).
-    fn collect_used_graphic_ids(&mut self) -> std::collections::HashSet<u64> {
+    fn collect_used_graphic_ids(&self) -> std::collections::HashSet<u64> {
         self.graphics.collect_active_graphic_ids()
     }
 
-    fn cleanup_unused_kitty_images(&mut self) {
-        // Collect all currently used graphic IDs from the grid
+    fn cleanup_kitty_images(&mut self, candidates: &std::collections::HashSet<u32>) {
+        if candidates.is_empty() {
+            return;
+        }
+
         let used_ids = self.collect_used_graphic_ids();
-
-        // Convert to u32 for kitty_images map
-        let used_kitty_ids: std::collections::HashSet<u32> =
-            used_ids.iter().map(|&id| id as u32).collect();
-
-        // Delete images not in use
-        self.graphics
-            .delete_kitty_images(|id, _| !used_kitty_ids.contains(id));
+        self.graphics.delete_kitty_images(|id, _| {
+            candidates.contains(id) && !used_ids.contains(&(*id as u64))
+        });
     }
 }
 
@@ -5044,6 +5042,15 @@ impl<U: EventListener> Handler for Crosswords<U> {
         );
 
         let mut overlay_changed = false;
+        let mut deleted_image_ids = std::collections::HashSet::new();
+
+        self.graphics.kitty_chunking_state.cancel_transmissions(
+            delete.action,
+            delete.image_id,
+            delete.image_number,
+            delete.x,
+            delete.y,
+        );
 
         match delete.action {
             b'a' | b'A' => {
@@ -5051,15 +5058,20 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 // placements are not visible by themselves and survive,
                 // as do the images they keep alive (kitty's
                 // clear_filter_func skips virtual refs).
-                overlay_changed = !self.graphics.kitty_placements.is_empty();
+                deleted_image_ids.extend(
+                    self.graphics
+                        .kitty_placements
+                        .keys()
+                        .map(|(image_id, _)| *image_id),
+                );
+                deleted_image_ids.extend(self.graphics.kitty_images.keys().copied());
+                let before = self.graphics.kitty_placements.len();
                 self.graphics.kitty_placements.clear();
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
-                }
+                overlay_changed = self.graphics.kitty_placements.len() != before;
             }
             b'i' | b'I' => {
                 let image_id_to_match = delete.image_id;
+                deleted_image_ids.insert(image_id_to_match);
                 // Delete overlay and virtual placements for this image
                 let before = self.graphics.kitty_placements.len()
                     + self.graphics.kitty_virtual_placements.len();
@@ -5081,11 +5093,6 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 overlay_changed = self.graphics.kitty_placements.len()
                     + self.graphics.kitty_virtual_placements.len()
                     != before;
-
-                if delete.delete_data {
-                    self.graphics
-                        .delete_kitty_images(|id, _| *id == image_id_to_match);
-                }
             }
             b'c' | b'C' => {
                 let cursor_pos = self.grid.cursor.pos;
@@ -5095,17 +5102,17 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     + self.history_size() as i64
                     + cursor_pos.row.0 as i64;
                 let before = self.graphics.kitty_placements.len();
-                self.graphics.kitty_placements.retain(|_, p| {
-                    !(p.dest_col <= col
+                self.graphics.kitty_placements.retain(|(image_id, _), p| {
+                    let removed = p.dest_col <= col
                         && col < p.dest_col + p.columns as usize
                         && p.dest_row <= abs_row
-                        && abs_row < p.dest_row + p.rows as i64)
+                        && abs_row < p.dest_row + p.rows as i64;
+                    if removed {
+                        deleted_image_ids.insert(*image_id);
+                    }
+                    !removed
                 });
                 overlay_changed = self.graphics.kitty_placements.len() != before;
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
-                }
             }
             b'p' | b'P' => {
                 if delete.x > 0 && delete.y > 0 {
@@ -5117,17 +5124,17 @@ impl<U: EventListener> Handler for Crosswords<U> {
                         + row.0 as i64;
                     let c = col.0;
                     let before = self.graphics.kitty_placements.len();
-                    self.graphics.kitty_placements.retain(|_, p| {
-                        !(p.dest_col <= c
+                    self.graphics.kitty_placements.retain(|(image_id, _), p| {
+                        let removed = p.dest_col <= c
                             && c < p.dest_col + p.columns as usize
                             && p.dest_row <= abs_row
-                            && abs_row < p.dest_row + p.rows as i64)
+                            && abs_row < p.dest_row + p.rows as i64;
+                        if removed {
+                            deleted_image_ids.insert(*image_id);
+                        }
+                        !removed
                     });
                     overlay_changed = self.graphics.kitty_placements.len() != before;
-                }
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
                 }
             }
             b'x' | b'X' => {
@@ -5135,14 +5142,15 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     let col = Column((delete.x - 1) as usize);
                     let c = col.0;
                     let before = self.graphics.kitty_placements.len();
-                    self.graphics.kitty_placements.retain(|_, p| {
-                        !(p.dest_col <= c && c < p.dest_col + p.columns as usize)
+                    self.graphics.kitty_placements.retain(|(image_id, _), p| {
+                        let removed =
+                            p.dest_col <= c && c < p.dest_col + p.columns as usize;
+                        if removed {
+                            deleted_image_ids.insert(*image_id);
+                        }
+                        !removed
                     });
                     overlay_changed = self.graphics.kitty_placements.len() != before;
-                }
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
                 }
             }
             b'y' | b'Y' => {
@@ -5152,25 +5160,28 @@ impl<U: EventListener> Handler for Crosswords<U> {
                         + self.history_size() as i64
                         + row.0 as i64;
                     let before = self.graphics.kitty_placements.len();
-                    self.graphics.kitty_placements.retain(|_, p| {
-                        !(p.dest_row <= abs_row && abs_row < p.dest_row + p.rows as i64)
+                    self.graphics.kitty_placements.retain(|(image_id, _), p| {
+                        let removed =
+                            p.dest_row <= abs_row && abs_row < p.dest_row + p.rows as i64;
+                        if removed {
+                            deleted_image_ids.insert(*image_id);
+                        }
+                        !removed
                     });
                     overlay_changed = self.graphics.kitty_placements.len() != before;
-                }
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
                 }
             }
             b'z' | b'Z' => {
                 let z = delete.z_index;
                 let before = self.graphics.kitty_placements.len();
-                self.graphics.kitty_placements.retain(|_, p| p.z_index != z);
+                self.graphics.kitty_placements.retain(|(image_id, _), p| {
+                    let removed = p.z_index == z;
+                    if removed {
+                        deleted_image_ids.insert(*image_id);
+                    }
+                    !removed
+                });
                 overlay_changed = self.graphics.kitty_placements.len() != before;
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
-                }
             }
             b'n' | b'N' => {
                 // Delete by image number — look up image_id from the
@@ -5185,6 +5196,7 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 if let Some(&image_id) =
                     self.graphics.kitty_image_numbers.get(&lookup_number)
                 {
+                    deleted_image_ids.insert(image_id);
                     let before = self.graphics.kitty_placements.len()
                         + self.graphics.kitty_virtual_placements.len();
                     if delete.placement_id != 0 {
@@ -5205,10 +5217,6 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     overlay_changed = self.graphics.kitty_placements.len()
                         + self.graphics.kitty_virtual_placements.len()
                         != before;
-
-                    if delete.delete_data {
-                        self.graphics.delete_kitty_images(|id, _| *id == image_id);
-                    }
                 }
             }
             b'q' | b'Q' => {
@@ -5223,18 +5231,18 @@ impl<U: EventListener> Handler for Crosswords<U> {
                         + row.0 as i64;
                     let c = col.0;
                     let before = self.graphics.kitty_placements.len();
-                    self.graphics.kitty_placements.retain(|_, p| {
-                        !(p.z_index == z
+                    self.graphics.kitty_placements.retain(|(image_id, _), p| {
+                        let removed = p.z_index == z
                             && p.dest_col <= c
                             && c < p.dest_col + p.columns as usize
                             && p.dest_row <= abs_row
-                            && abs_row < p.dest_row + p.rows as i64)
+                            && abs_row < p.dest_row + p.rows as i64;
+                        if removed {
+                            deleted_image_ids.insert(*image_id);
+                        }
+                        !removed
                     });
                     overlay_changed = self.graphics.kitty_placements.len() != before;
-                }
-
-                if delete.delete_data {
-                    self.cleanup_unused_kitty_images();
                 }
             }
             b'r' | b'R' => {
@@ -5242,23 +5250,32 @@ impl<U: EventListener> Handler for Crosswords<U> {
                 let range_start = delete.x;
                 let range_end = delete.y;
                 if range_start > 0 && range_end >= range_start {
+                    deleted_image_ids.extend(
+                        self.graphics
+                            .kitty_images
+                            .keys()
+                            .copied()
+                            .filter(|id| *id >= range_start && *id <= range_end),
+                    );
                     let before = self.graphics.kitty_placements.len()
                         + self.graphics.kitty_virtual_placements.len();
-                    self.graphics
-                        .kitty_placements
-                        .retain(|k, _| k.0 < range_start || k.0 > range_end);
-                    self.graphics
-                        .kitty_virtual_placements
-                        .retain(|k, _| k.0 < range_start || k.0 > range_end);
+                    self.graphics.kitty_placements.retain(|k, _| {
+                        let removed = k.0 >= range_start && k.0 <= range_end;
+                        if removed {
+                            deleted_image_ids.insert(k.0);
+                        }
+                        !removed
+                    });
+                    self.graphics.kitty_virtual_placements.retain(|k, _| {
+                        let removed = k.0 >= range_start && k.0 <= range_end;
+                        if removed {
+                            deleted_image_ids.insert(k.0);
+                        }
+                        !removed
+                    });
                     overlay_changed = self.graphics.kitty_placements.len()
                         + self.graphics.kitty_virtual_placements.len()
                         != before;
-
-                    if delete.delete_data {
-                        self.graphics.delete_kitty_images(|id, _| {
-                            *id >= range_start && *id <= range_end
-                        });
-                    }
                 }
             }
             _ => {
@@ -5267,6 +5284,10 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     delete.action as char
                 );
             }
+        }
+
+        if delete.delete_data {
+            self.cleanup_kitty_images(&deleted_image_ids);
         }
 
         if overlay_changed {
@@ -5806,20 +5827,44 @@ impl<U: EventListener> Crosswords<U> {
             placement.image_id, placement.placement_id, placement.columns, placement.rows
         );
 
+        let placement_id = if placement.placement_id == 0 {
+            let mut id = 1;
+            while self
+                .graphics
+                .kitty_virtual_placements
+                .contains_key(&(placement.image_id, id))
+            {
+                id += 1;
+            }
+            id
+        } else {
+            placement.placement_id
+        };
         let vp = VirtualPlacement {
             image_id: placement.image_id,
-            placement_id: placement.placement_id,
+            placement_id,
             columns: placement.columns,
             rows: placement.rows,
             x: placement.x,
             y: placement.y,
             width: placement.width,
             height: placement.height,
+            cell_x_offset: placement.cell_x_offset,
+            cell_y_offset: placement.cell_y_offset,
+            z_index: placement.z_index,
         };
         self.graphics
             .kitty_virtual_placements
-            .insert((placement.image_id, placement.placement_id), vp);
+            .insert((placement.image_id, placement_id), vp);
         self.graphics.kitty_graphics_dirty = true;
+        if let Some(stored) = self.graphics.get_kitty_image(placement.image_id) {
+            let mut pixel_data = stored.data.clone();
+            pixel_data.transmit_time = stored.transmission_time;
+            self.graphics
+                .pending_images
+                .push((placement.image_id, pixel_data));
+            self.send_graphics_updates();
+        }
     }
 }
 
@@ -9365,7 +9410,8 @@ mod tests {
         let vp = cw
             .graphics
             .kitty_virtual_placements
-            .get(&(image_id, 0))
+            .values()
+            .find(|placement| placement.image_id == image_id)
             .expect("virtual placement registered");
         assert_eq!(vp.columns, cols);
         assert_eq!(vp.rows, rows);
@@ -9492,7 +9538,8 @@ mod tests {
         let vp = cw
             .graphics
             .kitty_virtual_placements
-            .get(&(image_id, 0))
+            .values()
+            .find(|placement| placement.image_id == image_id)
             .expect("a=T,U=1 must register a virtual placement");
         assert_eq!((vp.columns, vp.rows), (0, 0), "c=/r= omitted on the wire");
         assert!(
@@ -9699,7 +9746,8 @@ mod tests {
         let vp = cw
             .graphics
             .kitty_virtual_placements
-            .get(&(1234, 0))
+            .values()
+            .find(|placement| placement.image_id == 1234)
             .expect("virtual placement registered");
         assert_eq!(vp.image_id, 1234);
         assert_eq!(vp.columns, 8);
@@ -10420,5 +10468,212 @@ mod tests {
         events.borrow_mut().clear();
         parser.advance(&mut term, b"\x1b[?9h\x1b[?9$p");
         assert_eq!(replies(&events), vec!["\x1b[?9;1$y".to_string()]);
+    }
+
+    #[test]
+    fn virtual_placement_uploads_transmit_then_place_and_retransmission() {
+        use crate::ansi::kitty_graphics_protocol::PlacementRequest;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Clone)]
+        struct TestListener(Rc<RefCell<Vec<RioEvent>>>);
+
+        impl EventListener for TestListener {
+            fn send_event(&self, event: RioEvent, _id: WindowId) {
+                self.0.borrow_mut().push(event);
+            }
+        }
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(10, 10),
+            CursorShape::Block,
+            TestListener(events.clone()),
+            WindowId::from(0),
+            0,
+            10,
+        );
+        term.store_graphic(crate::ansi::graphics::kitty_test_data(7, 4));
+        assert!(events.borrow().is_empty(), "transmit-only must not upload");
+        term.place_graphic(PlacementRequest {
+            image_id: 7,
+            placement_id: 1,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            columns: 1,
+            rows: 1,
+            z_index: 0,
+            virtual_placement: true,
+            unicode_placeholder: 0,
+            cursor_movement: 1,
+            cell_x_offset: 0,
+            cell_y_offset: 0,
+        });
+
+        let pending_image_count = |events: &[RioEvent]| {
+            events.iter().find_map(|event| match event {
+                RioEvent::UpdateGraphics { queues, .. } => {
+                    Some(queues.pending_images.len())
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(pending_image_count(&events.borrow()), Some(1));
+
+        events.borrow_mut().clear();
+        term.store_graphic(crate::ansi::graphics::kitty_test_data(7, 8));
+        let events = events.borrow();
+        let update = events.iter().find_map(|event| match event {
+            RioEvent::UpdateGraphics { queues, .. } => Some(queues),
+            _ => None,
+        });
+        let update = update.expect("virtual retransmission must notify the renderer");
+        assert_eq!(update.pending_images.len(), 1);
+        assert_eq!(update.pending_images[0].0, 7);
+    }
+
+    #[test]
+    fn delete_by_id_removes_virtual_placement_without_deleting_pixels() {
+        use crate::ansi::graphics::VirtualPlacement;
+        use crate::ansi::kitty_graphics_protocol::DeleteRequest;
+
+        let mut term = make_crosswords();
+        term.graphics.kitty_virtual_placements.insert(
+            (7, 3),
+            VirtualPlacement {
+                image_id: 7,
+                placement_id: 3,
+                columns: 1,
+                rows: 1,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                cell_x_offset: 0,
+                cell_y_offset: 0,
+                z_index: 0,
+            },
+        );
+        term.graphics.store_kitty_image(
+            7,
+            None,
+            crate::ansi::graphics::kitty_test_data(7, 4),
+        );
+
+        Handler::delete_graphics(
+            &mut term,
+            DeleteRequest {
+                action: b'i',
+                image_id: 7,
+                image_number: 0,
+                placement_id: 3,
+                x: 0,
+                y: 0,
+                z_index: 0,
+                delete_data: false,
+            },
+        );
+
+        assert!(!term.graphics.kitty_virtual_placements.contains_key(&(7, 3)));
+        assert!(term.graphics.kitty_images.contains_key(&7));
+        assert!(term.graphics.kitty_graphics_dirty);
+    }
+
+    #[test]
+    fn delete_all_visible_placements_preserves_virtual_placements_and_images() {
+        use crate::ansi::graphics::VirtualPlacement;
+        use crate::ansi::kitty_graphics_protocol::DeleteRequest;
+
+        let mut term = make_crosswords();
+        term.graphics.kitty_virtual_placements.insert(
+            (7, 3),
+            VirtualPlacement {
+                image_id: 7,
+                placement_id: 3,
+                columns: 1,
+                rows: 1,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                cell_x_offset: 0,
+                cell_y_offset: 0,
+                z_index: 0,
+            },
+        );
+        term.graphics.store_kitty_image(
+            7,
+            None,
+            crate::ansi::graphics::kitty_test_data(7, 4),
+        );
+
+        Handler::delete_graphics(
+            &mut term,
+            DeleteRequest {
+                action: b'A',
+                image_id: 0,
+                image_number: 0,
+                placement_id: 0,
+                x: 0,
+                y: 0,
+                z_index: 0,
+                delete_data: true,
+            },
+        );
+
+        assert!(term.graphics.kitty_virtual_placements.contains_key(&(7, 3)));
+        assert!(term.graphics.kitty_images.contains_key(&7));
+    }
+
+    #[test]
+    fn delete_image_placement_preserves_shared_virtual_image_data() {
+        use crate::ansi::graphics::VirtualPlacement;
+        use crate::ansi::kitty_graphics_protocol::DeleteRequest;
+
+        let mut term = make_crosswords();
+        for placement_id in [3, 4] {
+            term.graphics.kitty_virtual_placements.insert(
+                (7, placement_id),
+                VirtualPlacement {
+                    image_id: 7,
+                    placement_id,
+                    columns: 1,
+                    rows: 1,
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                    cell_x_offset: 0,
+                    cell_y_offset: 0,
+                    z_index: 0,
+                },
+            );
+        }
+        term.graphics.store_kitty_image(
+            7,
+            None,
+            crate::ansi::graphics::kitty_test_data(7, 4),
+        );
+
+        Handler::delete_graphics(
+            &mut term,
+            DeleteRequest {
+                action: b'I',
+                image_id: 7,
+                image_number: 0,
+                placement_id: 3,
+                x: 0,
+                y: 0,
+                z_index: 0,
+                delete_data: true,
+            },
+        );
+
+        assert!(!term.graphics.kitty_virtual_placements.contains_key(&(7, 3)));
+        assert!(term.graphics.kitty_virtual_placements.contains_key(&(7, 4)));
+        assert!(term.graphics.kitty_images.contains_key(&7));
     }
 }

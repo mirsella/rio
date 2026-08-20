@@ -30,11 +30,6 @@ pub struct ViewportSelection {
     pub is_block: bool,
 }
 
-/// Virtual placements have no z of their own; kitty draws them under
-/// text unless the application says otherwise, and rio's renderer pins
-/// them there (see `frontends/rioterm/src/renderer/mod.rs`).
-const VIRTUAL_Z_INDEX: i32 = -1;
-
 /// One drawable kitty item: a direct overlay placement, or one row-run
 /// of U+10EEEE placeholder cells from a virtual placement (`U=1`, what
 /// `kitten icat --transfer-mode` emits under multiplexers).
@@ -58,7 +53,7 @@ impl KittyEntry {
     fn z_index(&self) -> i32 {
         match self {
             KittyEntry::Direct { placement, .. } => placement.z_index,
-            KittyEntry::Virtual { .. } => VIRTUAL_Z_INDEX,
+            KittyEntry::Virtual { placement, .. } => placement.z_index,
         }
     }
 }
@@ -483,10 +478,10 @@ impl RenderState {
                 )?;
                 Some((
                     run.image_id,
-                    VIRTUAL_Z_INDEX,
+                    placement.z_index,
                     KittyOverlayGeometry {
-                        x: geometry.x,
-                        y: geometry.y,
+                        x: geometry.x + placement.cell_x_offset as f32,
+                        y: geometry.y + placement.cell_y_offset as f32,
                         width: geometry.width,
                         height: geometry.height,
                         source_rect: geometry.source_rect,

@@ -240,6 +240,8 @@ impl From<String> for Action {
             "scrolltoprevprompt" => Some(Action::ScrollToPrevPrompt),
             "scrolltonextprompt" => Some(Action::ScrollToNextPrompt),
             "createtab" => Some(Action::TabCreateNew),
+            "movecurrenttabtonewwindow" => Some(Action::MoveCurrentTabToNewWindow),
+            "mergewindow" => Some(Action::MergeWindow),
             "movecurrenttabtoprev" => Some(Action::MoveCurrentTabToPrev),
             "movecurrenttabtonext" => Some(Action::MoveCurrentTabToNext),
             "closetab" => Some(Action::TabCloseCurrent),
@@ -422,6 +424,12 @@ pub enum Action {
 
     /// Create a new Rio tab.
     TabCreateNew,
+
+    /// Move the current tab into a new window.
+    MoveCurrentTabToNewWindow,
+
+    /// Arm merging the current window into another Rio window.
+    MergeWindow,
 
     /// Move current tab to previous slot.
     MoveCurrentTabToPrev,
@@ -1354,6 +1362,19 @@ mod tests {
 
         assert!(binding.triggers_match(&identical_binding));
         assert!(identical_binding.triggers_match(&binding));
+    }
+
+    #[test]
+    fn move_current_tab_to_new_window_action_parses() {
+        assert_eq!(
+            Action::from("MoveCurrentTabToNewWindow".to_string()),
+            Action::MoveCurrentTabToNewWindow
+        );
+    }
+
+    #[test]
+    fn merge_window_action_parses() {
+        assert_eq!(Action::from("MergeWindow".to_string()), Action::MergeWindow);
     }
 
     #[test]
