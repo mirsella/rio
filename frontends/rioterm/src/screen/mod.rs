@@ -16,7 +16,7 @@ use crate::bindings::{
 };
 use crate::context;
 use crate::context::renderable::{Cursor, RenderableContent};
-use crate::context::{next_rich_text_id, process_open_url, ContextManager};
+use crate::context::{next_rich_text_id, process_open_url, ContextManager, GridTransfer};
 use crate::crosswords::{
     grid::{Dimensions, Scroll},
     pos::{Column, Pos, Side},
@@ -120,9 +120,116 @@ pub struct ScreenWindowProperties {
     pub window_id: rio_window::window::WindowId,
 }
 
+type RouteGraphics = rustc_hash::FxHashMap<
+    rio_backend::sugarloaf::GraphicKey,
+    rio_backend::sugarloaf::GraphicDataEntry,
+>;
+
+pub struct ScreenTransfer {
+    grid: GridTransfer<EventProxy>,
+    graphics: RouteGraphics,
+}
+
+pub struct WindowTransfer {
+    tabs: Vec<ScreenTransfer>,
+    active_index: usize,
+}
+
+impl ScreenTransfer {
+    pub fn id(&self) -> crate::layout::TabId {
+        self.grid.id()
+    }
+
+    pub fn route_ids(&self) -> &[usize] {
+        self.grid.route_ids()
+    }
+}
+
+#[cfg_attr(not(all(feature = "wayland", target_os = "linux")), allow(dead_code))]
+pub struct ScreenTransferFailure {
+    pub(crate) transfer: ScreenTransfer,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Debug for ScreenTransferFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScreenTransferFailure")
+            .field("tab_id", &self.transfer.id())
+            .field("route_ids", &self.transfer.route_ids())
+            .field("message", &self.message)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for ScreenTransferFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for ScreenTransferFailure {}
+
+enum ScreenContext {
+    Fresh(Option<String>),
+    Transfer(ScreenTransfer),
+}
+
 #[inline]
 fn window_should_be_opaque(config: &rio_backend::config::Config) -> bool {
     config.window.opacity >= 1.0 && !config.window.blur.is_glass()
+}
+
+fn route_ids_belong_to(
+    graphics_routes: impl IntoIterator<Item = usize>,
+    route_ids: &[usize],
+) -> bool {
+    graphics_routes
+        .into_iter()
+        .all(|route_id| route_ids.contains(&route_id))
+}
+
+fn scaled_margin_for_tabs(
+    navigation: &rio_backend::config::navigation::Navigation,
+    margin: Margin,
+    macos_use_unified_titlebar: bool,
+    tab_count: usize,
+    scale: f32,
+) -> Margin {
+    Margin::new(
+        padding_top_from_config(
+            navigation,
+            margin.top,
+            tab_count,
+            macos_use_unified_titlebar,
+        ) * scale,
+        margin.right * scale,
+        margin.bottom * scale,
+        margin.left * scale,
+    )
+}
+
+enum ScreenBuildFailure {
+    Fresh(Box<dyn Error>),
+    Transfer(ScreenTransferFailure),
+}
+
+impl ScreenBuildFailure {
+    fn into_error(self) -> Box<dyn Error> {
+        match self {
+            Self::Fresh(error) => error,
+            Self::Transfer(error) => Box::new(error),
+        }
+    }
+
+    fn into_transfer(self) -> ScreenTransferFailure {
+        match self {
+            Self::Transfer(error) => error,
+            Self::Fresh(_) => {
+                unreachable!("transfer construction returned a fresh error")
+            }
+        }
+    }
 }
 
 impl Screen<'_> {
@@ -133,6 +240,40 @@ impl Screen<'_> {
         font_library: &rio_backend::sugarloaf::font::FontLibrary,
         open_url: Option<String>,
     ) -> Result<Screen<'screen>, Box<dyn Error>> {
+        Self::build(
+            window_properties,
+            config,
+            event_proxy,
+            font_library,
+            ScreenContext::Fresh(open_url),
+        )
+        .map_err(ScreenBuildFailure::into_error)
+    }
+
+    pub fn from_transfer<'screen>(
+        window_properties: ScreenWindowProperties,
+        config: &rio_backend::config::Config,
+        event_proxy: EventProxy,
+        font_library: &rio_backend::sugarloaf::font::FontLibrary,
+        transfer: ScreenTransfer,
+    ) -> Result<Screen<'screen>, ScreenTransferFailure> {
+        Self::build(
+            window_properties,
+            config,
+            event_proxy,
+            font_library,
+            ScreenContext::Transfer(transfer),
+        )
+        .map_err(ScreenBuildFailure::into_transfer)
+    }
+
+    fn build<'screen>(
+        window_properties: ScreenWindowProperties,
+        config: &rio_backend::config::Config,
+        event_proxy: EventProxy,
+        font_library: &rio_backend::sugarloaf::font::FontLibrary,
+        screen_context: ScreenContext,
+    ) -> Result<Screen<'screen>, ScreenBuildFailure> {
         let size = window_properties.size;
         let scale = window_properties.scale;
         let raw_window_handle = window_properties.raw_window_handle;
@@ -228,11 +369,15 @@ impl Screen<'_> {
 
         let is_native = config.navigation.is_native();
 
+        let open_url = match &screen_context {
+            ScreenContext::Fresh(open_url) => open_url.as_deref(),
+            ScreenContext::Transfer(_) => None,
+        };
         let (shell, working_dir) = process_open_url(
             config.shell.to_owned(),
             config.working_dir.to_owned(),
             config.editor.to_owned(),
-            open_url.as_deref(),
+            open_url,
         );
 
         let context_manager_config = context::ContextManagerConfig {
@@ -292,18 +437,45 @@ impl Screen<'_> {
             is_ime_enabled: false,
         };
 
-        let context_manager = context::ContextManager::start(
-            // config.cursor.blinking
-            (&cursor, config.cursor.blinking),
-            event_proxy,
-            window_id.into(),
-            0,
-            rich_text_id,
-            context_manager_config,
-            context_dimension,
-            scaled_margin,
-            sugarloaf_errors,
-        )?;
+        let (context_manager, graphics, transferred) = match screen_context {
+            ScreenContext::Fresh(_) => {
+                let context_manager = context::ContextManager::start(
+                    (&cursor, config.cursor.blinking),
+                    event_proxy,
+                    window_id.into(),
+                    rich_text_id,
+                    context_manager_config,
+                    context_dimension,
+                    scaled_margin,
+                    sugarloaf_errors,
+                )
+                .map_err(ScreenBuildFailure::Fresh)?;
+                (context_manager, None, false)
+            }
+            ScreenContext::Transfer(ScreenTransfer { grid, graphics }) => {
+                if !route_ids_belong_to(
+                    graphics.keys().map(|graphic| graphic.route_id),
+                    grid.route_ids(),
+                ) {
+                    return Err(ScreenBuildFailure::Transfer(ScreenTransferFailure {
+                        transfer: ScreenTransfer { grid, graphics },
+                        message: "transferred graphics contain an unrelated route".into(),
+                    }));
+                }
+
+                let context_manager = ContextManager::from_transfer(
+                    grid,
+                    event_proxy,
+                    window_id.into(),
+                    context_manager_config,
+                );
+                (context_manager, Some(graphics), true)
+            }
+        };
+
+        if let Some(graphics) = graphics {
+            sugarloaf.image_data = graphics;
+        }
 
         sugarloaf.set_window_opaque(window_should_be_opaque(config));
         sugarloaf.set_background_color(Some(renderer.dynamic_background.1));
@@ -319,7 +491,7 @@ impl Screen<'_> {
             sugarloaf.clear_background_image();
         }
 
-        Ok(Screen {
+        let mut screen = Screen {
             search_state: SearchState::default(),
             hint_state: HintState::new(config.hints.alphabet.clone()),
             hints_config: config
@@ -346,7 +518,11 @@ impl Screen<'_> {
             last_close_press: None,
             grids: rustc_hash::FxHashMap::default(),
             grid_rasterizer: rio_grid::GridGlyphRasterizer::new(),
-        })
+        };
+        if transferred {
+            screen.refresh_after_tab_transfer(size);
+        }
+        Ok(screen)
     }
 
     #[inline]
@@ -362,6 +538,152 @@ impl Screen<'_> {
                 ));
             }
         }
+    }
+
+    /// Discard renderer-owned graphics and grid renderers for several routes.
+    fn extract_routes_graphics(
+        &mut self,
+        route_ids: impl IntoIterator<Item = usize>,
+    ) -> RouteGraphics {
+        let route_ids: rustc_hash::FxHashSet<_> = route_ids.into_iter().collect();
+        self.grids
+            .retain(|route_id, _| !route_ids.contains(route_id));
+        self.sugarloaf
+            .extract_routes_graphics(route_ids.iter().copied())
+    }
+
+    pub(crate) fn discard_routes(&mut self, route_ids: impl IntoIterator<Item = usize>) {
+        let route_ids: Vec<_> = route_ids.into_iter().collect();
+        for route_id in &route_ids {
+            self.sugarloaf
+                .font_library()
+                .remove_glyph_registry(*route_id);
+        }
+        drop(self.extract_routes_graphics(route_ids));
+    }
+
+    /// Extract a tab and all renderer state owned by its split routes.
+    pub fn extract_transfer(&mut self, index: usize) -> Option<ScreenTransfer> {
+        let grid = self.context_manager.extract_grid(index)?;
+        let graphics = self.extract_routes_graphics(grid.route_ids().iter().copied());
+        Some(ScreenTransfer { grid, graphics })
+    }
+
+    pub fn extract_window_transfer(&mut self) -> Option<WindowTransfer> {
+        let count = self.context_manager.len();
+        if count == 0 {
+            return None;
+        }
+        let active_index = self.context_manager.current_index();
+        let tabs = (0..count)
+            .map(|_| {
+                self.extract_transfer(0)
+                    .expect("window tab disappeared during extraction")
+            })
+            .collect();
+        Some(WindowTransfer { tabs, active_index })
+    }
+
+    /// Transactionally insert a tab and its renderer-owned graphics.
+    pub fn insert_transfer(
+        &mut self,
+        index: usize,
+        transfer: ScreenTransfer,
+        size: rio_window::dpi::PhysicalSize<u32>,
+    ) -> Result<(), ScreenTransfer> {
+        let ScreenTransfer { grid, graphics } = transfer;
+        let route_ids = grid.route_ids().to_vec();
+        if !route_ids_belong_to(graphics.keys().map(|key| key.route_id), &route_ids)
+            || self
+                .sugarloaf
+                .image_data
+                .keys()
+                .any(|key| route_ids.contains(&key.route_id))
+        {
+            return Err(ScreenTransfer { grid, graphics });
+        }
+        if let Err(graphics) = self.sugarloaf.insert_routes_graphics(graphics) {
+            return Err(ScreenTransfer { grid, graphics });
+        }
+        if let Err(grid) = self.context_manager.insert_grid(index, grid) {
+            let graphics = self
+                .sugarloaf
+                .extract_routes_graphics(route_ids.iter().copied());
+            return Err(ScreenTransfer { grid, graphics });
+        }
+        self.refresh_after_tab_transfer(size);
+        Ok(())
+    }
+
+    pub fn insert_window_transfer(
+        &mut self,
+        index: usize,
+        transfer: WindowTransfer,
+        size: rio_window::dpi::PhysicalSize<u32>,
+    ) -> Result<(), WindowTransfer> {
+        if transfer.active_index >= transfer.tabs.len()
+            || !self
+                .context_manager
+                .can_insert_grids(index, transfer.tabs.len())
+        {
+            return Err(transfer);
+        }
+
+        let WindowTransfer { tabs, active_index } = transfer;
+        let mut inserted = 0;
+        let mut remaining = tabs.into_iter();
+        while let Some(tab) = remaining.next() {
+            match self.insert_transfer(index + inserted, tab, size) {
+                Ok(()) => inserted += 1,
+                Err(tab) => {
+                    let mut tabs = Vec::with_capacity(inserted + 1);
+                    for _ in 0..inserted {
+                        tabs.push(
+                            self.extract_transfer(index).expect(
+                                "inserted window tab disappeared during rollback",
+                            ),
+                        );
+                    }
+                    tabs.push(tab);
+                    tabs.extend(remaining);
+                    return Err(WindowTransfer { tabs, active_index });
+                }
+            }
+        }
+        self.context_manager.set_current(index + active_index);
+        Ok(())
+    }
+
+    pub fn refresh_after_tab_transfer(
+        &mut self,
+        size: rio_window::dpi::PhysicalSize<u32>,
+    ) {
+        self.sugarloaf.resize(size.width, size.height);
+        let scale = self.sugarloaf.scale_factor();
+        let scaled_margin = scaled_margin_for_tabs(
+            &self.renderer.navigation,
+            self.renderer.margin,
+            self.renderer.macos_use_unified_titlebar,
+            self.context_manager.len(),
+            scale,
+        );
+        for grid in self.context_manager.contexts_mut() {
+            grid.width = size.width as f32;
+            grid.height = size.height as f32;
+            grid.update_scaled_margin(scaled_margin);
+            grid.update_scale(scale);
+            for context in grid.contexts_mut().values_mut() {
+                let context = context.context_mut();
+                context.dimension.update_scale(scale);
+                context
+                    .renderable_content
+                    .pending_update
+                    .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+            }
+            grid.update_dimensions(&mut self.sugarloaf);
+        }
+        self.resize_all_contexts();
+        self.mark_dirty();
     }
 
     #[inline]
@@ -398,6 +720,20 @@ impl Screen<'_> {
         self.mouse.accumulated_scroll = crate::mouse::AccumulatedScroll::default();
     }
 
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    pub(crate) fn reset_drag_input(&mut self) -> Option<usize> {
+        self.mouse.left_button_state = ElementState::Released;
+        self.mouse.middle_button_state = ElementState::Released;
+        self.mouse.right_button_state = ElementState::Released;
+        self.mouse.on_border = false;
+        if let Some(island) = self.renderer.island.as_mut() {
+            island.cancel_drag();
+        }
+        self.handle_scrollbar_release();
+        self.resize_state = None;
+        (!self.context_manager.is_empty()).then(|| self.context_manager.current_route())
+    }
+
     #[inline]
     pub fn select_current_based_on_mouse(&mut self) -> bool {
         if self
@@ -405,7 +741,6 @@ impl Screen<'_> {
             .current_grid_mut()
             .select_current_based_on_mouse(&self.mouse)
         {
-            self.context_manager.select_route_from_current_grid();
             // The focusing click never reaches on_left_click, so a
             // selection left behind in the target panel would
             // drag-extend from its stale anchor; drop it on switch.
@@ -413,6 +748,30 @@ impl Screen<'_> {
             return true;
         }
         false
+    }
+
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    fn start_wayland_window_drag(
+        &mut self,
+        window: &rio_window::window::Window,
+        x_unscaled: f32,
+        layout: &TabStripLayout,
+    ) {
+        use rio_window::platform::wayland::WindowExtWayland;
+
+        if !window.supports_toplevel_drag() {
+            return;
+        }
+        if let Some(island) = self.renderer.island.as_mut() {
+            let Some(grid) = self.context_manager.current_grid_opt() else {
+                return;
+            };
+            island.start_window_drag(
+                grid.id(),
+                x_unscaled - layout.left_margin,
+                x_unscaled,
+            );
+        }
     }
 
     #[inline]
@@ -485,7 +844,6 @@ impl Screen<'_> {
         if self.renderer.island.is_some() {
             self.renderer.island = Some(old_island.unwrap_or_else(island::Island::new));
         }
-
         let scale = self.sugarloaf.scale_factor();
         for context_grid in self.context_manager.contexts_mut() {
             context_grid.update_line_height(config.line_height);
@@ -663,8 +1021,7 @@ impl Screen<'_> {
         let width = new_size.width as f32;
         let height = new_size.height as f32;
 
-        self.context_manager
-            .resize_all_grids(width, height, &mut self.sugarloaf);
+        self.context_manager.resize_all_grids(width, height);
         self.mark_dirty();
         // Rescaled cursor displacement is layout, not travel.
         self.renderer.trail_cursor.snap();
@@ -1260,6 +1617,12 @@ impl Screen<'_> {
                     Act::WindowCreateNew => {
                         self.context_manager.create_new_window();
                     }
+                    Act::MoveCurrentTabToNewWindow => {
+                        self.context_manager.move_current_tab_to_new_window();
+                    }
+                    Act::MergeWindow => {
+                        self.context_manager.merge_window();
+                    }
                     Act::ToggleQuake => {
                         self.context_manager.toggle_quake();
                     }
@@ -1278,8 +1641,10 @@ impl Screen<'_> {
                         if self.ctx().len() <= 1 {
                             return true;
                         }
-                        self.context_manager
+                        let removed = self
+                            .context_manager
                             .close_unfocused_tabs(&mut self.sugarloaf);
+                        self.discard_routes(removed);
                         if let Some(ref mut island) = self.renderer.island {
                             island.dismiss_color_picker();
                         }
@@ -1445,12 +1810,8 @@ impl Screen<'_> {
                         self.clear_selection();
                         let old_index = self.context_manager.current_index();
                         self.context_manager.switch_to_next_split_or_tab();
-                        let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
-                            &mut self.sugarloaf,
-                            old_index,
-                            new_index,
-                        );
+                        self.context_manager
+                            .clear_context_overlays(&mut self.sugarloaf, old_index);
                         self.mark_dirty();
                     }
                     Act::SelectPrevSplitOrTab => {
@@ -1458,23 +1819,15 @@ impl Screen<'_> {
                         self.clear_selection();
                         let old_index = self.context_manager.current_index();
                         self.context_manager.switch_to_prev_split_or_tab();
-                        let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
-                            &mut self.sugarloaf,
-                            old_index,
-                            new_index,
-                        );
+                        self.context_manager
+                            .clear_context_overlays(&mut self.sugarloaf, old_index);
                         self.mark_dirty();
                     }
                     Act::SelectTab(tab_index) => {
                         let old_index = self.context_manager.current_index();
                         self.context_manager.select_tab(*tab_index);
-                        let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
-                            &mut self.sugarloaf,
-                            old_index,
-                            new_index,
-                        );
+                        self.context_manager
+                            .clear_context_overlays(&mut self.sugarloaf, old_index);
                         self.cancel_search(clipboard);
                         self.mark_dirty();
                     }
@@ -1482,12 +1835,8 @@ impl Screen<'_> {
                         self.cancel_search(clipboard);
                         let old_index = self.context_manager.current_index();
                         self.context_manager.select_last_tab();
-                        let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
-                            &mut self.sugarloaf,
-                            old_index,
-                            new_index,
-                        );
+                        self.context_manager
+                            .clear_context_overlays(&mut self.sugarloaf, old_index);
                         self.mark_dirty();
                     }
                     Act::SelectNextTab => {
@@ -1495,12 +1844,8 @@ impl Screen<'_> {
                         self.clear_selection();
                         let old_index = self.context_manager.current_index();
                         self.context_manager.switch_to_next();
-                        let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
-                            &mut self.sugarloaf,
-                            old_index,
-                            new_index,
-                        );
+                        self.context_manager
+                            .clear_context_overlays(&mut self.sugarloaf, old_index);
                         self.mark_dirty();
                     }
                     Act::MoveCurrentTabToPrev => {
@@ -1509,11 +1854,8 @@ impl Screen<'_> {
                         let old_index = self.context_manager.current_index();
                         self.context_manager.move_current_to_prev();
                         let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
-                            &mut self.sugarloaf,
-                            old_index,
-                            new_index,
-                        );
+                        self.context_manager
+                            .clear_context_overlays(&mut self.sugarloaf, old_index);
                         let tab_width =
                             self.island_tab_layout(self.context_manager.len()).tab_width;
                         if let Some(ref mut island) = self.renderer.island {
@@ -1527,11 +1869,8 @@ impl Screen<'_> {
                         let old_index = self.context_manager.current_index();
                         self.context_manager.move_current_to_next();
                         let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
-                            &mut self.sugarloaf,
-                            old_index,
-                            new_index,
-                        );
+                        self.context_manager
+                            .clear_context_overlays(&mut self.sugarloaf, old_index);
                         let tab_width =
                             self.island_tab_layout(self.context_manager.len()).tab_width;
                         if let Some(ref mut island) = self.renderer.island {
@@ -1544,12 +1883,8 @@ impl Screen<'_> {
                         self.clear_selection();
                         let old_index = self.context_manager.current_index();
                         self.context_manager.switch_to_prev();
-                        let new_index = self.context_manager.current_index();
-                        self.context_manager.switch_context_visibility(
-                            &mut self.sugarloaf,
-                            old_index,
-                            new_index,
-                        );
+                        self.context_manager
+                            .clear_context_overlays(&mut self.sugarloaf, old_index);
                         self.mark_dirty();
                     }
                     Act::ReceiveChar | Act::None => (),
@@ -1563,38 +1898,29 @@ impl Screen<'_> {
 
     pub fn split_right_with_config(&mut self, config: rio_backend::config::Config) {
         let rich_text_id = next_rich_text_id();
-        self.context_manager.split_from_config(
-            rich_text_id,
-            false,
-            config,
-            &mut self.sugarloaf,
-        );
+        self.context_manager
+            .split_from_config(rich_text_id, false, config);
 
         self.mark_dirty();
     }
 
     pub fn split_right(&mut self) {
         let rich_text_id = next_rich_text_id();
-        self.context_manager
-            .split(rich_text_id, false, &mut self.sugarloaf);
+        self.context_manager.split(rich_text_id, false);
 
         self.mark_dirty();
     }
 
     pub fn split_down(&mut self) {
         let rich_text_id = next_rich_text_id();
-        self.context_manager
-            .split(rich_text_id, true, &mut self.sugarloaf);
+        self.context_manager.split(rich_text_id, true);
 
         self.mark_dirty();
     }
 
     pub fn move_divider_up(&mut self) {
         let amount = 20.0; // Default movement amount
-        if self
-            .context_manager
-            .move_divider_up(amount, &mut self.sugarloaf)
-        {
+        if self.context_manager.move_divider_up(amount) {
             self.mark_dirty();
             // Divider displacement is layout, not cursor travel.
             self.renderer.trail_cursor.snap();
@@ -1603,10 +1929,7 @@ impl Screen<'_> {
 
     pub fn move_divider_down(&mut self) {
         let amount = 20.0; // Default movement amount
-        if self
-            .context_manager
-            .move_divider_down(amount, &mut self.sugarloaf)
-        {
+        if self.context_manager.move_divider_down(amount) {
             self.mark_dirty();
             // Divider displacement is layout, not cursor travel.
             self.renderer.trail_cursor.snap();
@@ -1615,10 +1938,7 @@ impl Screen<'_> {
 
     pub fn move_divider_left(&mut self) {
         let amount = 40.0; // Default movement amount
-        if self
-            .context_manager
-            .move_divider_left(amount, &mut self.sugarloaf)
-        {
+        if self.context_manager.move_divider_left(amount) {
             self.mark_dirty();
             // Divider displacement is layout, not cursor travel.
             self.renderer.trail_cursor.snap();
@@ -1627,10 +1947,7 @@ impl Screen<'_> {
 
     pub fn move_divider_right(&mut self) {
         let amount = 40.0; // Default movement amount
-        if self
-            .context_manager
-            .move_divider_right(amount, &mut self.sugarloaf)
-        {
+        if self.context_manager.move_divider_right(amount) {
             self.mark_dirty();
             // Divider displacement is layout, not cursor travel.
             self.renderer.trail_cursor.snap();
@@ -1654,20 +1971,17 @@ impl Screen<'_> {
 
         let rich_text_id = next_rich_text_id();
         self.context_manager.add_context(redirect, rich_text_id);
-        let new_index = self.context_manager.current_index();
-        self.context_manager.switch_context_visibility(
-            &mut self.sugarloaf,
-            old_index,
-            new_index,
-        );
+        self.context_manager
+            .clear_context_overlays(&mut self.sugarloaf, old_index);
 
         self.cancel_search(clipboard);
         self.mark_dirty();
     }
 
     pub fn close_split_or_tab(&mut self, clipboard: &mut Clipboard) {
-        if self.context_manager.current_grid_len() > 1 {
+        if self.context_manager.current_grid().len() > 1 {
             self.clear_selection();
+            self.discard_routes([self.context_manager.current().route_id]);
             self.context_manager
                 .remove_current_grid(&mut self.sugarloaf);
             self.mark_dirty();
@@ -1678,6 +1992,10 @@ impl Screen<'_> {
 
     pub fn close_tab(&mut self, clipboard: &mut Clipboard) {
         self.clear_selection();
+        if self.context_manager.len() > 1 {
+            let route_ids = self.context_manager.current_grid().route_ids().to_vec();
+            self.discard_routes(route_ids);
+        }
         self.context_manager
             .close_current_context(&mut self.sugarloaf);
         if let Some(ref mut island) = self.renderer.island {
@@ -2485,6 +2803,7 @@ impl Screen<'_> {
         if !self.renderer.command_palette.is_enabled() {
             return false;
         }
+        use crate::renderer::command_palette::PaletteAction;
 
         let scale_factor = self.sugarloaf.scale_factor();
         let window_width = self.sugarloaf.window_size().width;
@@ -2499,13 +2818,20 @@ impl Screen<'_> {
         ) {
             Ok(Some(index)) => {
                 // Clicked a result row — select and execute
-                if let Some(action) = {
-                    // Temporarily set selected index to the clicked row
-                    self.renderer.command_palette.selected_index = index;
-                    self.renderer.command_palette.get_selected_action()
-                } {
+                self.renderer.command_palette.selected_index = index;
+                if let Some(font) = self.renderer.command_palette.get_selected_font() {
+                    clipboard.set(ClipboardType::Clipboard, font);
                     self.renderer.command_palette.set_enabled(false);
-                    self.execute_palette_action(action, clipboard);
+                } else if let Some(action) =
+                    self.renderer.command_palette.get_selected_action()
+                {
+                    if action == PaletteAction::ListFonts {
+                        let fonts = self.sugarloaf.font_family_names();
+                        self.renderer.command_palette.enter_fonts_mode(fonts);
+                    } else {
+                        self.renderer.command_palette.set_enabled(false);
+                        self.execute_palette_action(action, clipboard);
+                    }
                 }
                 self.mark_dirty();
                 true
@@ -2766,14 +3092,14 @@ impl Screen<'_> {
         &mut self,
         window: &rio_window::window::Window,
         prev: Option<ChromePress>,
-    ) {
+    ) -> bool {
         let window_origin = window.outer_position().ok();
         let double = matches!(self.mouse.click_state, ClickState::DoubleClick)
             && prev.is_some_and(|p| p.validates_double_click(window_origin));
         if double {
             let is_maximized = window.is_maximized();
             window.set_maximized(!is_maximized);
-            return;
+            return true;
         }
 
         self.last_chrome_press = Some(ChromePress {
@@ -2784,6 +3110,26 @@ impl Screen<'_> {
         if self.allow_manual_dragging {
             self.start_window_drag(window);
         }
+        false
+    }
+
+    #[cfg_attr(
+        not(all(feature = "wayland", target_os = "linux")),
+        allow(unused_variables)
+    )]
+    fn handle_chrome_press(
+        &mut self,
+        window: &rio_window::window::Window,
+        prev: Option<ChromePress>,
+        x_unscaled: f32,
+        layout: &TabStripLayout,
+    ) {
+        if self.on_chrome_press(window, prev) {
+            return;
+        }
+
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        self.start_wayland_window_drag(window, x_unscaled, layout);
     }
 
     #[inline]
@@ -2841,6 +3187,93 @@ impl Screen<'_> {
                 * self.sugarloaf.scale_factor()) as f64
     }
 
+    /// Return an external tab insertion slot for a physical client point.
+    pub fn tab_drop_index(&self, x: f64, y: f64) -> Option<usize> {
+        if !self.renderer.navigation.is_enabled() {
+            return None;
+        }
+        let num_tabs = self.context_manager.len();
+        island::tab_drop_index(
+            &self.island_tab_layout(num_tabs),
+            num_tabs,
+            x,
+            y,
+            self.sugarloaf.scale_factor(),
+            self.renderer.navigation.tab_bar_height,
+        )
+    }
+
+    /// Show an external tab insertion marker for this target window.
+    pub fn set_tab_drop_marker(&mut self, index: usize) -> bool {
+        assert!(
+            index <= self.context_manager.len(),
+            "tab drop index exceeds tab count"
+        );
+        let changed = self
+            .renderer
+            .island
+            .as_mut()
+            .is_some_and(|island| island.set_drop_marker(index));
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    /// Mark the tab whose contents are being transferred.
+    pub fn set_transfer_source_marker(&mut self, index: usize) -> bool {
+        assert!(
+            index < self.context_manager.len(),
+            "transfer source index exceeds tab count"
+        );
+        let changed = self
+            .renderer
+            .island
+            .as_mut()
+            .is_some_and(|island| island.set_transfer_source(index));
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    /// Clear this window's transfer source marker.
+    pub fn clear_transfer_source_marker(&mut self) -> bool {
+        let changed = self
+            .renderer
+            .island
+            .as_mut()
+            .is_some_and(island::Island::clear_transfer_source);
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    /// Clear this window's external tab insertion marker.
+    pub fn clear_tab_drop_marker(&mut self) -> bool {
+        let changed = self
+            .renderer
+            .island
+            .as_mut()
+            .is_some_and(island::Island::clear_drop_marker);
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
+    pub fn set_window_overlay(
+        &mut self,
+        overlay: Option<crate::renderer::WindowOverlay>,
+    ) -> bool {
+        let changed = self.renderer.set_window_overlay(overlay);
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
     pub fn handle_island_click(
         &mut self,
         window: &rio_window::window::Window,
@@ -2863,6 +3296,7 @@ impl Screen<'_> {
         let window_width = self.sugarloaf.window_size().width;
         let num_tabs = self.context_manager.len();
         let island_visible = self.renderer.navigation.island_visible(num_tabs);
+        let layout = self.island_tab_layout(num_tabs);
 
         if let Some(ref mut island) = self.renderer.island {
             if island.is_color_picker_open() {
@@ -2894,6 +3328,21 @@ impl Screen<'_> {
             return false;
         }
 
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        {
+            let top_chrome_height =
+                self.renderer.navigation.tab_inset_y as f64 * scale_factor as f64;
+            if !is_right_click && mouse_y < top_chrome_height {
+                self.handle_chrome_press(
+                    window,
+                    chrome_press,
+                    mouse_x as f32 / scale_factor,
+                    &layout,
+                );
+                return true;
+            }
+        }
+
         let mouse_x_unscaled = mouse_x as f32 / scale_factor;
 
         // Island isn't painted (hide_if_single + single tab). On macOS the
@@ -2902,10 +3351,6 @@ impl Screen<'_> {
         // visible island. Other platforms render the terminal from the top
         // when the island is hidden, so their clicks keep falling through.
         if !island_visible {
-            // …unless a ×-close just hid the strip (2 tabs → 1 with
-            // hide-if-single): the tail press of a double-click on the
-            // × would otherwise leak into the terminal as a selection,
-            // or start a window drag via the band fallback.
             if self.is_close_press_tail(mouse_x_unscaled) {
                 return true;
             }
@@ -2925,7 +3370,6 @@ impl Screen<'_> {
             return false;
         }
 
-        let layout = self.island_tab_layout(num_tabs);
         let x_in_tabs = mouse_x_unscaled - layout.left_margin;
 
         if !is_right_click
@@ -2947,7 +3391,7 @@ impl Screen<'_> {
         let past_last_tab = num_tabs > 1 && x_in_tabs >= layout.tabs_width;
         if x_in_tabs < 0.0 || past_last_tab {
             if !is_right_click {
-                self.on_chrome_press(window, chrome_press);
+                self.handle_chrome_press(window, chrome_press, mouse_x_unscaled, &layout);
             }
             return true;
         }
@@ -2996,6 +3440,27 @@ impl Screen<'_> {
         }
 
         if num_tabs == 1 {
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            {
+                use rio_window::platform::wayland::WindowExtWayland;
+                let double = matches!(self.mouse.click_state, ClickState::DoubleClick)
+                    && chrome_press.as_ref().is_some_and(|press| {
+                        press.validates_double_click(window.outer_position().ok())
+                    });
+
+                if !double && window.supports_toplevel_drag() {
+                    if let Some(island) = self.renderer.island.as_mut() {
+                        island.start_drag(
+                            self.context_manager
+                                .tab_id_at(0)
+                                .expect("singleton tab must exist"),
+                            0,
+                            mouse_x_unscaled - layout.left_margin,
+                            mouse_x_unscaled,
+                        );
+                    }
+                }
+            }
             self.on_chrome_press(window, chrome_press);
             return true;
         }
@@ -3020,12 +3485,8 @@ impl Screen<'_> {
             self.clear_selection();
             let old_index = self.context_manager.current_index();
             self.context_manager.set_current(clicked_tab);
-            let new_index = self.context_manager.current_index();
-            self.context_manager.switch_context_visibility(
-                &mut self.sugarloaf,
-                old_index,
-                new_index,
-            );
+            self.context_manager
+                .clear_context_overlays(&mut self.sugarloaf, old_index);
 
             self.mark_dirty();
         }
@@ -3041,10 +3502,13 @@ impl Screen<'_> {
         let can_reorder = self.allow_manual_dragging;
         #[cfg(not(target_os = "macos"))]
         let can_reorder = true;
-        if num_tabs > 1 && can_reorder {
+        if can_reorder {
             if let Some(ref mut island) = self.renderer.island {
                 let tab_left = layout.left_margin + clicked_tab as f32 * layout.tab_width;
                 island.start_drag(
+                    self.context_manager
+                        .tab_id_at(clicked_tab)
+                        .expect("clicked tab must exist"),
                     clicked_tab,
                     mouse_x_unscaled - tab_left,
                     mouse_x_unscaled,
@@ -3055,11 +3519,11 @@ impl Screen<'_> {
         true
     }
 
-    pub fn handle_tab_drag_move(&mut self, x_unscaled: f32) {
+    pub fn handle_tab_drag_move(&mut self, x_unscaled: f32, external: bool) {
         let num_tabs = self.context_manager.len();
 
         // A tab closed mid-drag invalidates the armed indices.
-        if num_tabs < 2 {
+        if num_tabs == 0 {
             if let Some(ref mut island) = self.renderer.island {
                 island.cancel_drag();
             }
@@ -3074,20 +3538,24 @@ impl Screen<'_> {
                     // armed but still below the drag threshold
                     return;
                 }
-                match (island.drag_index(), island.drag_center(&layout)) {
-                    (Some(idx), Some(center)) => (idx, center),
-                    _ => return,
-                }
+                (island.drag_index(), island.drag_center(&layout))
             }
             None => return,
         };
-
         let old_index = self.context_manager.current_index();
-        if drag_idx != old_index {
+        if drag_idx.is_some_and(|index| index != old_index) {
             if let Some(ref mut island) = self.renderer.island {
                 island.cancel_drag();
             }
             self.mark_dirty();
+            return;
+        }
+        if external {
+            self.mark_dirty();
+            return;
+        }
+        let Some(center) = center else { return };
+        if drag_idx.is_none() {
             return;
         }
 
@@ -3096,11 +3564,8 @@ impl Screen<'_> {
         if target != old_index {
             self.context_manager.move_current_tab_to(target);
             let new_index = self.context_manager.current_index();
-            self.context_manager.switch_context_visibility(
-                &mut self.sugarloaf,
-                old_index,
-                new_index,
-            );
+            self.context_manager
+                .clear_context_overlays(&mut self.sugarloaf, old_index);
             if let Some(ref mut island) = self.renderer.island {
                 island.remap_tab_move(old_index, new_index, layout.tab_width);
             }
@@ -3639,6 +4104,7 @@ impl Screen<'_> {
                 self.ctx_mut().current_mut().messenger.send_write(content);
             }
         } else {
+            let old_display_offset = self.display_offset();
             self.mouse.accumulated_scroll.y +=
                 (new_scroll_y_px * self.mouse.multiplier) / self.mouse.divider;
             let lines = (self.mouse.accumulated_scroll.y / height) as i32;
@@ -3737,8 +4203,10 @@ impl Screen<'_> {
             PaletteAction::TabClose => self.close_tab(clipboard),
             PaletteAction::TabCloseUnfocused => {
                 if self.ctx().len() > 1 {
-                    self.context_manager
+                    let removed = self
+                        .context_manager
                         .close_unfocused_tabs(&mut self.sugarloaf);
+                    self.discard_routes(removed);
                     if let Some(ref mut island) = self.renderer.island {
                         island.dismiss_color_picker();
                     }
@@ -3749,23 +4217,15 @@ impl Screen<'_> {
                 self.clear_selection();
                 let old = self.context_manager.current_index();
                 self.context_manager.switch_to_next();
-                let new = self.context_manager.current_index();
-                self.context_manager.switch_context_visibility(
-                    &mut self.sugarloaf,
-                    old,
-                    new,
-                );
+                self.context_manager
+                    .clear_context_overlays(&mut self.sugarloaf, old);
             }
             PaletteAction::SelectPrevTab => {
                 self.clear_selection();
                 let old = self.context_manager.current_index();
                 self.context_manager.switch_to_prev();
-                let new = self.context_manager.current_index();
-                self.context_manager.switch_context_visibility(
-                    &mut self.sugarloaf,
-                    old,
-                    new,
-                );
+                self.context_manager
+                    .clear_context_overlays(&mut self.sugarloaf, old);
             }
             PaletteAction::SplitRight => self.split_right(),
             PaletteAction::SplitDown => self.split_down(),
@@ -3781,6 +4241,12 @@ impl Screen<'_> {
             }
             PaletteAction::WindowCreateNew => {
                 self.context_manager.create_new_window();
+            }
+            PaletteAction::MoveCurrentTabToNewWindow => {
+                self.context_manager.move_current_tab_to_new_window();
+            }
+            PaletteAction::MergeWindow => {
+                self.context_manager.merge_window();
             }
             PaletteAction::IncreaseFontSize => {
                 self.change_font_size(FontSizeAction::Increase);
@@ -5000,6 +5466,33 @@ fn shell_execute_open(target: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_graphics_reject_unrelated_routes_transactionally() {
+        assert!(route_ids_belong_to([4, 7, 4], &[4, 7]));
+        assert!(!route_ids_belong_to([4, 8], &[4, 7]));
+    }
+
+    #[test]
+    fn transfer_tab_count_transitions_recompute_scaled_margins() {
+        let navigation = rio_backend::config::navigation::Navigation {
+            hide_if_single: true,
+            ..Default::default()
+        };
+        let margin = Margin::new(3.0, 4.0, 5.0, 6.0);
+        let single = scaled_margin_for_tabs(&navigation, margin, false, 1, 1.25);
+        let double = scaled_margin_for_tabs(&navigation, margin, false, 2, 1.25);
+
+        assert_ne!(single.top, double.top, "1 -> 2 must reveal the tab strip");
+        assert_eq!(single.right, 5.0);
+        assert_eq!(single.bottom, 6.25);
+        assert_eq!(single.left, 7.5);
+        assert_eq!(
+            scaled_margin_for_tabs(&navigation, margin, false, 1, 1.25),
+            single,
+            "2 -> 1 must restore the hidden-strip margin"
+        );
+    }
 
     #[test]
     fn chrome_press_validates_double_click() {

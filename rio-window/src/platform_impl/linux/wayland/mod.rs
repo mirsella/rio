@@ -3,6 +3,7 @@
 use std::fmt::Display;
 use std::sync::Arc;
 
+use sctk::compositor::SurfaceData;
 use sctk::reexports::client::globals::{BindError, GlobalError};
 use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::{self, ConnectError, DispatchError, Proxy};
@@ -14,6 +15,7 @@ pub use event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 pub use output::{MonitorHandle, VideoModeHandle};
 pub use window::Window;
 
+mod data_device;
 mod event_loop;
 mod output;
 mod seat;
@@ -75,6 +77,21 @@ impl DeviceId {
 #[inline]
 fn make_wid(surface: &WlSurface) -> WindowId {
     WindowId(surface.id().as_ptr() as u64)
+}
+
+/// Resolve subsurfaces, including client-side decorations, to their root surface.
+fn root_surface(surface: &WlSurface) -> WlSurface {
+    let mut root = surface.clone();
+    while let Some(parent) = root
+        .data::<SurfaceData>()
+        .and_then(SurfaceData::parent_surface)
+    {
+        if parent == &root {
+            break;
+        }
+        root = parent.clone();
+    }
+    root
 }
 
 /// The default routine does floor, but we need round on Wayland.
