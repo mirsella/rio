@@ -162,6 +162,7 @@ impl<T: 'static> EventLoop<T> {
                 move |_, _, winit_state: &mut WinitState| {
                     // Mark that we have something to dispatch.
                     winit_state.dispatched_events = true;
+                    winit_state.process_drag_loop_requests();
                     winit_state.update_system_theme();
                 },
             )

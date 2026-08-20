@@ -150,6 +150,12 @@ fn window_bg_alpha(config: &Config) -> f32 {
 
 pub use rio_backend::sugarloaf::{atlas_image_key, kitty_image_key, route_image_key};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowOverlay {
+    MergeSource,
+    MergeTarget,
+}
+
 pub struct Renderer {
     is_vi_mode_enabled: bool,
     is_game_mode_enabled: bool,
@@ -201,6 +207,7 @@ pub struct Renderer {
     pub custom_mouse_cursor: bool,
     pub trail_cursor_enabled: bool,
     pub trail_cursor: trail_cursor::TrailCursor,
+    window_overlay: Option<WindowOverlay>,
 }
 
 impl Renderer {
@@ -275,6 +282,7 @@ impl Renderer {
                 decay_slow: config.effects.trail_cursor_decay[1] as f32 / 1000.0,
                 start_threshold: config.effects.trail_cursor_start_threshold as f32,
             }),
+            window_overlay: None,
         }
     }
 
@@ -399,6 +407,14 @@ impl Renderer {
     #[inline]
     pub fn set_vi_mode(&mut self, is_vi_mode_enabled: bool) {
         self.is_vi_mode_enabled = is_vi_mode_enabled;
+    }
+
+    pub fn set_window_overlay(&mut self, overlay: Option<WindowOverlay>) -> bool {
+        if self.window_overlay == overlay {
+            return false;
+        }
+        self.window_overlay = overlay;
+        true
     }
 
     // Get the RGB value for a color index.
@@ -607,7 +623,10 @@ impl Renderer {
                             continue;
                         };
                         let mut overlay = rio_backend::sugarloaf::GraphicOverlay {
-                            image_id: route_image_key(route_id, p.image_key),
+                            image_id: rio_backend::sugarloaf::GraphicKey::new(
+                                context.route_id,
+                                p.image_key,
+                            ),
                             x: geometry.x,
                             y: geometry.y,
                             width: geometry.width,
@@ -645,8 +664,8 @@ impl Renderer {
                             continue;
                         };
                         let mut overlay = rio_backend::sugarloaf::GraphicOverlay {
-                            image_id: route_image_key(
-                                route_id,
+                            image_id: rio_backend::sugarloaf::GraphicKey::new(
+                                context.route_id,
                                 kitty_image_key(p.image_id),
                             ),
                             x: geometry.x,
@@ -680,6 +699,8 @@ impl Renderer {
                         (clip_x0, clip_y0, clip_x1, clip_y1),
                     );
                 }
+
+                overlays.sort_by_key(|overlay| (overlay.z_index, overlay.image_id));
             } else if rc.kitty_graphics_dirty {
                 // All placements (kitty and atlas) were removed, so drop
                 // this panel's overlay vec.
@@ -887,6 +908,23 @@ impl Renderer {
             sugarloaf.rect(None, x, y, width, height, rect.color, 0.0, 1);
         }
 
+        if let Some(overlay) = self.window_overlay {
+            let color = match overlay {
+                WindowOverlay::MergeSource => [0.28, 0.28, 0.28, 0.42],
+                WindowOverlay::MergeTarget => [1.0, 1.0, 1.0, 0.30],
+            };
+            sugarloaf.rect(
+                None,
+                0.0,
+                0.0,
+                window_size.width / scale_factor,
+                window_size.height / scale_factor,
+                color,
+                0.0,
+                15,
+            );
+        }
+
         // Derive the window bg color from the currently-active panel's
         // OSC 11 state (sticky on `renderable_content.background`) on
         // every frame, not just the frame where OSC arrived. Without
@@ -972,11 +1010,6 @@ impl Renderer {
             IncompletePlacement, PlaceholderRun, PLACEHOLDER,
         };
 
-        // Below text by default for virtual placements — apps that
-        // want them above the glyphs set z-index explicitly via the
-        // graphics protocol.
-        const VIRTUAL_Z_INDEX: i32 = -1;
-
         for (line_idx, row) in rc.visible_rows.iter().enumerate() {
             // Per-row dirty flag: skip rows that never had a placeholder
             // written. O(visible_w · visible_h) → O(rows_with_placeholders).
@@ -1009,7 +1042,6 @@ impl Renderer {
                             origin_y,
                             cell_width,
                             cell_height,
-                            VIRTUAL_Z_INDEX,
                             clip,
                         );
                     }
@@ -1046,7 +1078,6 @@ impl Renderer {
                                 origin_y,
                                 cell_width,
                                 cell_height,
-                                VIRTUAL_Z_INDEX,
                                 clip,
                             );
                         }
@@ -1077,7 +1108,6 @@ impl Renderer {
                     origin_y,
                     cell_width,
                     cell_height,
-                    VIRTUAL_Z_INDEX,
                     clip,
                 );
             }
@@ -1101,7 +1131,6 @@ impl Renderer {
             origin_y: f32,
             cell_width: f32,
             cell_height: f32,
-            z_index: i32,
             clip: (f32, f32, f32, f32),
         ) {
             let vp = rio_backend::ansi::kitty_virtual::resolve_virtual_placement(
@@ -1137,14 +1166,19 @@ impl Renderer {
             };
 
             let mut overlay = rio_backend::sugarloaf::GraphicOverlay {
-                image_id: route_image_key(route_id, kitty_image_key(run.image_id)),
+                image_id: rio_backend::sugarloaf::GraphicKey::new(
+                    route_id,
+                    kitty_image_key(run.image_id),
+                ),
                 x: geom.x,
                 y: geom.y,
                 width: geom.width,
                 height: geom.height,
-                z_index,
+                z_index: vp.z_index,
                 source_rect: geom.source_rect,
             };
+            overlay.x += vp.cell_x_offset as f32;
+            overlay.y += vp.cell_y_offset as f32;
             if rio_backend::ansi::graphics::clip_overlay_to_rect(
                 &mut overlay,
                 clip.0,
