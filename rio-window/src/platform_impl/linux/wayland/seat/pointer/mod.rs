@@ -19,7 +19,6 @@ use sctk::reexports::protocols::wp::pointer_constraints::zv1::client::zwp_pointe
 use sctk::reexports::client::globals::{BindError, GlobalList};
 use sctk::reexports::csd_frame::FrameClick;
 
-use sctk::compositor::SurfaceData;
 use sctk::globals::GlobalData;
 use sctk::seat::pointer::{
     PointerData, PointerDataExt, PointerEvent, PointerEventKind, PointerHandler,
@@ -31,6 +30,7 @@ use crate::event::{
     ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent,
 };
 
+use crate::platform_impl::wayland::data_device::{FrameDragGrab, LEFT_BUTTON};
 use crate::platform_impl::wayland::state::WinitState;
 use crate::platform_impl::wayland::{self, DeviceId, WindowId};
 
@@ -66,22 +66,57 @@ impl PointerHandler for WinitState {
         let device_id =
             crate::event::DeviceId(crate::platform_impl::DeviceId::Wayland(DeviceId));
 
-        for event in events {
+        for (event_index, event) in events.iter().enumerate() {
             let surface = &event.surface;
 
-            // The parent surface.
-            let parent_surface = match event.surface.data::<SurfaceData>() {
-                Some(data) => data.parent_surface().unwrap_or(surface),
-                None => continue,
+            match event.kind {
+                PointerEventKind::Press { button, serial, .. } => {
+                    pointer
+                        .winit_data()
+                        .button_pressed(button, serial, surface.clone());
+                }
+                PointerEventKind::Release { button, .. } => {
+                    pointer.winit_data().button_released(button);
+                }
+                _ => {}
+            }
+
+            let parent_surface = wayland::root_surface(surface);
+
+            let window_id = wayland::make_wid(&parent_surface);
+
+            let forgotten_frame_window = if matches!(
+                event.kind,
+                PointerEventKind::Release { button, .. } if button == LEFT_BUTTON
+            ) {
+                self.toplevel_drag
+                    .lock()
+                    .unwrap()
+                    .forget_frame_drag_for_pointer(&seat.id(), pointer.id())
+            } else {
+                None
             };
 
-            let window_id = wayland::make_wid(parent_surface);
+            if let Some(frame_window_id) = forgotten_frame_window {
+                if let Some(frame_window) =
+                    self.windows.get_mut().get_mut(&frame_window_id)
+                {
+                    frame_window
+                        .lock()
+                        .unwrap()
+                        .cancel_pending_move_for_seat(&seat.id());
+                }
+            }
 
             // Ensure that window exists.
             let mut window = match self.windows.get_mut().get_mut(&window_id) {
                 Some(window) => window.lock().unwrap(),
                 None => continue,
             };
+
+            if matches!(event.kind, PointerEventKind::Enter { .. }) {
+                pointer.winit_data().inner.lock().unwrap().surface = Some(window_id);
+            }
 
             let scale_factor = window.scale_factor();
             let position: PhysicalPosition<f64> =
@@ -91,20 +126,36 @@ impl PointerHandler for WinitState {
             match event.kind {
                 // Pointer movements on decorations.
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. }
-                    if parent_surface != surface =>
+                    if &parent_surface != surface =>
                 {
-                    if let Some(icon) = window.frame_point_moved(
-                        seat,
-                        surface,
-                        Duration::ZERO,
-                        event.position.0,
-                        event.position.1,
-                    ) {
+                    let custom_drag = self.toplevel_drag.lock().unwrap().has_frame_drag(
+                        window_id,
+                        &seat.id(),
+                        pointer.id(),
+                    );
+                    let icon = if custom_drag {
+                        window.frame_point_moved_without_native_move(
+                            &seat.id(),
+                            surface,
+                            Duration::ZERO,
+                            event.position.0,
+                            event.position.1,
+                        )
+                    } else {
+                        window.frame_point_moved(
+                            seat,
+                            surface,
+                            Duration::ZERO,
+                            event.position.0,
+                            event.position.1,
+                        )
+                    };
+                    if let Some(icon) = icon {
                         let _ = themed_pointer.set_cursor(connection, icon);
                     }
                 }
-                PointerEventKind::Leave { .. } if parent_surface != surface => {
-                    window.frame_point_left();
+                PointerEventKind::Leave { .. } if &parent_surface != surface => {
+                    window.frame_point_left(&seat.id());
                 }
                 ref kind @ PointerEventKind::Press {
                     button,
@@ -115,7 +166,7 @@ impl PointerHandler for WinitState {
                     button,
                     serial,
                     time,
-                } if parent_surface != surface => {
+                } if &parent_surface != surface => {
                     let click = match wayland_button_to_winit(button) {
                         MouseButton::Left => FrameClick::Normal,
                         MouseButton::Right => FrameClick::Alternate,
@@ -124,7 +175,7 @@ impl PointerHandler for WinitState {
                     let pressed = matches!(kind, PointerEventKind::Press { .. });
 
                     // Emulate click on the frame.
-                    window.frame_click(
+                    let moves = window.frame_click(
                         click,
                         pressed,
                         seat,
@@ -132,7 +183,48 @@ impl PointerHandler for WinitState {
                         Duration::from_millis(time as u64),
                         window_id,
                         &mut self.window_compositor_updates,
-                    );
+                    ) == Some(true);
+                    if pressed
+                        && moves
+                        && matches!(click, FrameClick::Normal)
+                        && self.toplevel_drag.lock().unwrap().supported()
+                        // The application callback runs after this protocol
+                        // batch. Starting a DND after a queued release would
+                        // violate Wayland's implicit-grab requirement, so
+                        // leave this press on the native-move path instead.
+                        && !events[event_index + 1..].iter().any(|event| {
+                            matches!(
+                                event.kind,
+                                PointerEventKind::Release { button, .. }
+                                    if button == LEFT_BUTTON
+                            )
+                        })
+                    {
+                        self.toplevel_drag.lock().unwrap().remember_frame_drag(
+                            window_id,
+                            FrameDragGrab {
+                                seat_id: seat.id(),
+                                pointer_id: pointer.id(),
+                                button,
+                                serial,
+                                origin: surface.clone(),
+                            },
+                        );
+                        self.events_sink.push_window_event(
+                            WindowEvent::ToplevelDrag(
+                                crate::platform::wayland::ToplevelDragEvent::FrameDrag {
+                                    position: LogicalPosition::new(
+                                        event.position.0,
+                                        event.position.1,
+                                    ),
+                                    seat_id: seat.id().protocol_id(),
+                                    pointer_id: pointer.id().protocol_id(),
+                                },
+                            ),
+                            window_id,
+                        );
+                        self.dispatched_events = true;
+                    }
                 }
                 // Regular events on the main surface.
                 PointerEventKind::Enter { .. } => {
@@ -142,9 +234,6 @@ impl PointerHandler for WinitState {
                     );
 
                     window.pointer_entered(Arc::downgrade(themed_pointer));
-
-                    // Set the currently focused surface.
-                    pointer.winit_data().inner.lock().unwrap().surface = Some(window_id);
 
                     self.events_sink.push_window_event(
                         WindowEvent::CursorMoved {
@@ -174,18 +263,12 @@ impl PointerHandler for WinitState {
                         window_id,
                     );
                 }
-                ref kind @ PointerEventKind::Press { button, serial, .. }
-                | ref kind @ PointerEventKind::Release { button, serial, .. } => {
-                    // Update the last button serial.
-                    pointer
-                        .winit_data()
-                        .inner
-                        .lock()
-                        .unwrap()
-                        .latest_button_serial = serial;
+                ref kind @ PointerEventKind::Press { button, .. }
+                | ref kind @ PointerEventKind::Release { button, .. } => {
+                    let pressed = matches!(kind, PointerEventKind::Press { .. });
 
                     let button = wayland_button_to_winit(button);
-                    let state = if matches!(kind, PointerEventKind::Press { .. }) {
+                    let state = if pressed {
                         ElementState::Pressed
                     } else {
                         ElementState::Released
@@ -345,6 +428,32 @@ impl WinitPointerData {
         self.sctk_data.latest_button_serial().unwrap_or_default()
     }
 
+    /// Most recent active grab for `button` and its implicit-grab serial.
+    pub fn active_button_grab(&self, button: u32) -> Option<(u32, u32, WlSurface)> {
+        let inner = self.inner.lock().unwrap();
+        let (pressed, serial, surface) = inner
+            .active_buttons
+            .iter()
+            .rev()
+            .find(|(pressed, _, _)| *pressed == button)?;
+        Some((*pressed, *serial, surface.clone()))
+    }
+
+    fn button_pressed(&self, button: u32, serial: u32, surface: WlSurface) {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .active_buttons
+            .retain(|(pressed, _, _)| *pressed != button);
+        inner.active_buttons.push((button, serial, surface));
+    }
+
+    fn button_released(&self, button: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .active_buttons
+            .retain(|(pressed, _, _)| *pressed != button);
+    }
+
     /// Last enter serial.
     pub fn latest_enter_serial(&self) -> u32 {
         self.sctk_data.latest_enter_serial().unwrap_or_default()
@@ -372,8 +481,8 @@ pub struct WinitPointerDataInner {
     /// The associated confined pointer.
     confined_pointer: Option<ZwpConfinedPointerV1>,
 
-    /// Serial of the last button event.
-    latest_button_serial: u32,
+    /// Pressed buttons in press order with their implicit-grab serials and surfaces.
+    active_buttons: Vec<(u32, u32, WlSurface)>,
 
     /// Currently focused window.
     surface: Option<WindowId>,
@@ -400,7 +509,7 @@ impl Default for WinitPointerDataInner {
             surface: None,
             locked_pointer: None,
             confined_pointer: None,
-            latest_button_serial: 0,
+            active_buttons: Vec::new(),
             phase: TouchPhase::Ended,
         }
     }

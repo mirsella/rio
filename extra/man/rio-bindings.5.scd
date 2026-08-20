@@ -217,6 +217,9 @@ action = "CreateWindow"
 *CreateWindow*
 	Create a new window.
 
+*MoveCurrentTabToNewWindow*
+	Move the current tab into a new window.
+
 *CloseWindow*
 	Close the current window.
 

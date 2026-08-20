@@ -1820,6 +1820,24 @@ impl UnownedWindow {
         self.drag_initiate(util::MOVERESIZE_MOVE)
     }
 
+    #[allow(dead_code)]
+    pub fn drag_window_from_active_grab(
+        &self,
+        _source_window_id: u64,
+    ) -> Result<(), ExternalError> {
+        self.drag_window()
+    }
+
+    #[allow(dead_code)]
+    pub fn drag_window_from_frame_grab(
+        &self,
+        source_window_id: u64,
+        _seat_id: u32,
+        _pointer_id: u32,
+    ) -> Result<(), ExternalError> {
+        self.drag_window_from_active_grab(source_window_id)
+    }
+
     #[inline]
     pub fn show_window_menu(&self, _position: Position) {}
 
