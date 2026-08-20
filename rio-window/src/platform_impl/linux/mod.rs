@@ -295,6 +295,21 @@ impl VideoModeHandle {
 }
 
 impl Window {
+    #[cfg(wayland_platform)]
+    fn as_wayland(
+        &self,
+    ) -> Result<&wayland::Window, crate::platform::wayland::ToplevelDragError> {
+        match self {
+            Window::Wayland(window) => Ok(window),
+            #[cfg(x11_platform)]
+            Window::X(_) => {
+                Err(crate::platform::wayland::ToplevelDragError::Unsupported(
+                    NotSupportedError::new(),
+                ))
+            }
+        }
+    }
+
     #[inline]
     pub(crate) fn new(
         window_target: &ActiveEventLoop,
@@ -448,6 +463,116 @@ impl Window {
     #[inline]
     pub fn drag_window(&self) -> Result<(), ExternalError> {
         x11_or_wayland!(match self; Window(window) => window.drag_window())
+    }
+
+    #[cfg(wayland_platform)]
+    pub fn drag_window_from_active_grab(
+        &self,
+        source_window_id: u64,
+    ) -> Result<(), ExternalError> {
+        x11_or_wayland!(match self; Window(window) => {
+            window.drag_window_from_active_grab(source_window_id)
+        })
+    }
+
+    #[cfg(wayland_platform)]
+    pub fn drag_window_from_frame_grab(
+        &self,
+        source_window_id: u64,
+        seat_id: u32,
+        pointer_id: u32,
+    ) -> Result<(), ExternalError> {
+        x11_or_wayland!(match self; Window(window) => {
+            window.drag_window_from_frame_grab(source_window_id, seat_id, pointer_id)
+        })
+    }
+
+    #[cfg(wayland_platform)]
+    pub(crate) fn supports_toplevel_drag(&self) -> bool {
+        self.as_wayland()
+            .is_ok_and(wayland::Window::supports_toplevel_drag)
+    }
+
+    #[cfg(wayland_platform)]
+    pub(crate) fn forget_frame_drag(&self) {
+        if let Ok(window) = self.as_wayland() {
+            window.forget_frame_drag();
+        }
+    }
+
+    #[cfg(wayland_platform)]
+    pub(crate) fn forget_frame_drag_for_pointer(&self, seat_id: u32, pointer_id: u32) {
+        if let Ok(window) = self.as_wayland() {
+            window.forget_frame_drag_for_pointer(seat_id, pointer_id);
+        }
+    }
+
+    #[cfg(wayland_platform)]
+    pub(crate) fn prepare_toplevel_drag(
+        &self,
+        data: Vec<u8>,
+        frame_grab: Option<(u32, u32)>,
+    ) -> Result<
+        crate::platform::wayland::ToplevelDragId,
+        crate::platform::wayland::ToplevelDragError,
+    > {
+        self.as_wayland()?.prepare_toplevel_drag(data, frame_grab)
+    }
+
+    #[cfg(wayland_platform)]
+    pub(crate) fn start_toplevel_drag(
+        &self,
+        drag_id: crate::platform::wayland::ToplevelDragId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        self.as_wayland()?.start_toplevel_drag(drag_id)
+    }
+
+    #[cfg(wayland_platform)]
+    pub(crate) fn accept_toplevel_drag_offer(
+        &self,
+        offer_id: crate::platform::wayland::ToplevelDragOfferId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        self.as_wayland()?.accept_toplevel_drag_offer(offer_id)
+    }
+
+    #[cfg(wayland_platform)]
+    pub(crate) fn reject_toplevel_drag_offer(
+        &self,
+        offer_id: crate::platform::wayland::ToplevelDragOfferId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        self.as_wayland()?.reject_toplevel_drag_offer(offer_id)
+    }
+
+    #[cfg(wayland_platform)]
+    pub(crate) fn receive_toplevel_drag_offer(
+        &self,
+        offer_id: crate::platform::wayland::ToplevelDragOfferId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        self.as_wayland()?.receive_toplevel_drag_offer(offer_id)
+    }
+
+    #[cfg(wayland_platform)]
+    pub(crate) fn finish_toplevel_drag_offer(
+        &self,
+        offer_id: crate::platform::wayland::ToplevelDragOfferId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        self.as_wayland()?.finish_toplevel_drag_offer(offer_id)
+    }
+
+    #[cfg(wayland_platform)]
+    pub(crate) fn cancel_toplevel_drag_offer(
+        &self,
+        offer_id: crate::platform::wayland::ToplevelDragOfferId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        self.as_wayland()?.cancel_toplevel_drag_offer(offer_id)
+    }
+
+    #[cfg(wayland_platform)]
+    pub(crate) fn cancel_toplevel_drag(
+        &self,
+        drag_id: crate::platform::wayland::ToplevelDragId,
+    ) -> Result<(), crate::platform::wayland::ToplevelDragError> {
+        self.as_wayland()?.cancel_toplevel_drag(drag_id)
     }
 
     #[inline]

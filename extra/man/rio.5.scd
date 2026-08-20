@@ -371,7 +371,8 @@ This section documents the *[bindings]* table of the configuration file.
 
 	*action*
 		Action to perform. Available actions include:
-		_"Quit"_, _"CreateWindow"_, _"CloseWindow"_, _"Copy"_, _"Paste"_,
+		_"Quit"_, _"CreateWindow"_, _"MoveCurrentTabToNewWindow"_,
+		_"CloseWindow"_, _"Copy"_, _"Paste"_,
 		_"ScrollUp"_, _"ScrollDown"_, _"ToggleViMode"_, _"OpenConfigEditor"_,
 		and many others.
 
