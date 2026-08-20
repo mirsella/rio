@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use ahash::HashSet;
+use ahash::{HashMap, HashSet};
 use tracing::{info, warn};
 
 use sctk::reexports::client::backend::ObjectId;
@@ -147,8 +147,8 @@ pub struct WindowState {
 
     /// Whether the client side decorations have pending move operations.
     ///
-    /// The value is the serial of the event triggered moved.
-    has_pending_move: Option<u32>,
+    /// The value is the seat and serial of the event that triggered the move.
+    pending_moves: HashMap<ObjectId, u32>,
 
     /// The underlying SCTK window.
     pub window: Window,
@@ -196,7 +196,7 @@ impl WindowState {
             frame: None,
             frame_callback_state: FrameCallbackState::None,
             seat_focus: Default::default(),
-            has_pending_move: None,
+            pending_moves: HashMap::default(),
             ime_allowed: false,
             ime_purpose: ImePurpose::Normal,
             last_configure: None,
@@ -433,6 +433,23 @@ impl WindowState {
         Ok(())
     }
 
+    pub fn drag_window_with_seat(
+        &self,
+        seat: &WlSeat,
+        serial: u32,
+    ) -> Result<(), ExternalError> {
+        self.window.xdg_toplevel()._move(seat, serial);
+        Ok(())
+    }
+
+    pub fn cancel_pending_move(&mut self) {
+        self.pending_moves.clear();
+    }
+
+    pub fn cancel_pending_move_for_seat(&mut self, seat_id: &ObjectId) {
+        self.pending_moves.remove(seat_id);
+    }
+
     /// Tells whether the window should be closed.
     #[allow(clippy::too_many_arguments)]
     pub fn frame_click(
@@ -445,12 +462,19 @@ impl WindowState {
         window_id: WindowId,
         updates: &mut Vec<WindowCompositorUpdate>,
     ) -> Option<bool> {
-        match self.frame.as_mut()?.on_click(timestamp, click, pressed)? {
+        if !pressed {
+            self.cancel_pending_move_for_seat(&seat.id());
+        }
+        let action = self.frame.as_mut()?.on_click(timestamp, click, pressed)?;
+        let moves = matches!(action, FrameAction::Move);
+        match action {
             FrameAction::Minimize => self.window.set_minimized(),
             FrameAction::Maximize => self.window.set_maximized(),
             FrameAction::UnMaximize => self.window.unset_maximized(),
             FrameAction::Close => WinitState::queue_close(updates, window_id),
-            FrameAction::Move => self.has_pending_move = Some(serial),
+            FrameAction::Move => {
+                self.pending_moves.insert(seat.id(), serial);
+            }
             FrameAction::Resize(edge) => {
                 let edge = match edge {
                     ResizeEdge::None => XdgResizeEdge::None,
@@ -472,10 +496,11 @@ impl WindowState {
             _ => (),
         };
 
-        Some(false)
+        Some(moves)
     }
 
-    pub fn frame_point_left(&mut self) {
+    pub fn frame_point_left(&mut self, seat_id: &ObjectId) {
+        self.cancel_pending_move_for_seat(seat_id);
         if let Some(frame) = self.frame.as_mut() {
             frame.click_point_left();
         }
@@ -490,8 +515,7 @@ impl WindowState {
         x: f64,
         y: f64,
     ) -> Option<CursorIcon> {
-        // Take the serial if we had any, so it doesn't stick around.
-        let serial = self.has_pending_move.take();
+        let serial = self.pending_moves.remove(&seat.id());
 
         if let Some(frame) = self.frame.as_mut() {
             let cursor = frame.click_point_moved(timestamp, &surface.id(), x, y);
@@ -506,6 +530,21 @@ impl WindowState {
         } else {
             None
         }
+    }
+
+    pub fn frame_point_moved_without_native_move(
+        &mut self,
+        seat_id: &ObjectId,
+        surface: &WlSurface,
+        timestamp: Duration,
+        x: f64,
+        y: f64,
+    ) -> Option<CursorIcon> {
+        self.cancel_pending_move_for_seat(seat_id);
+        self.frame
+            .as_mut()
+            .map(|frame| frame.click_point_moved(timestamp, &surface.id(), x, y))
+            .flatten()
     }
 
     /// Get the stored resizable state.

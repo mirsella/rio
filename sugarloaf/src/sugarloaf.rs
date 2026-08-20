@@ -9,7 +9,7 @@ use crate::font::{fonts::SugarloafFont, FontLibrary};
 use crate::font_cache::{compute_advance, resolve_with, FontCache, ResolvedGlyph};
 use crate::layout::RootStyle;
 use crate::renderer::Renderer;
-use crate::sugarloaf::graphics::GraphicDataEntry;
+use crate::sugarloaf::graphics::{GraphicDataEntry, GraphicKey};
 use swash::Attributes;
 
 use crate::context::Context;
@@ -37,9 +37,8 @@ pub struct Sugarloaf<'a> {
     pub background_image: Option<ImageProperties>,
     #[cfg(feature = "wgpu")]
     filters_brush: Option<FiltersBrush>,
-    /// Pixel data for standalone image textures, keyed by image key
-    /// (`graphics::kitty_image_key` / `graphics::atlas_image_key`).
-    pub image_data: rustc_hash::FxHashMap<u64, GraphicDataEntry>,
+    /// Pixel data for standalone image textures, scoped by terminal route.
+    pub image_data: rustc_hash::FxHashMap<GraphicKey, GraphicDataEntry>,
     /// Persistent state for the CPU rasterizer (glyph cache + frame hash).
     /// Unused on GPU backends.
     cpu_cache: crate::renderer::cpu::CpuCache,
@@ -64,6 +63,104 @@ pub struct Sugarloaf<'a> {
     /// outlives every Vulkan-handle-owning field above. See note at
     /// the top of the struct.
     pub ctx: Context<'a>,
+}
+
+#[cfg(test)]
+mod route_graphics_tests {
+    use super::*;
+
+    #[test]
+    fn extraction_moves_only_the_requested_routes() {
+        let route_one = GraphicKey::new(1, 7);
+        let route_two = GraphicKey::new(2, 7);
+        let route_three = GraphicKey::new(3, 7);
+        let mut entries = rustc_hash::FxHashMap::from_iter([
+            (route_one, 10),
+            (route_two, 20),
+            (route_three, 30),
+        ]);
+
+        let routes = rustc_hash::FxHashSet::from_iter([1, 3]);
+        let extracted = extract_route_entries(&mut entries, &routes);
+
+        assert_eq!(extracted.get(&route_one), Some(&10));
+        assert_eq!(extracted.get(&route_three), Some(&30));
+        assert_eq!(entries.get(&route_two), Some(&20));
+        assert!(!entries.contains_key(&route_one));
+        assert!(!entries.contains_key(&route_three));
+    }
+
+    #[test]
+    fn colliding_insertion_returns_all_incoming_ownership() {
+        let key = GraphicKey::new(1, 7);
+        let other = GraphicKey::new(1, 8);
+        let mut entries = rustc_hash::FxHashMap::from_iter([(key, "existing")]);
+        let incoming =
+            rustc_hash::FxHashMap::from_iter([(key, "collision"), (other, "owned")]);
+
+        let returned = try_insert_route_entries(&mut entries, incoming).unwrap_err();
+
+        assert_eq!(entries.get(&key), Some(&"existing"));
+        assert_eq!(returned.get(&key), Some(&"collision"));
+        assert_eq!(returned.get(&other), Some(&"owned"));
+        assert!(!entries.contains_key(&other));
+    }
+
+    #[test]
+    fn extraction_cleanup_removes_only_requested_route_overlays() {
+        let overlay = |route_id| crate::sugarloaf::graphics::GraphicOverlay {
+            image_id: GraphicKey::new(route_id, 7),
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            z_index: 0,
+            source_rect: crate::sugarloaf::graphics::GraphicOverlay::FULL_SOURCE_RECT,
+        };
+        let mut overlays = rustc_hash::FxHashMap::from_iter([
+            (10, vec![overlay(1), overlay(2)]),
+            (20, vec![overlay(1)]),
+        ]);
+
+        remove_route_overlays(&mut overlays, &rustc_hash::FxHashSet::from_iter([1]));
+
+        assert_eq!(overlays.len(), 1);
+        assert_eq!(overlays[&10].len(), 1);
+        assert_eq!(overlays[&10][0].image_id.route_id, 2);
+    }
+}
+
+fn extract_route_entries<T>(
+    entries: &mut rustc_hash::FxHashMap<GraphicKey, T>,
+    route_ids: &rustc_hash::FxHashSet<usize>,
+) -> rustc_hash::FxHashMap<GraphicKey, T> {
+    entries
+        .extract_if(|key, _| route_ids.contains(&key.route_id))
+        .collect()
+}
+
+fn try_insert_route_entries<T>(
+    entries: &mut rustc_hash::FxHashMap<GraphicKey, T>,
+    incoming: rustc_hash::FxHashMap<GraphicKey, T>,
+) -> Result<(), rustc_hash::FxHashMap<GraphicKey, T>> {
+    if incoming.keys().any(|key| entries.contains_key(key)) {
+        return Err(incoming);
+    }
+    entries.extend(incoming);
+    Ok(())
+}
+
+fn remove_route_overlays(
+    overlays_by_panel: &mut rustc_hash::FxHashMap<
+        usize,
+        Vec<crate::sugarloaf::graphics::GraphicOverlay>,
+    >,
+    route_ids: &rustc_hash::FxHashSet<usize>,
+) {
+    overlays_by_panel.retain(|_, overlays| {
+        overlays.retain(|overlay| !route_ids.contains(&overlay.image_id.route_id));
+        !overlays.is_empty()
+    });
 }
 
 #[derive(Debug)]
@@ -837,11 +934,33 @@ impl Sugarloaf<'_> {
     }
 
     /// Remove an image's pixel data and its cached GPU texture.
-    /// `key` is a `graphics::kitty_image_key` / `graphics::atlas_image_key`.
     #[inline]
-    pub fn remove_image(&mut self, key: u64) {
+    pub fn remove_image(&mut self, key: GraphicKey) {
         self.image_data.remove(&key);
         self.renderer.evict_image_texture(key);
+    }
+
+    /// Move all CPU image data owned by the requested routes out of this
+    /// renderer and clear their source-side GPU and overlay state.
+    pub fn extract_routes_graphics(
+        &mut self,
+        route_ids: impl IntoIterator<Item = usize>,
+    ) -> rustc_hash::FxHashMap<GraphicKey, GraphicDataEntry> {
+        let route_ids: rustc_hash::FxHashSet<_> = route_ids.into_iter().collect();
+        let extracted = extract_route_entries(&mut self.image_data, &route_ids);
+        self.renderer
+            .evict_route_image_textures(|route_id| route_ids.contains(&route_id));
+        remove_route_overlays(&mut self.image_overlays, &route_ids);
+        extracted
+    }
+
+    /// Transactionally insert graphics from any number of routes.
+    #[inline]
+    pub fn insert_routes_graphics(
+        &mut self,
+        graphics: rustc_hash::FxHashMap<GraphicKey, GraphicDataEntry>,
+    ) -> Result<(), rustc_hash::FxHashMap<GraphicKey, GraphicDataEntry>> {
+        try_insert_route_entries(&mut self.image_data, graphics)
     }
 
     /// Drop everything this frame's immediate-mode producers pushed
@@ -1143,23 +1262,40 @@ impl Sugarloaf<'_> {
                 multiview_mask: None,
             });
 
-            // Grid passes first — cell bg/text composite under
-            // the rich-text UI overlays drawn below. Wgpu
-            // doesn't yet interleave kitty image layers with
-            // the grid bg/text split (BrushRenderer::render
-            // owns kitty image draws inline), so for now the
-            // bg+text passes run back-to-back per panel —
-            // same visual result as the prior single render
-            // call. Re-ordering kitty layers around the
-            // bg/text split would require pulling image
-            // draws out of BrushRenderer::render — Metal
-            // already does that; wgpu follow-up.
+            // Keep the image phases interleaved with the grid phases so
+            // Kitty z-layers have the same meaning on every renderer.
+            self.renderer.render_wgpu_part(
+                ctx,
+                &mut rpass,
+                crate::renderer::WgpuRenderPart::Images(
+                    crate::renderer::ImageLayer::BelowBg,
+                ),
+            );
             for (grid, uniforms) in grids.iter_mut() {
                 grid.render_bg_wgpu(&mut rpass, uniforms);
+            }
+            self.renderer.render_wgpu_part(
+                ctx,
+                &mut rpass,
+                crate::renderer::WgpuRenderPart::Images(
+                    crate::renderer::ImageLayer::BelowText,
+                ),
+            );
+            for (grid, uniforms) in grids.iter_mut() {
                 grid.render_text_wgpu(&mut rpass, uniforms);
             }
-
-            self.renderer.render(ctx, &mut rpass);
+            self.renderer.render_wgpu_part(
+                ctx,
+                &mut rpass,
+                crate::renderer::WgpuRenderPart::Images(
+                    crate::renderer::ImageLayer::AboveText,
+                ),
+            );
+            self.renderer.render_wgpu_part(
+                ctx,
+                &mut rpass,
+                crate::renderer::WgpuRenderPart::Geometry,
+            );
 
             // UI text pass (swash-backed). Lazy-init the
             // wgpu pipeline + atlases on the first frame.

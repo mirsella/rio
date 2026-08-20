@@ -59,12 +59,6 @@ pub struct WinitSeatState {
     modifiers_pending: bool,
 }
 
-impl WinitSeatState {
-    pub fn new() -> Self {
-        Default::default()
-    }
-}
-
 impl SeatHandler for WinitState {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seat_state
@@ -127,6 +121,11 @@ impl SeatHandler for WinitState {
                     .insert(surface_id, themed_pointer.clone());
 
                 seat_state.pointer = Some(themed_pointer);
+                if let Some(drag_seat) =
+                    self.toplevel_drag.lock().unwrap().seats.get_mut(&seat.id())
+                {
+                    drag_seat.pointer = seat_state.pointer.clone();
+                }
             }
             _ => (),
         }
@@ -152,12 +151,27 @@ impl SeatHandler for WinitState {
         seat: WlSeat,
         capability: SeatCapability,
     ) {
+        if matches!(&capability, SeatCapability::Pointer) {
+            self.cancel_pending_move_for_seat(&seat.id());
+        }
         let seat_state = match self.seats.get_mut(&seat.id()) {
             Some(seat_state) => seat_state,
             None => {
                 warn!("Received wl_seat::remove_capability for unknown seat");
                 return;
             }
+        };
+
+        let cancelled_drag = if matches!(&capability, SeatCapability::Pointer) {
+            Some({
+                let mut drag = self.toplevel_drag.lock().unwrap();
+                (
+                    drag.cancel_sources_for_seat(&seat.id()),
+                    drag.cancel_offers_for_seat(&seat.id()),
+                )
+            })
+        } else {
+            None
         };
 
         if let Some(text_input) = seat_state.text_input.take() {
@@ -192,6 +206,11 @@ impl SeatHandler for WinitState {
                         pointer.pointer().release();
                     }
                 }
+                if let Some(drag_seat) =
+                    self.toplevel_drag.lock().unwrap().seats.get_mut(&seat.id())
+                {
+                    drag_seat.pointer = None;
+                }
             }
             SeatCapability::Keyboard => {
                 seat_state.keyboard_state = None;
@@ -199,15 +218,28 @@ impl SeatHandler for WinitState {
             }
             _ => (),
         }
+        self.process_drag_loop_requests();
+        if let Some((cancelled_sources, cancelled_offers)) = cancelled_drag {
+            for source in cancelled_sources {
+                self.notify_cancelled_source(source);
+            }
+            for offer in cancelled_offers {
+                self.notify_cancelled_offer(offer);
+            }
+        }
     }
 
     fn new_seat(
         &mut self,
         _connection: &Connection,
-        _queue_handle: &QueueHandle<Self>,
+        queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
-        self.seats.insert(seat.id(), WinitSeatState::new());
+        self.toplevel_drag
+            .lock()
+            .unwrap()
+            .register_seat(queue_handle, &seat);
+        self.seats.insert(seat.id(), WinitSeatState::default());
     }
 
     fn remove_seat(
@@ -217,6 +249,8 @@ impl SeatHandler for WinitState {
         seat: WlSeat,
     ) {
         let _ = self.seats.remove(&seat.id());
+        self.cancel_pending_move_for_seat(&seat.id());
+        self.remove_drag_seat(&seat.id());
         self.on_keyboard_destroy(&seat.id());
     }
 }
@@ -231,6 +265,12 @@ impl WinitState {
                 self.events_sink
                     .push_window_event(WindowEvent::Focused(false), *window_id);
             }
+        }
+    }
+
+    fn cancel_pending_move_for_seat(&mut self, seat: &ObjectId) {
+        for window in self.windows.get_mut().values_mut() {
+            window.lock().unwrap().cancel_pending_move_for_seat(seat);
         }
     }
 }

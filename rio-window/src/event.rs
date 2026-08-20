@@ -223,6 +223,10 @@ pub enum WindowEvent {
     /// hovered.
     HoveredFileCancelled,
 
+    /// A Wayland data-device drag lifecycle event.
+    #[cfg(wayland_platform)]
+    ToplevelDrag(crate::platform::wayland::ToplevelDragEvent),
+
     /// The window gained or lost focus.
     ///
     /// The parameter is true if the window has gained focus, and false if it has lost focus.
@@ -1099,6 +1103,12 @@ mod tests {
                 with_window_event(DroppedFile("x.txt".into()));
                 with_window_event(HoveredFile("x.txt".into()));
                 with_window_event(HoveredFileCancelled);
+                #[cfg(wayland_platform)]
+                with_window_event(ToplevelDrag(
+                    crate::platform::wayland::ToplevelDragEvent::Cancelled {
+                        drag_id: crate::platform::wayland::ToplevelDragId::from_raw(1),
+                    },
+                ));
                 with_window_event(Ime(Enabled));
                 with_window_event(CursorMoved {
                     device_id: did,

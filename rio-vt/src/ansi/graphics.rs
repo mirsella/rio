@@ -544,6 +544,9 @@ pub struct VirtualPlacement {
     pub y: u32,
     pub width: u32,
     pub height: u32,
+    pub cell_x_offset: u32,
+    pub cell_y_offset: u32,
+    pub z_index: i32,
 }
 
 /// Per-screen Kitty graphics state.
@@ -833,31 +836,41 @@ impl Graphics {
             &mut self.atlas_key_refs,
             &mut self.kitty_inactive_screen.atlas_key_refs,
         );
+
+        // The renderer has one route-local texture namespace, while Kitty
+        // image stores are screen-local. Re-upload every newly active image
+        // that has placement metadata so equal IDs on main/alt cannot leave
+        // the previous screen's pixels cached.
+        let active_ids: std::collections::HashSet<_> = self
+            .kitty_placements
+            .keys()
+            .chain(self.kitty_virtual_placements.keys())
+            .map(|(image_id, _)| *image_id)
+            .collect();
+        for image_id in active_ids {
+            if let Some(stored) = self.kitty_images.get(&image_id) {
+                let mut data = stored.data.clone();
+                data.transmit_time = stored.transmission_time;
+                self.pending_images.push((image_id, data));
+            }
+        }
         self.kitty_graphics_dirty = true;
     }
 
-    /// Clear all kitty graphics state on both screens. Used by full reset.
+    /// Clear all graphics state on both screens. Used by full reset.
     pub fn clear_all_kitty_state(&mut self) {
-        // Subtract bytes from the inactive screen before dropping it,
-        // since total_bytes is the *global* counter.
-        let inactive_bytes: usize = self
-            .kitty_inactive_screen
-            .kitty_images
-            .values()
-            .map(|s| s.data.pixels.len())
-            .sum();
-        self.total_bytes = self.total_bytes.saturating_sub(inactive_bytes);
-
-        self.kitty_images.clear();
-        self.kitty_image_numbers.clear();
-        self.kitty_placements.clear();
-        self.kitty_virtual_placements.clear();
-
         // Sixel/iTerm2 placements die with the reset too; queue every
         // referenced key (both screens) so the frontend frees the
         // pixel store and GPU textures.
         {
             let mut removals = self.texture_operations.lock();
+            let kitty_ids: std::collections::HashSet<_> = self
+                .kitty_images
+                .keys()
+                .chain(self.kitty_inactive_screen.kitty_images.keys())
+                .copied()
+                .collect();
+            removals.extend(kitty_ids.into_iter().map(rio_graphics::kitty_image_key));
             for key in self.atlas_key_refs.keys() {
                 removals.push(*key);
             }
@@ -865,8 +878,17 @@ impl Graphics {
                 removals.push(*key);
             }
         }
+        self.kitty_images.clear();
+        self.kitty_image_numbers.clear();
+        self.kitty_placements.clear();
+        self.kitty_virtual_placements.clear();
         self.atlas_placements.clear();
         self.atlas_key_refs.clear();
+        self.pending.clear();
+        self.pending_images.clear();
+        self.image_timestamps.clear();
+        self.kitty_chunking_state = Default::default();
+        self.total_bytes = 0;
 
         self.kitty_inactive_screen = KittyScreenState::default();
         self.kitty_graphics_dirty = true;
@@ -883,23 +905,39 @@ impl Graphics {
         let now = std::time::Instant::now();
         data.transmit_time = now;
 
-        // Evict before storing to protect images with active placements
         let new_bytes = data.pixels.len();
-        if self.total_bytes + new_bytes > self.total_limit {
+        let old_bytes = self
+            .kitty_images
+            .get(&image_id)
+            .map_or(0, |stored| stored.data.pixels.len());
+        let additional_bytes = new_bytes.saturating_sub(old_bytes);
+        if self.total_bytes + additional_bytes > self.total_limit {
             // Collect active IDs — images with placements are protected
             let mut active = std::collections::HashSet::new();
-            for placement in self.kitty_placements.values() {
-                active.insert(placement.image_id as u64);
+            for placement in self
+                .kitty_placements
+                .values()
+                .map(|placement| placement.image_id)
+                .chain(
+                    self.kitty_virtual_placements
+                        .values()
+                        .map(|placement| placement.image_id),
+                )
+            {
+                active.insert(placement as u64);
             }
             // Also protect the image we're about to store
             active.insert(image_id as u64);
-            self.evict_images(new_bytes, &active);
+            self.evict_images(additional_bytes, &active);
         }
 
-        // If replacing an existing image, subtract its bytes first
-        if let Some(old) = self.kitty_images.get(&image_id) {
-            self.total_bytes = self.total_bytes.saturating_sub(old.data.pixels.len());
-        }
+        // Eviction may have removed the image being replaced. In that case
+        // its bytes were already included in the eviction total.
+        let replaced_bytes = self
+            .kitty_images
+            .get(&image_id)
+            .map_or(0, |stored| stored.data.pixels.len());
+        self.total_bytes = self.total_bytes.saturating_sub(replaced_bytes);
 
         self.kitty_images.insert(
             image_id,
@@ -935,11 +973,36 @@ impl Graphics {
         &mut self,
         predicate: impl Fn(&u32, &StoredImage) -> bool,
     ) {
-        let before = self.kitty_images.len();
-        self.kitty_images.retain(|id, img| !predicate(id, img));
-        if self.kitty_images.len() != before {
-            self.kitty_graphics_dirty = true;
+        let mut removed_bytes = 0;
+        let removed_ids: std::collections::HashSet<_> = self
+            .kitty_images
+            .extract_if(|id, image| {
+                let remove = predicate(id, image);
+                if remove {
+                    removed_bytes += image.data.pixels.len();
+                }
+                remove
+            })
+            .map(|(id, _)| id)
+            .collect();
+        if removed_ids.is_empty() {
+            return;
         }
+
+        self.pending_images
+            .retain(|(id, _)| !removed_ids.contains(id));
+        self.kitty_placements
+            .retain(|(id, _), _| !removed_ids.contains(id));
+        self.kitty_virtual_placements
+            .retain(|(id, _), _| !removed_ids.contains(id));
+        self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
+        self.texture_operations.lock().extend(
+            removed_ids
+                .iter()
+                .copied()
+                .map(rio_graphics::kitty_image_key),
+        );
+        self.kitty_graphics_dirty = true;
         // Clean up stale number mappings
         self.kitty_image_numbers
             .retain(|_, id| self.kitty_images.contains_key(id));
@@ -1123,7 +1186,11 @@ impl Graphics {
                     rio_graphics::kitty_image_key(id.get() as u32)
                 }
             };
-            self.texture_operations.lock().push(key);
+            let active_duplicate = source == CandidateSource::InactiveKitty
+                && self.kitty_images.contains_key(&evicted_u32);
+            if !active_duplicate {
+                self.texture_operations.lock().push(key);
+            }
         }
 
         // Sweep dangling placements on both screens. A placement is
@@ -1138,6 +1205,8 @@ impl Graphics {
             self.kitty_images.keys().copied().collect();
         self.kitty_placements
             .retain(|_, p| active_ids.contains(&p.image_id));
+        self.kitty_virtual_placements
+            .retain(|_, p| active_ids.contains(&p.image_id));
         let inactive_ids: std::collections::HashSet<u32> = self
             .kitty_inactive_screen
             .kitty_images
@@ -1146,6 +1215,9 @@ impl Graphics {
             .collect();
         self.kitty_inactive_screen
             .kitty_placements
+            .retain(|_, p| inactive_ids.contains(&p.image_id));
+        self.kitty_inactive_screen
+            .kitty_virtual_placements
             .retain(|_, p| inactive_ids.contains(&p.image_id));
 
         // Update total_bytes
@@ -1160,7 +1232,7 @@ impl Graphics {
 
     /// Collect IDs of graphics still displayed on the grid or as
     /// overlays. O(number of placements).
-    pub fn collect_active_graphic_ids(&mut self) -> std::collections::HashSet<u64> {
+    pub fn collect_active_graphic_ids(&self) -> std::collections::HashSet<u64> {
         let mut active = std::collections::HashSet::new();
         // Sixel/iTerm2 liveness: placements are the single owners.
         for placement in &self.atlas_placements {
@@ -1169,6 +1241,9 @@ impl Graphics {
         }
         // Overlay-based (kitty) liveness — use image_id directly
         for placement in self.kitty_placements.values() {
+            active.insert(placement.image_id as u64);
+        }
+        for placement in self.kitty_virtual_placements.values() {
             active.insert(placement.image_id as u64);
         }
         active
@@ -1471,4 +1546,124 @@ fn test_graphics_no_eviction_when_under_limit() {
     // No eviction should occur
     assert_eq!(graphics.pending.len(), 1);
     assert_eq!(graphics.total_bytes, 50_000);
+}
+
+#[cfg(test)]
+pub(crate) fn kitty_test_data(image_id: u32, bytes: usize) -> GraphicData {
+    GraphicData {
+        id: GraphicId::new(image_id as u64),
+        width: bytes,
+        height: 1,
+        color_type: rio_graphics::ColorType::Rgba,
+        pixels: vec![255; bytes],
+        is_opaque: true,
+        resize: None,
+        display_width: None,
+        display_height: None,
+        transmit_time: std::time::Instant::now(),
+    }
+}
+
+#[test]
+fn kitty_delete_updates_bytes_queue_and_virtual_placements() {
+    let mut graphics = Graphics::default();
+    graphics.store_kitty_image(1, Some(11), kitty_test_data(1, 4));
+    graphics.store_kitty_image(2, None, kitty_test_data(2, 6));
+    graphics.kitty_virtual_placements.insert(
+        (1, 9),
+        VirtualPlacement {
+            image_id: 1,
+            placement_id: 9,
+            columns: 1,
+            rows: 1,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            cell_x_offset: 0,
+            cell_y_offset: 0,
+            z_index: 0,
+        },
+    );
+    graphics.pending_images.push((1, kitty_test_data(1, 4)));
+
+    graphics.delete_kitty_images(|id, _| *id == 1);
+
+    assert_eq!(graphics.total_bytes, 6);
+    assert!(!graphics.kitty_images.contains_key(&1));
+    assert!(!graphics.kitty_image_numbers.contains_key(&11));
+    assert!(!graphics.kitty_virtual_placements.contains_key(&(1, 9)));
+    assert!(graphics.pending_images.is_empty());
+    assert_eq!(
+        graphics.texture_operations.lock().as_slice(),
+        &[rio_graphics::kitty_image_key(1)]
+    );
+}
+
+#[test]
+fn graphics_reset_accounts_for_both_screens_and_atlas_data() {
+    let mut graphics = Graphics::default();
+    graphics.store_kitty_image(1, None, kitty_test_data(1, 4));
+    let inactive = kitty_test_data(2, 6);
+    graphics.total_bytes += inactive.pixels.len();
+    graphics.kitty_inactive_screen.kitty_images.insert(
+        2,
+        StoredImage {
+            data: inactive,
+            transmission_time: std::time::Instant::now(),
+        },
+    );
+    let atlas = kitty_test_data(3, 8);
+    graphics.track_graphic(atlas.id, atlas.pixels.len());
+    graphics.pending.push(atlas);
+    graphics
+        .atlas_key_refs
+        .insert(rio_graphics::atlas_image_key(3), 1);
+
+    graphics.clear_all_kitty_state();
+
+    assert_eq!(graphics.total_bytes, 0);
+    assert!(graphics.pending.is_empty());
+    assert!(graphics.image_timestamps.is_empty());
+    let removals: std::collections::HashSet<_> =
+        graphics.texture_operations.lock().iter().copied().collect();
+    assert_eq!(
+        removals,
+        std::collections::HashSet::from([
+            rio_graphics::kitty_image_key(1),
+            rio_graphics::kitty_image_key(2),
+            rio_graphics::atlas_image_key(3),
+        ])
+    );
+}
+
+#[test]
+fn kitty_retransmission_replaces_memory_instead_of_double_counting() {
+    let mut graphics = Graphics::default();
+    graphics.store_kitty_image(1, None, kitty_test_data(1, 10));
+    graphics.store_kitty_image(1, None, kitty_test_data(1, 4));
+    assert_eq!(graphics.total_bytes, 4);
+}
+
+#[test]
+fn virtual_placements_keep_images_active() {
+    let mut graphics = Graphics::default();
+    graphics.kitty_virtual_placements.insert(
+        (7, 1),
+        VirtualPlacement {
+            image_id: 7,
+            placement_id: 1,
+            columns: 1,
+            rows: 1,
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            cell_x_offset: 0,
+            cell_y_offset: 0,
+            z_index: 0,
+        },
+    );
+
+    assert!(graphics.collect_active_graphic_ids().contains(&7));
 }

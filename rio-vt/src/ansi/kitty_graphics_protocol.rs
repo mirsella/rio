@@ -44,6 +44,54 @@ pub struct KittyGraphicsState {
 }
 
 impl KittyGraphicsState {
+    pub fn cancel_transmissions(
+        &mut self,
+        action: u8,
+        image_id: u32,
+        image_number: u32,
+        range_start: u32,
+        range_end: u32,
+    ) {
+        let action = action.to_ascii_lowercase();
+        let current_key = self.current_transmission_key;
+        let mut removed_current = false;
+        self.incomplete_images.retain(|key, command| {
+            let matches = match action {
+                b'i' => {
+                    let id = if image_id > 0 { image_id } else { image_number };
+                    id > 0 && command.image_id == id
+                }
+                b'n' => {
+                    let number = if image_number > 0 {
+                        image_number
+                    } else {
+                        image_id
+                    };
+                    number > 0
+                        && (command.image_number == number
+                            || (command.image_number == 0 && command.image_id == number))
+                }
+                b'r' => {
+                    range_start > 0
+                        && range_end >= range_start
+                        && command.image_id >= range_start
+                        && command.image_id <= range_end
+                }
+                // Any delete command aborts incomplete uploads. The
+                // protocol does not allow a later chunk to resurrect data
+                // after a deletion request.
+                _ => true,
+            };
+            if matches && *key == current_key {
+                removed_current = true;
+            }
+            !matches
+        });
+        if removed_current {
+            self.current_transmission_key = 0;
+        }
+    }
+
     /// Allocate a fresh image_id for an implicit transmission.
     fn allocate_image_id(&mut self) -> u32 {
         if self.next_auto_image_id < 0x80000000 {
@@ -1540,6 +1588,65 @@ mod tests {
         assert!(response.graphic_data.is_some());
         assert!(response.placement_request.is_none());
         assert!(response.delete_request.is_none());
+    }
+
+    #[test]
+    fn range_delete_cancels_all_matching_transmissions() {
+        let mut state = KittyGraphicsState::default();
+        state.incomplete_images.insert(
+            10,
+            KittyGraphicsCommand {
+                image_id: 10,
+                ..Default::default()
+            },
+        );
+        state.incomplete_images.insert(
+            11,
+            KittyGraphicsCommand {
+                image_id: 11,
+                ..Default::default()
+            },
+        );
+        state.incomplete_images.insert(
+            20,
+            KittyGraphicsCommand {
+                image_id: 20,
+                ..Default::default()
+            },
+        );
+        state.current_transmission_key = 11;
+
+        state.cancel_transmissions(b'r', 0, 0, 10, 11);
+
+        assert!(!state.incomplete_images.contains_key(&10));
+        assert!(!state.incomplete_images.contains_key(&11));
+        assert!(state.incomplete_images.contains_key(&20));
+        assert_eq!(state.current_transmission_key, 0);
+    }
+
+    #[test]
+    fn any_delete_cancels_incomplete_transmissions() {
+        let mut state = KittyGraphicsState::default();
+        state.incomplete_images.insert(
+            10,
+            KittyGraphicsCommand {
+                image_id: 10,
+                ..Default::default()
+            },
+        );
+        state.incomplete_images.insert(
+            20,
+            KittyGraphicsCommand {
+                image_id: 20,
+                ..Default::default()
+            },
+        );
+        state.current_transmission_key = 20;
+
+        state.cancel_transmissions(b'a', 0, 0, 0, 0);
+
+        assert!(state.incomplete_images.is_empty());
+        assert_eq!(state.current_transmission_key, 0);
     }
 
     #[test]

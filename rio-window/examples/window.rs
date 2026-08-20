@@ -1,5 +1,7 @@
 //! Simple winit application.
 
+extern crate tracing as tracing_crate;
+
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Debug;
@@ -8,13 +10,9 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::{fmt, mem};
 
-use ::tracing::{error, info};
 use cursor_icon::CursorIcon;
 #[cfg(not(any(android_platform, ios_platform)))]
 use raw_window_handle::{DisplayHandle, HasDisplayHandle};
-#[cfg(not(any(android_platform, ios_platform)))]
-use softbuffer::{Context, Surface};
-
 use rio_window::application::ApplicationHandler;
 use rio_window::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use rio_window::event::{
@@ -22,11 +20,6 @@ use rio_window::event::{
 };
 use rio_window::event_loop::{ActiveEventLoop, EventLoop};
 use rio_window::keyboard::{Key, ModifiersState};
-use rio_window::window::{
-    Cursor, CursorGrabMode, CustomCursor, CustomCursorSource, Fullscreen, Icon,
-    ResizeDirection, Theme, Window, WindowId,
-};
-
 #[cfg(macos_platform)]
 use rio_window::platform::macos::{
     OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS,
@@ -36,6 +29,13 @@ use rio_window::platform::startup_notify::{
     self, EventLoopExtStartupNotify, WindowAttributesExtStartupNotify,
     WindowExtStartupNotify,
 };
+use rio_window::window::{
+    Cursor, CursorGrabMode, CustomCursor, CustomCursorSource, Fullscreen, Icon,
+    ResizeDirection, Theme, Window, WindowId,
+};
+#[cfg(not(any(android_platform, ios_platform)))]
+use softbuffer::{Context, Surface};
+use tracing_crate::{error, info};
 
 #[path = "util/tracing.rs"]
 mod tracing;
@@ -467,6 +467,8 @@ impl ApplicationHandler<UserEvent> for Application {
             WindowEvent::DoubleTapGesture { .. } => {
                 info!("Smart zoom");
             }
+            #[cfg(wayland_platform)]
+            WindowEvent::ToplevelDrag(_) => (),
             WindowEvent::TouchpadPressure { .. }
             | WindowEvent::HoveredFileCancelled
             | WindowEvent::KeyboardInput { .. }

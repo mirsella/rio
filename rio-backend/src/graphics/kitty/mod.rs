@@ -5212,7 +5212,7 @@ fn test_overlay_clips_to_panel_rect() {
     // ends at x=400 must clip at the divider, showing only the left
     // two-thirds of the texture.
     let mut overlay = GraphicOverlay {
-        image_id: 1,
+        image_id: rio_graphics::GraphicKey::new(1, 1),
         x: 100.0,
         y: 50.0,
         width: 600.0,
@@ -5234,7 +5234,7 @@ fn test_overlay_clips_to_panel_rect() {
 
     // Fully outside the panel: dropped.
     let mut outside = GraphicOverlay {
-        image_id: 1,
+        image_id: rio_graphics::GraphicKey::new(1, 1),
         x: 500.0,
         y: 0.0,
         width: 100.0,
@@ -5247,7 +5247,7 @@ fn test_overlay_clips_to_panel_rect() {
     // Partial scroll off the panel top with an existing crop: the
     // source rect shrinks within the crop, not the full texture.
     let mut scrolled = GraphicOverlay {
-        image_id: 1,
+        image_id: rio_graphics::GraphicKey::new(1, 1),
         x: 0.0,
         y: -50.0,
         width: 100.0,
@@ -5308,7 +5308,7 @@ fn test_narrowing_terminal_keeps_image_span_and_clips_at_edge() {
     };
     let geometry = kitty_overlay_geometry(stored, 100, 100, &viewport).unwrap();
     let mut overlay = GraphicOverlay {
-        image_id: 1,
+        image_id: rio_graphics::GraphicKey::new(1, 1),
         x: geometry.x,
         y: geometry.y,
         width: geometry.width,

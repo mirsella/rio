@@ -106,12 +106,27 @@ pub fn atlas_image_key(graphic_id: u64) -> u64 {
     (1u64 << 32) + graphic_id
 }
 
+/// Renderer-facing image key. Terminal protocols keep using their local
+/// `u64` keys; the route is added only when images enter shared render state.
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct GraphicKey {
+    pub route_id: usize,
+    pub image_id: u64,
+}
+
+impl GraphicKey {
+    #[inline]
+    pub const fn new(route_id: usize, image_id: u64) -> Self {
+        Self { route_id, image_id }
+    }
+}
+
 /// An overlay image placement.
 /// Used by the renderer to draw images on top of (or behind) terminal content.
 #[derive(Debug, Clone)]
 pub struct GraphicOverlay {
-    /// Image texture key ([`kitty_image_key`] or [`atlas_image_key`]).
-    pub image_id: u64,
+    /// Route-scoped image texture key.
+    pub image_id: GraphicKey,
     /// Screen position (physical pixels).
     pub x: f32,
     pub y: f32,
@@ -130,6 +145,25 @@ pub struct GraphicOverlay {
 impl GraphicOverlay {
     /// Default source rect — full image.
     pub const FULL_SOURCE_RECT: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    #[test]
+    fn identical_local_image_keys_are_disjoint_across_routes() {
+        let local = kitty_image_key(7);
+        assert_ne!(GraphicKey::new(1, local), GraphicKey::new(2, local));
+    }
+
+    #[test]
+    fn kitty_and_atlas_keys_remain_disjoint_within_a_route() {
+        assert_ne!(
+            GraphicKey::new(1, kitty_image_key(u32::MAX)),
+            GraphicKey::new(1, atlas_image_key(0))
+        );
+    }
 }
 
 /// Unique identifier for every graphic added to a grid.

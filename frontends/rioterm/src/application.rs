@@ -30,6 +30,48 @@ use rio_window::window::{CursorIcon, Fullscreen};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+use crate::tab_drag::{
+    Command as TabDragCommand, Event as TabDragEvent, Lifecycle as TabDragLifecycle,
+    OwnerRoute, TabDrag, Transition as TabDragTransition,
+};
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+use std::collections::VecDeque;
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum DeferredTabDragClose {
+    Terminal(usize),
+    Window(rio_backend::event::WindowId),
+}
+
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+// ponytail: fixed grace period; a compositor target-enter signal is the precise replacement.
+const TAB_DETACH_GRACE_PERIOD: Duration = Duration::from_millis(750);
+
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+fn deferred_window_close<D, O>(
+    drag: &TabDrag<D, O>,
+    window_id: WindowId,
+) -> Option<DeferredTabDragClose> {
+    if drag.source_window == window_id
+        || drag
+            .hover
+            .as_ref()
+            .is_some_and(|hover| hover.target_window == window_id)
+    {
+        Some(DeferredTabDragClose::Window(window_id.into()))
+    } else {
+        None
+    }
+}
+
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+fn is_valid_tab_drag_target<D, O>(drag: &TabDrag<D, O>, window_id: WindowId) -> bool {
+    drag.owner
+        .as_ref()
+        .is_none_or(|owner| owner.window_id != window_id)
+}
+
 pub struct Application<'a> {
     config: rio_backend::config::Config,
     event_proxy: EventProxy,
@@ -37,13 +79,24 @@ pub struct Application<'a> {
     scheduler: Scheduler,
     app_id: Option<String>,
     global_hotkey: Option<crate::global_hotkey::GlobalHotkeys>,
+    merge_window_source: Option<rio_backend::event::WindowId>,
+    merge_target: Option<(rio_backend::event::WindowId, usize)>,
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    tab_drag: Option<TabDrag>,
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    retained_tab_drag_owner: Option<crate::router::Route<'a>>,
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    deferred_tab_drag_closes: Vec<DeferredTabDragClose>,
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    tab_drag_detach_deadline: Option<Instant>,
+    drop_marker_window: Option<rio_backend::event::WindowId>,
     /// Frontmost app when the quake window was shown, re-activated
     /// when it hides so focus returns where the user was.
     #[cfg(target_os = "macos")]
     quake_previous_app: Option<i32>,
 }
 
-impl Application<'_> {
+impl<'a> Application<'a> {
     pub fn new<'app>(
         config: rio_backend::config::Config,
         config_error: Option<rio_backend::config::ConfigError>,
@@ -81,6 +134,17 @@ impl Application<'_> {
             scheduler,
             app_id,
             global_hotkey: None,
+            merge_window_source: None,
+            merge_target: None,
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            tab_drag: None,
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            retained_tab_drag_owner: None,
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            deferred_tab_drag_closes: Vec::new(),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            tab_drag_detach_deadline: None,
+            drop_marker_window: None,
             #[cfg(target_os = "macos")]
             quake_previous_app: None,
         }
@@ -158,7 +222,7 @@ impl Application<'_> {
     }
 }
 
-impl Application<'_> {
+impl<'a> Application<'a> {
     /// Register a system-wide hotkey for every `ToggleQuake` binding
     /// in the config, so the quake window opens while Rio is
     /// unfocused. No-op when quake is not bound; pure Wayland has no
@@ -273,6 +337,1306 @@ impl Application<'_> {
             }
         }
     }
+
+    fn close_terminal_at(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: rio_backend::event::WindowId,
+        route_id: usize,
+    ) {
+        let mut remove_window = false;
+        if let Some(route) = self.router.routes.get_mut(&window_id) {
+            route.window.screen.discard_routes([route_id]);
+            remove_window = route
+                .window
+                .screen
+                .context_manager
+                .should_close_context_manager(
+                    route_id,
+                    &mut route.window.screen.sugarloaf,
+                );
+            if !remove_window {
+                let size = route.window.screen.context_manager.len();
+                route.window.screen.resize_top_or_bottom_line(size);
+                route.window.screen.mark_dirty();
+                route.request_redraw();
+            }
+        }
+        self.scheduler.unschedule_window(route_id);
+        if remove_window {
+            self.clear_merge_if_window(window_id);
+            self.router.remove_route(window_id);
+            if self.router.routes.is_empty() {
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn restore_route_transfer(
+        route: &mut crate::router::Route<'_>,
+        index: usize,
+        transfer: crate::screen::ScreenTransfer,
+    ) -> Result<(), crate::screen::ScreenTransfer> {
+        let size = route.window.winit_window.inner_size();
+        route.window.screen.insert_transfer(index, transfer, size)?;
+        route.request_redraw();
+        Ok(())
+    }
+
+    fn route_from_transfer(
+        &self,
+        window: rio_window::window::Window,
+        transfer: crate::screen::ScreenTransfer,
+    ) -> Result<crate::router::Route<'a>, crate::screen::ScreenTransferFailure> {
+        let window = crate::router::RouteWindow::from_transfer(
+            window,
+            self.event_proxy.clone(),
+            &self.config,
+            &self.router.font_library,
+            transfer,
+        )?;
+        Ok(crate::router::Route::new(
+            crate::router::routes::assistant::Assistant::new(),
+            RoutePath::Terminal,
+            window,
+        ))
+    }
+
+    fn move_tab_to_new_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        source_id: rio_backend::event::WindowId,
+        tab_id: crate::layout::TabId,
+    ) -> Option<rio_backend::event::WindowId> {
+        let Some(original_index) = self
+            .router
+            .routes
+            .get(&source_id)
+            .and_then(|route| route.window.screen.context_manager.tab_index(tab_id))
+        else {
+            tracing::warn!(?tab_id, "tab disappeared before detaching");
+            return None;
+        };
+
+        let bare = match crate::router::RouteWindow::create(
+            event_loop,
+            &self.config,
+            "Rio",
+            None,
+            self.app_id.as_deref(),
+        ) {
+            Ok(window) => window,
+            Err(error) => {
+                tracing::warn!(%error, "could not create a window for the current tab");
+                return None;
+            }
+        };
+
+        let (original_index, transfer, source_empty) = {
+            let Some(source) = self.router.routes.get_mut(&source_id) else {
+                return None;
+            };
+            let Some(transfer) = source.window.screen.extract_transfer(original_index)
+            else {
+                tracing::error!("current tab disappeared before extraction");
+                return None;
+            };
+            let source_empty = source.window.screen.context_manager.is_empty();
+            if !source_empty {
+                source
+                    .window
+                    .screen
+                    .refresh_after_tab_transfer(source.window.winit_window.inner_size());
+                source.request_redraw();
+            }
+            (original_index, transfer, source_empty)
+        };
+        let route = match self.route_from_transfer(bare, transfer) {
+            Ok(route) => route,
+            Err(failure) => {
+                tracing::warn!(error = %failure, "could not map a new window for the current tab");
+                let source = self
+                    .router
+                    .routes
+                    .get_mut(&source_id)
+                    .expect("tab transfer source disappeared during synchronous window construction");
+                Self::restore_route_transfer(source, original_index, failure.transfer)
+                    .unwrap_or_else(|_| {
+                        panic!("tab transfer source rejected its synchronously extracted tab")
+                    });
+                return None;
+            }
+        };
+        let destination_id = self.router.install_normal_route(route);
+
+        if source_empty {
+            self.clear_merge_if_window(source_id);
+            self.router.remove_route(source_id);
+        }
+        if let Some(destination) = self.router.routes.get_mut(&destination_id) {
+            destination.window.winit_window.focus_window();
+            destination.request_redraw();
+        }
+        Some(destination_id)
+    }
+
+    fn perform_close_requested(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: rio_backend::event::WindowId,
+    ) {
+        if self.config.confirm_before_quit
+            && !cfg!(any(target_os = "macos", target_os = "windows"))
+        {
+            if let Some(route) = self.router.routes.get_mut(&window_id) {
+                route.confirm_quit();
+            }
+            return;
+        }
+        if let Some(route) = self.router.routes.get(&window_id) {
+            for route_id in route.window.screen.context_manager.route_ids() {
+                self.scheduler.unschedule_window(route_id);
+            }
+        }
+        self.clear_merge_if_window(window_id);
+        self.router.remove_route(window_id);
+        if self.router.routes.is_empty() {
+            event_loop.exit();
+        }
+    }
+}
+
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+impl<'a> Application<'a> {
+    fn start_external_drag(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        source_id: rio_backend::event::WindowId,
+    ) -> bool {
+        use rio_window::platform::wayland::WindowExtWayland;
+
+        if self.tab_drag.is_some() {
+            return false;
+        }
+        let Some(route) = self.router.routes.get_mut(&source_id) else {
+            return false;
+        };
+        if route.path != RoutePath::Terminal
+            || !route.window.winit_window.supports_toplevel_drag()
+            || !route.window.screen.mouse.left_button_state.is_pressed()
+        {
+            return false;
+        }
+
+        let scale = route.window.screen.sugarloaf.scale_factor();
+        route
+            .window
+            .screen
+            .handle_tab_drag_move(route.window.screen.mouse.x as f32 / scale, true);
+        let Some(handoff) = route
+            .window
+            .screen
+            .renderer
+            .island
+            .as_mut()
+            .and_then(crate::renderer::island::Island::take_external_drag_handoff)
+        else {
+            return false;
+        };
+
+        let whole_window = matches!(
+            &handoff,
+            crate::renderer::island::ExternalDragHandoff::Window { .. }
+        );
+        let tab_count = route.window.screen.context_manager.len();
+        let (source_index, transition) = match handoff {
+            crate::renderer::island::ExternalDragHandoff::Tab { tab_id, .. } => {
+                let Some(source_index) =
+                    route.window.screen.context_manager.tab_index(tab_id)
+                else {
+                    tracing::warn!("dragged tab disappeared before external handoff");
+                    if let Some(island) = route.window.screen.renderer.island.as_mut() {
+                        island.cancel_drag();
+                    }
+                    return false;
+                };
+                (
+                    source_index,
+                    TabDrag::begin(
+                        route.window.winit_window.id(),
+                        tab_id,
+                        source_index,
+                        tab_count,
+                    ),
+                )
+            }
+            crate::renderer::island::ExternalDragHandoff::Window { .. } => {
+                let source_index = route.window.screen.context_manager.current_index();
+                let Some(tab_id) = route
+                    .window
+                    .screen
+                    .context_manager
+                    .current_grid_opt()
+                    .map(|grid| grid.id())
+                else {
+                    if let Some(island) = route.window.screen.renderer.island.as_mut() {
+                        island.cancel_drag();
+                    }
+                    return false;
+                };
+                (
+                    source_index,
+                    TabDrag::begin_window(
+                        route.window.winit_window.id(),
+                        tab_id,
+                        tab_count,
+                        source_index,
+                    ),
+                )
+            }
+        };
+
+        match transition {
+            Ok(transition) => {
+                route.window.screen.set_transfer_source_marker(source_index);
+                if whole_window {
+                    route.window.screen.set_window_overlay(Some(
+                        crate::renderer::WindowOverlay::MergeSource,
+                    ));
+                }
+                if let Some(island) = route.window.screen.renderer.island.as_mut() {
+                    island.cancel_drag();
+                }
+                self.run_tab_drag_transition(event_loop, transition);
+                if self
+                    .tab_drag
+                    .as_ref()
+                    .is_some_and(|drag| !drag.whole_window)
+                {
+                    self.schedule_tab_detach();
+                }
+                true
+            }
+            Err(error) => {
+                tracing::debug!(%error, "could not start external tab drag");
+                if let Some(island) = route.window.screen.renderer.island.as_mut() {
+                    island.cancel_drag();
+                }
+                false
+            }
+        }
+    }
+
+    fn run_tab_drag_transition(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        transition: TabDragTransition,
+    ) {
+        assert!(
+            self.tab_drag.is_none(),
+            "tab drag reducer state must be taken first"
+        );
+        let TabDragTransition {
+            mut state,
+            commands,
+        } = transition;
+        let mut commands: VecDeque<_> = commands.into();
+        while let Some(command) = commands.pop_front() {
+            let immediate = self.execute_tab_drag_command(&state, command);
+            let Some(event) = immediate else {
+                continue;
+            };
+            let transition = state.reduce(event);
+            state = transition.state;
+            commands.extend(transition.commands);
+        }
+        self.tab_drag = Some(state);
+        self.finish_terminal_tab_drag(event_loop);
+    }
+
+    fn dispatch_tab_drag_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: TabDragEvent,
+    ) {
+        let Some(state) = self.tab_drag.take() else {
+            return;
+        };
+        self.run_tab_drag_transition(event_loop, state.reduce(event));
+    }
+
+    fn execute_tab_drag_command(
+        &mut self,
+        state: &TabDrag,
+        command: TabDragCommand,
+    ) -> Option<TabDragEvent> {
+        use rio_window::platform::wayland::WindowExtWayland;
+
+        match command {
+            TabDragCommand::PrepareSource {
+                payload,
+                frame_grab,
+            } => {
+                let source: rio_backend::event::WindowId = state.source_window.into();
+                let Some(route) = self.router.routes.get(&source) else {
+                    return Some(TabDragEvent::PrepareFailed);
+                };
+                let result = route
+                    .window
+                    .winit_window
+                    .prepare_toplevel_drag(payload, frame_grab);
+                Some(match result {
+                    Ok(drag_id) => TabDragEvent::Prepared(drag_id),
+                    Err(error) => {
+                        tracing::debug!(%error, "could not prepare Wayland tab drag");
+                        TabDragEvent::PrepareFailed
+                    }
+                })
+            }
+            TabDragCommand::StartSourceOwner => {
+                let drag_id = state.drag_id.expect("started owner requires drag");
+                let source: rio_backend::event::WindowId = state.source_window.into();
+                let Some(route) = self.router.routes.get(&source) else {
+                    return Some(TabDragEvent::OwnerStartFailed(drag_id));
+                };
+                let owner = OwnerRoute {
+                    window_id: state.source_window,
+                    tab_id: state.tab_id,
+                    route_ids: if state.whole_window {
+                        route.window.screen.context_manager.route_ids()
+                    } else {
+                        route
+                            .window
+                            .screen
+                            .context_manager
+                            .current_grid()
+                            .route_ids()
+                    },
+                };
+                let result = route.window.winit_window.start_toplevel_drag(drag_id);
+                Some(match result {
+                    Ok(()) => TabDragEvent::OwnerStarted { drag_id, owner },
+                    Err(error) => {
+                        tracing::warn!(%error, "could not start source tab drag owner");
+                        TabDragEvent::OwnerStartFailed(drag_id)
+                    }
+                })
+            }
+            TabDragCommand::AcceptOffer => {
+                let hover = state.hover.expect("accepted offer requires hover");
+                let target = hover.target_window.into();
+                let Some(route) = self.router.routes.get(&target) else {
+                    return Some(TabDragEvent::TargetRejected);
+                };
+                let result = route
+                    .window
+                    .winit_window
+                    .accept_toplevel_drag_offer(hover.offer_id);
+                if let Err(error) = result {
+                    tracing::debug!(%error, "could not accept tab drag offer");
+                    return Some(TabDragEvent::TargetRejected);
+                }
+                None
+            }
+            TabDragCommand::RejectOffer {
+                offer_id,
+                target_window,
+            } => {
+                self.reject_tab_drag_offer(offer_id, target_window);
+                None
+            }
+            TabDragCommand::ReceiveData => {
+                let hover = state.hover.expect("received offer requires hover");
+                let target = hover.target_window.into();
+                let Some(route) = self.router.routes.get(&target) else {
+                    return Some(TabDragEvent::DataFailed(hover.offer_id));
+                };
+                let result = route
+                    .window
+                    .winit_window
+                    .receive_toplevel_drag_offer(hover.offer_id);
+                let Err(error) = result else {
+                    return None;
+                };
+                tracing::debug!(%error, "could not receive tab drag data");
+                if let Err(cancel_error) = route
+                    .window
+                    .winit_window
+                    .cancel_toplevel_drag_offer(hover.offer_id)
+                {
+                    tracing::debug!(%cancel_error, "could not destroy failed tab drag offer");
+                }
+                Some(TabDragEvent::DataFailed(hover.offer_id))
+            }
+            TabDragCommand::MoveOwnerToTarget => {
+                let owner = state.owner.as_ref().expect("target move requires owner");
+                let hover = state.hover.expect("target move requires hover");
+                Some(
+                    if if state.whole_window {
+                        self.move_window_owner_to_target(
+                            owner,
+                            hover.target_window,
+                            hover.index,
+                        )
+                    } else {
+                        self.move_owner_to_target(owner, hover.target_window, hover.index)
+                    } {
+                        TabDragEvent::TargetCommitted
+                    } else {
+                        TabDragEvent::TargetRejected
+                    },
+                )
+            }
+            TabDragCommand::FinishOffer => {
+                let hover = state.hover.expect("finished offer requires hover");
+                let target = hover.target_window.into();
+                if let Some(route) = self.router.routes.get(&target) {
+                    if let Err(error) = route
+                        .window
+                        .winit_window
+                        .finish_toplevel_drag_offer(hover.offer_id)
+                    {
+                        tracing::warn!(%error, "could not finish committed tab drag offer");
+                        if let Err(cancel_error) = route
+                            .window
+                            .winit_window
+                            .cancel_toplevel_drag_offer(hover.offer_id)
+                        {
+                            tracing::debug!(%cancel_error, "could not destroy failed tab drag offer");
+                        }
+                        return Some(TabDragEvent::OfferCancelled(hover.offer_id));
+                    }
+                } else {
+                    tracing::error!(
+                        "committed tab drag target disappeared before offer finish"
+                    );
+                    return Some(TabDragEvent::OfferCancelled(hover.offer_id));
+                }
+                None
+            }
+            TabDragCommand::CancelOffer => {
+                if let Some(hover) = state.hover {
+                    if let Some(route) =
+                        self.router.routes.get(&hover.target_window.into())
+                    {
+                        if let Err(error) = route
+                            .window
+                            .winit_window
+                            .cancel_toplevel_drag_offer(hover.offer_id)
+                        {
+                            tracing::debug!(%error, "could not cancel tab drag offer");
+                        }
+                    }
+                    return Some(TabDragEvent::OfferCancelled(hover.offer_id));
+                }
+                None
+            }
+            TabDragCommand::CancelSource => {
+                let drag_id = state.drag_id.expect("cancelled source requires drag");
+                let source: rio_backend::event::WindowId = state.source_window.into();
+                if let Some(route) = self.router.routes.get(&source) {
+                    if let Err(error) =
+                        route.window.winit_window.cancel_toplevel_drag(drag_id)
+                    {
+                        tracing::debug!(%error, "could not cancel tab drag source");
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn reject_tab_drag_offer(
+        &self,
+        offer_id: rio_window::platform::wayland::ToplevelDragOfferId,
+        target_window: WindowId,
+    ) {
+        use rio_window::platform::wayland::WindowExtWayland;
+
+        if let Some(route) = self.router.routes.get(&target_window.into()) {
+            if let Err(error) = route
+                .window
+                .winit_window
+                .reject_toplevel_drag_offer(offer_id)
+            {
+                tracing::debug!(%error, "could not reject tab drag offer");
+            }
+        }
+    }
+
+    fn cancel_tab_drag_offer(
+        &self,
+        offer_id: rio_window::platform::wayland::ToplevelDragOfferId,
+        target_window: WindowId,
+    ) {
+        use rio_window::platform::wayland::WindowExtWayland;
+
+        if let Some(route) = self.router.routes.get(&target_window.into()) {
+            if let Err(error) = route
+                .window
+                .winit_window
+                .cancel_toplevel_drag_offer(offer_id)
+            {
+                tracing::debug!(%error, "could not cancel tab drag offer");
+            }
+        }
+    }
+
+    fn retain_tab_drag_owner(&mut self, owner_id: rio_backend::event::WindowId) {
+        assert!(
+            self.retained_tab_drag_owner.is_none(),
+            "only one tab drag owner may await protocol completion"
+        );
+        self.clear_merge_if_window(owner_id);
+        self.retained_tab_drag_owner = Some(
+            self.router
+                .remove_route(owner_id)
+                .expect("committed drag owner must remain registered"),
+        );
+    }
+
+    fn move_owner_to_target(
+        &mut self,
+        owner: &OwnerRoute,
+        target_window: WindowId,
+        index: usize,
+    ) -> bool {
+        if owner.window_id == target_window {
+            tracing::error!("source tab drag owner was selected as its own target");
+            return false;
+        }
+        let owner_id: rio_backend::event::WindowId = owner.window_id.into();
+        let target_id: rio_backend::event::WindowId = target_window.into();
+        let [Some(owner_route), Some(target_route)] =
+            self.router.routes.get_disjoint_mut([&owner_id, &target_id])
+        else {
+            return false;
+        };
+        let moved = {
+            let Some(owner_index) = owner_route
+                .window
+                .screen
+                .context_manager
+                .tab_index(owner.tab_id)
+            else {
+                return false;
+            };
+            let transfer = owner_route
+                .window
+                .screen
+                .extract_transfer(owner_index)
+                .expect("validated owner tab disappeared");
+            if transfer.route_ids() != owner.route_ids {
+                Self::restore_route_transfer(owner_route, owner_index, transfer)
+                    .unwrap_or_else(|_| panic!("owner rejected its own tab transfer"));
+                return false;
+            }
+            match Self::restore_route_transfer(target_route, index, transfer) {
+                Ok(()) => true,
+                Err(transfer) => {
+                    Self::restore_route_transfer(owner_route, owner_index, transfer)
+                        .unwrap_or_else(|_| {
+                            panic!("owner changed during synchronous target insertion")
+                        });
+                    false
+                }
+            }
+        };
+        if moved {
+            if let Some(source) = self.router.routes.get_mut(&owner_id) {
+                source.window.screen.clear_transfer_source_marker();
+                if !source.window.screen.context_manager.is_empty() {
+                    let size = source.window.winit_window.inner_size();
+                    source.window.screen.refresh_after_tab_transfer(size);
+                    source.request_redraw();
+                }
+            }
+            let source_empty = self
+                .router
+                .routes
+                .get(&owner_id)
+                .is_some_and(|route| route.window.screen.context_manager.is_empty());
+            if source_empty {
+                self.retain_tab_drag_owner(owner_id);
+            }
+        }
+        moved
+    }
+
+    fn move_window_owner_to_target(
+        &mut self,
+        owner: &OwnerRoute,
+        target_window: WindowId,
+        index: usize,
+    ) -> bool {
+        if owner.window_id == target_window {
+            return false;
+        }
+        let owner_id: rio_backend::event::WindowId = owner.window_id.into();
+        let target_id: rio_backend::event::WindowId = target_window.into();
+        if !self.router.routes.get(&owner_id).is_some_and(|route| {
+            route.path == RoutePath::Terminal
+                && owner.route_ids == route.window.screen.context_manager.route_ids()
+        }) {
+            return false;
+        }
+        let moved = self.transfer_window_to_target(owner_id, target_id, index);
+        if moved {
+            self.retain_tab_drag_owner(owner_id);
+        }
+        moved
+    }
+
+    fn tab_drag_target_index(
+        &self,
+        target_window: WindowId,
+        position: rio_window::dpi::LogicalPosition<f64>,
+        whole_window: bool,
+        tab_count: usize,
+    ) -> Option<usize> {
+        let target_id: rio_backend::event::WindowId = target_window.into();
+        self.router
+            .routes
+            .get(&target_id)
+            .filter(|route| route.path == RoutePath::Terminal)
+            .and_then(|route| {
+                if whole_window {
+                    let index = route.window.screen.context_manager.len();
+                    return route
+                        .window
+                        .screen
+                        .context_manager
+                        .can_insert_grids(index, tab_count)
+                        .then_some(index);
+                }
+
+                let scale = route.window.screen.sugarloaf.scale_factor() as f64;
+                route
+                    .window
+                    .screen
+                    .tab_drop_index(position.x * scale, position.y * scale)
+                    .filter(|index| {
+                        route.window.screen.context_manager.can_insert_grid(*index)
+                    })
+            })
+    }
+
+    fn handle_toplevel_drag_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: rio_window::platform::wayland::ToplevelDragEvent,
+    ) {
+        use rio_window::platform::wayland::ToplevelDragEvent;
+
+        if let ToplevelDragEvent::FrameDrag {
+            seat_id,
+            pointer_id,
+            ..
+        } = event
+        {
+            if self.tab_drag.is_some() {
+                if let Some(route) = self.router.routes.get(&(window_id.into())) {
+                    route
+                        .window
+                        .winit_window
+                        .forget_frame_drag_for_pointer(seat_id, pointer_id);
+                }
+                return;
+            }
+            let source_window: rio_backend::event::WindowId = window_id.into();
+            let Some(route) = self.router.routes.get(&source_window) else {
+                return;
+            };
+            if route.path != RoutePath::Terminal {
+                let _ = route.window.winit_window.drag_window_from_frame_grab(
+                    u64::from(source_window),
+                    seat_id,
+                    pointer_id,
+                );
+                route
+                    .window
+                    .winit_window
+                    .forget_frame_drag_for_pointer(seat_id, pointer_id);
+                return;
+            }
+            let (tab_id, tab_count, original_index) = {
+                let screen = &route.window.screen;
+                let Some(grid) = screen.context_manager.current_grid_opt() else {
+                    let _ = route.window.winit_window.drag_window_from_frame_grab(
+                        u64::from(source_window),
+                        seat_id,
+                        pointer_id,
+                    );
+                    route
+                        .window
+                        .winit_window
+                        .forget_frame_drag_for_pointer(seat_id, pointer_id);
+                    return;
+                };
+                (
+                    grid.id(),
+                    screen.context_manager.len(),
+                    screen.context_manager.current_index(),
+                )
+            };
+            let transition = match TabDrag::begin_window_from_frame(
+                route.window.winit_window.id(),
+                tab_id,
+                tab_count,
+                original_index,
+                seat_id,
+                pointer_id,
+            ) {
+                Ok(transition) => transition,
+                Err(error) => {
+                    tracing::debug!(%error, "could not start whole-window drag");
+                    let _ = route.window.winit_window.drag_window_from_frame_grab(
+                        u64::from(source_window),
+                        seat_id,
+                        pointer_id,
+                    );
+                    route
+                        .window
+                        .winit_window
+                        .forget_frame_drag_for_pointer(seat_id, pointer_id);
+                    return;
+                }
+            };
+            self.run_tab_drag_transition(event_loop, transition);
+            if self.tab_drag.is_some() {
+                if let Some(route) = self.router.routes.get_mut(&source_window) {
+                    route
+                        .window
+                        .screen
+                        .set_transfer_source_marker(original_index);
+                    route.window.screen.set_window_overlay(Some(
+                        crate::renderer::WindowOverlay::MergeSource,
+                    ));
+                    route.request_redraw();
+                }
+            }
+            return;
+        }
+
+        let target_window = window_id;
+        if self.tab_drag.is_none() {
+            match &event {
+                ToplevelDragEvent::Entered { offer_id, .. }
+                | ToplevelDragEvent::Dropped { offer_id } => {
+                    self.cancel_tab_drag_offer(*offer_id, target_window);
+                }
+                _ => {}
+            }
+            return;
+        }
+        let restore_marker = matches!(
+            &event,
+            ToplevelDragEvent::SourceActionsChanged {
+                move_supported: true,
+                ..
+            } | ToplevelDragEvent::SelectedActionChanged {
+                selected_move: true,
+                ..
+            }
+        );
+        let event = match event {
+            ToplevelDragEvent::FrameDrag { .. } => {
+                unreachable!("frame drags are handled above")
+            }
+            ToplevelDragEvent::Entered { offer_id, position }
+            | ToplevelDragEvent::Motion { offer_id, position } => {
+                let valid_target = self
+                    .tab_drag
+                    .as_ref()
+                    .is_some_and(|drag| is_valid_tab_drag_target(drag, target_window));
+                let whole_window =
+                    self.tab_drag.as_ref().is_some_and(|drag| drag.whole_window);
+                let tab_count = self.tab_drag.as_ref().map_or(0, |drag| drag.tab_count);
+                let index = valid_target
+                    .then(|| {
+                        self.tab_drag_target_index(
+                            target_window,
+                            position,
+                            whole_window,
+                            tab_count,
+                        )
+                    })
+                    .flatten();
+                let target_id: rio_backend::event::WindowId = target_window.into();
+                let Some(index) = index else {
+                    self.clear_drop_marker();
+                    if self.tab_drag.as_ref().is_some_and(|drag| {
+                        drag.hover.is_some_and(|hover| hover.offer_id == offer_id)
+                    }) {
+                        self.dispatch_tab_drag_event(
+                            event_loop,
+                            TabDragEvent::TargetRejected,
+                        );
+                        if self.tab_drag.as_ref().is_some_and(|drag| {
+                            !drag.whole_window && drag.hover.is_none()
+                        }) {
+                            self.schedule_tab_detach();
+                        }
+                    } else {
+                        self.reject_tab_drag_offer(offer_id, target_window);
+                    }
+                    return;
+                };
+                self.tab_drag_detach_deadline = None;
+                let entering = self.tab_drag.as_ref().is_none_or(|drag| {
+                    drag.hover.is_none_or(|hover| hover.offer_id != offer_id)
+                });
+                self.dispatch_tab_drag_event(
+                    event_loop,
+                    if entering {
+                        TabDragEvent::Enter {
+                            offer_id,
+                            target_window,
+                            index,
+                        }
+                    } else {
+                        TabDragEvent::Motion { offer_id, index }
+                    },
+                );
+                if self.tab_drag.as_ref().is_some_and(|drag| {
+                    drag.hover.is_some_and(|hover| {
+                        hover.offer_id == offer_id && hover.target_window == target_window
+                    })
+                }) {
+                    self.set_drop_marker(target_id, index);
+                }
+                return;
+            }
+            ToplevelDragEvent::Left { offer_id } => {
+                let active_offer = self.tab_drag_owns_offer(offer_id);
+                if active_offer {
+                    self.clear_drop_marker();
+                }
+                if active_offer
+                    && self
+                        .tab_drag
+                        .as_ref()
+                        .is_some_and(|drag| !drag.whole_window)
+                {
+                    self.schedule_tab_detach();
+                }
+                TabDragEvent::Leave(offer_id)
+            }
+            ToplevelDragEvent::Dropped { offer_id } => {
+                if self.tab_drag_owns_offer(offer_id) {
+                    self.clear_drop_marker();
+                    TabDragEvent::Drop(offer_id)
+                } else {
+                    self.cancel_tab_drag_offer(offer_id, target_window);
+                    return;
+                }
+            }
+            ToplevelDragEvent::SourceActionsChanged {
+                offer_id,
+                move_supported,
+            } => {
+                if !move_supported && self.tab_drag_owns_offer(offer_id) {
+                    self.clear_drop_marker();
+                }
+                TabDragEvent::SourceActionsChanged {
+                    offer_id,
+                    move_supported,
+                }
+            }
+            ToplevelDragEvent::SelectedActionChanged {
+                offer_id,
+                selected_move,
+            } => {
+                if !selected_move && self.tab_drag_owns_offer(offer_id) {
+                    self.clear_drop_marker();
+                }
+                TabDragEvent::SelectedActionChanged {
+                    offer_id,
+                    selected_move,
+                }
+            }
+            ToplevelDragEvent::DataReady { offer_id, data } => {
+                TabDragEvent::DataReady { offer_id, data }
+            }
+            ToplevelDragEvent::OfferDataFailed { offer_id } => {
+                TabDragEvent::DataFailed(offer_id)
+            }
+            ToplevelDragEvent::OfferCancelled { offer_id } => {
+                if self.tab_drag_owns_offer(offer_id) {
+                    self.clear_drop_marker();
+                }
+                TabDragEvent::OfferCancelled(offer_id)
+            }
+            ToplevelDragEvent::Finished { drag_id } => {
+                TabDragEvent::SourceFinished(drag_id)
+            }
+            ToplevelDragEvent::Cancelled { drag_id } => {
+                if self
+                    .tab_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.drag_id == Some(drag_id))
+                {
+                    self.clear_drop_marker();
+                }
+                TabDragEvent::SourceCancelled(drag_id)
+            }
+        };
+        self.dispatch_tab_drag_event(event_loop, event);
+        if restore_marker {
+            if let Some((target_window, index)) =
+                self.tab_drag.as_ref().and_then(|drag| {
+                    drag.hover
+                        .filter(|hover| !hover.dropped)
+                        .map(|hover| (hover.target_window, hover.index))
+                })
+            {
+                self.set_drop_marker(target_window.into(), index);
+            }
+        }
+    }
+
+    fn finish_terminal_tab_drag(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(drag) = self.tab_drag.as_ref() else {
+            return;
+        };
+        if !matches!(
+            drag.lifecycle,
+            TabDragLifecycle::Complete(_) | TabDragLifecycle::Cancelled
+        ) {
+            return;
+        }
+        let whole_window = drag.whole_window;
+        let source_window = drag.source_window.into();
+        let frame_grab = drag.frame_grab();
+        let detached_tab = match drag.lifecycle {
+            TabDragLifecycle::Complete(crate::tab_drag::Outcome::Outside)
+                if !drag.whole_window =>
+            {
+                Some(drag.tab_id)
+            }
+            _ => None,
+        };
+        let resume_native_window_drag = whole_window
+            && matches!(
+                drag.lifecycle,
+                TabDragLifecycle::Complete(crate::tab_drag::Outcome::Outside)
+                    | TabDragLifecycle::Complete(crate::tab_drag::Outcome::RolledBack)
+                    | TabDragLifecycle::Cancelled
+            );
+        let owner_route_ids = drag
+            .owner
+            .as_ref()
+            .map(|owner| owner.route_ids.clone())
+            .unwrap_or_default();
+        self.reset_tab_drag_input(source_window);
+        for route_id in owner_route_ids {
+            self.scheduler.unschedule_window(route_id);
+        }
+        self.clear_drop_marker();
+        if let Some(route) = self.router.routes.get_mut(&source_window) {
+            route.window.screen.clear_transfer_source_marker();
+            if whole_window {
+                route.window.screen.set_window_overlay(None);
+            }
+        } else if let Some(route) = self.retained_tab_drag_owner.as_mut() {
+            route.window.screen.clear_transfer_source_marker();
+            if whole_window {
+                route.window.screen.set_window_overlay(None);
+            }
+        }
+        self.tab_drag = None;
+        self.tab_drag_detach_deadline = None;
+        if let Some(tab_id) = detached_tab {
+            if let Some(destination_id) =
+                self.move_tab_to_new_window(event_loop, source_window, tab_id)
+            {
+                if let Some(route) = self.router.routes.get(&destination_id) {
+                    if let Err(error) = route
+                        .window
+                        .winit_window
+                        .drag_window_from_active_grab(u64::from(source_window))
+                    {
+                        tracing::debug!(%error, "could not continue detached tab drag");
+                    }
+                }
+            }
+        }
+        if resume_native_window_drag {
+            if let Some(route) = self.router.routes.get(&source_window) {
+                let result = frame_grab.map_or_else(
+                    || {
+                        route
+                            .window
+                            .winit_window
+                            .drag_window_from_active_grab(u64::from(source_window))
+                    },
+                    |(seat_id, pointer_id)| {
+                        route.window.winit_window.drag_window_from_frame_grab(
+                            u64::from(source_window),
+                            seat_id,
+                            pointer_id,
+                        )
+                    },
+                );
+                if let Err(error) = result {
+                    tracing::debug!(%error, "could not resume native window drag");
+                }
+            }
+        }
+        let closes = std::mem::take(&mut self.deferred_tab_drag_closes);
+        if let Some(owner) = self.retained_tab_drag_owner.take() {
+            let close_source = closes.iter().any(|close| {
+                matches!(close, DeferredTabDragClose::Window(window_id) if *window_id == source_window)
+            });
+            if close_source {
+                self.router.install_normal_route(owner);
+            }
+        }
+        for close in closes {
+            match close {
+                DeferredTabDragClose::Terminal(route_id) => {
+                    if let Some(window_id) =
+                        self.router.routes.iter().find_map(|(window_id, route)| {
+                            route
+                                .window
+                                .screen
+                                .context_manager
+                                .contains_route_id(route_id)
+                                .then_some(*window_id)
+                        })
+                    {
+                        self.close_terminal_at(event_loop, window_id, route_id);
+                    }
+                }
+                DeferredTabDragClose::Window(window_id) => {
+                    self.perform_close_requested(event_loop, window_id);
+                }
+            }
+        }
+    }
+
+    fn reset_tab_drag_input(&mut self, source_window: rio_backend::event::WindowId) {
+        let route_id = if let Some(route) = self.router.routes.get_mut(&source_window) {
+            route.window.screen.reset_drag_input()
+        } else if let Some(route) = self.retained_tab_drag_owner.as_mut() {
+            route.window.screen.reset_drag_input()
+        } else {
+            None
+        };
+        if let Some(route_id) = route_id {
+            self.scheduler
+                .unschedule(TimerId::new(Topic::SelectionScrolling, route_id));
+        }
+    }
+
+    fn defer_tab_drag_close(&mut self, close: DeferredTabDragClose) {
+        if !self.deferred_tab_drag_closes.contains(&close) {
+            self.deferred_tab_drag_closes.push(close);
+        }
+    }
+
+    fn schedule_tab_detach(&mut self) {
+        self.tab_drag_detach_deadline = Some(Instant::now() + TAB_DETACH_GRACE_PERIOD);
+    }
+}
+
+impl<'a> Application<'a> {
+    fn transfer_window_to_target(
+        &mut self,
+        source_id: rio_backend::event::WindowId,
+        target_id: rio_backend::event::WindowId,
+        index: usize,
+    ) -> bool {
+        if source_id == target_id {
+            return false;
+        }
+        let [Some(source), Some(target)] = self
+            .router
+            .routes
+            .get_disjoint_mut([&source_id, &target_id])
+        else {
+            return false;
+        };
+        if source.path != RoutePath::Terminal || target.path != RoutePath::Terminal {
+            return false;
+        }
+        let source_size = source.window.winit_window.inner_size();
+        let target_size = target.window.winit_window.inner_size();
+        let Some(transfer) = source.window.screen.extract_window_transfer() else {
+            return false;
+        };
+        match target
+            .window
+            .screen
+            .insert_window_transfer(index, transfer, target_size)
+        {
+            Ok(()) => true,
+            Err(transfer) => {
+                source
+                    .window
+                    .screen
+                    .insert_window_transfer(0, transfer, source_size)
+                    .unwrap_or_else(|_| panic!("window transfer rollback failed"));
+                false
+            }
+        }
+    }
+
+    fn merge_window_into_target(
+        &mut self,
+        source_id: rio_backend::event::WindowId,
+        target_id: rio_backend::event::WindowId,
+        index: Option<usize>,
+    ) {
+        let index = index.or_else(|| {
+            self.router
+                .routes
+                .get(&target_id)
+                .filter(|route| route.path == RoutePath::Terminal)
+                .map(|route| route.window.screen.context_manager.len())
+        });
+        let Some(index) = index else { return };
+        if self.transfer_window_to_target(source_id, target_id, index) {
+            self.clear_merge_if_window(source_id);
+            self.router.remove_route(source_id);
+            if let Some(target) = self.router.routes.get(&target_id) {
+                target.window.winit_window.focus_window();
+            }
+        }
+    }
+
+    fn clear_merge_window(&mut self) {
+        if let Some(source_id) = self.merge_window_source.take() {
+            if let Some(route) = self.router.routes.get_mut(&source_id) {
+                route.window.screen.clear_transfer_source_marker();
+            }
+            self.set_window_overlay(source_id, None);
+        }
+        self.clear_merge_target();
+    }
+
+    fn clear_merge_if_window(&mut self, window_id: rio_backend::event::WindowId) {
+        if self.merge_window_source == Some(window_id)
+            || self
+                .merge_target
+                .is_some_and(|(target_id, _)| target_id == window_id)
+        {
+            self.clear_merge_window();
+        }
+    }
+
+    fn clear_merge_target(&mut self) {
+        if let Some((target_id, _)) = self.merge_target.take() {
+            self.set_window_overlay(target_id, None);
+        }
+        self.clear_drop_marker();
+    }
+
+    fn update_merge_target(
+        &mut self,
+        target_window: rio_backend::event::WindowId,
+        position: rio_window::dpi::PhysicalPosition<f64>,
+    ) {
+        let Some(source_id) = self.merge_window_source else {
+            return;
+        };
+        if source_id == target_window {
+            self.clear_merge_target();
+            return;
+        }
+        let Some(source_count) = self
+            .router
+            .routes
+            .get(&source_id)
+            .filter(|route| route.path == RoutePath::Terminal)
+            .map(|route| route.window.screen.context_manager.len())
+        else {
+            self.clear_merge_target();
+            return;
+        };
+        let Some(route) = self
+            .router
+            .routes
+            .get(&target_window)
+            .filter(|route| route.path == RoutePath::Terminal)
+        else {
+            self.clear_merge_target();
+            return;
+        };
+        let count = route.window.screen.context_manager.len();
+        let index = route
+            .window
+            .screen
+            .tab_drop_index(position.x, position.y)
+            .unwrap_or(count);
+        if !route
+            .window
+            .screen
+            .context_manager
+            .can_insert_grids(index, source_count)
+        {
+            self.clear_merge_target();
+            return;
+        }
+        if self
+            .merge_target
+            .is_some_and(|(current_target, _)| current_target != target_window)
+        {
+            self.clear_merge_target();
+        }
+        self.merge_target = Some((target_window, index));
+        self.set_drop_marker(target_window, index);
+        self.set_window_overlay(
+            target_window,
+            Some(crate::renderer::WindowOverlay::MergeTarget),
+        );
+    }
+
+    fn set_window_overlay(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        overlay: Option<crate::renderer::WindowOverlay>,
+    ) {
+        if let Some(route) = self.router.routes.get_mut(&window_id) {
+            if route.window.screen.set_window_overlay(overlay) {
+                route.request_redraw();
+            }
+        }
+    }
+
+    fn clear_drop_marker(&mut self) {
+        let Some(window_id) = self.drop_marker_window.take() else {
+            return;
+        };
+        if let Some(route) = self.router.routes.get_mut(&window_id) {
+            if route.window.screen.clear_tab_drop_marker() {
+                route.request_redraw();
+            }
+        }
+    }
+
+    fn set_drop_marker(&mut self, window_id: rio_backend::event::WindowId, index: usize) {
+        if self.drop_marker_window != Some(window_id) {
+            self.clear_drop_marker();
+        }
+        if let Some(route) = self.router.routes.get_mut(&window_id) {
+            if route.window.screen.set_tab_drop_marker(index) {
+                route.request_redraw();
+            }
+            self.drop_marker_window = Some(window_id);
+        }
+    }
+
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    fn tab_drag_owns_offer(
+        &self,
+        offer_id: rio_window::platform::wayland::ToplevelDragOfferId,
+    ) -> bool {
+        self.tab_drag.as_ref().is_some_and(|drag| {
+            drag.hover.is_some_and(|hover| hover.offer_id == offer_id)
+        })
+    }
 }
 
 impl ApplicationHandler<EventPayload> for Application<'_> {
@@ -341,7 +1705,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
         if !self.scheduler.scheduled(timer_id) {
             self.scheduler.schedule(
                 EventPayload::new(RioEventType::Rio(RioEvent::UpdateTitles), unsafe {
-                    rio_window::window::WindowId::dummy().into()
+                    rio_backend::event::WindowId::from(
+                        rio_window::window::WindowId::dummy(),
+                    )
                 }),
                 Duration::from_secs(2),
                 true,
@@ -353,7 +1719,20 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: EventPayload) {
-        let window_id = event.window_id;
+        let target = event.target.clone();
+        let window_id = event.window_id();
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        if matches!(
+            &event.payload,
+            RioEventType::Rio(RioEvent::CreateConfigEditor)
+        ) && self.tab_drag.as_ref().is_some_and(|drag| {
+            rio_backend::event::WindowId::from(drag.source_window) == window_id
+                || drag.owner.as_ref().is_some_and(|owner| {
+                    rio_backend::event::WindowId::from(owner.window_id) == window_id
+                })
+        }) {
+            return;
+        }
         match event.payload {
             RioEventType::Rio(RioEvent::Render) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
@@ -419,7 +1798,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             let timer_id = TimerId::new(Topic::RenderRoute, route_id);
                             let event = EventPayload::new(
                                 RioEventType::Rio(RioEvent::Render),
-                                window_id,
+                                target.clone(),
                             );
 
                             // Only schedule if not already scheduled
@@ -470,11 +1849,24 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     // Process graphics directly in sugarloaf
                     let sugarloaf = &mut route.window.screen.sugarloaf;
 
+                    // Removals arrive as final image keys (atlas refs
+                    // dropped off scrollback, kitty evictions) and free
+                    // both the pixel store and the cached GPU texture. Apply
+                    // them first so a same-frame re-upload wins below.
+                    for key in queues.remove_queue {
+                        sugarloaf.remove_image(rio_backend::sugarloaf::GraphicKey::new(
+                            route_id, key,
+                        ));
+                    }
+
                     // Atlas graphics (sixel/iTerm2) share the per-image
                     // texture store with kitty images, in a disjoint key
                     // namespace.
                     for graphic_data in queues.pending {
-                        let key = crate::renderer::atlas_image_key(graphic_data.id.get());
+                        let key = rio_backend::sugarloaf::GraphicKey::new(
+                            route_id,
+                            crate::renderer::atlas_image_key(graphic_data.id.get()),
+                        );
                         sugarloaf.image_data.insert(
                             key,
                             rio_backend::sugarloaf::GraphicDataEntry::from_graphic_data(
@@ -486,18 +1878,14 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     // Image textures (kitty) → separate store, no clone
                     for (image_id, graphic_data) in queues.pending_images {
                         sugarloaf.image_data.insert(
-                            crate::renderer::kitty_image_key(image_id),
+                            rio_backend::sugarloaf::GraphicKey::new(
+                                route_id,
+                                crate::renderer::kitty_image_key(image_id),
+                            ),
                             rio_backend::sugarloaf::GraphicDataEntry::from_graphic_data(
                                 graphic_data,
                             ),
                         );
-                    }
-
-                    // Removals arrive as final image keys (atlas refs
-                    // dropped off scrollback, kitty evictions) and free
-                    // both the pixel store and the cached GPU texture.
-                    for key in queues.remove_queue {
-                        sugarloaf.remove_image(key);
                     }
 
                     // Mark the panel dirty: the renderer skips non-dirty
@@ -518,7 +1906,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 let timer_id = TimerId::new(Topic::UpdateConfig, 0);
                 let event = EventPayload::new(
                     RioEventType::Rio(RioEvent::UpdateConfig),
-                    window_id,
+                    target.clone(),
                 );
 
                 if !self.scheduler.scheduled(timer_id) {
@@ -659,44 +2047,18 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             RioEventType::Rio(RioEvent::CloseTerminal(route_id)) => {
-                if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    route
-                        .window
-                        .screen
-                        .sugarloaf
-                        .font_library()
-                        .remove_glyph_registry(route_id);
-
-                    if route
-                        .window
-                        .screen
-                        .context_manager
-                        .should_close_context_manager(
-                            route_id,
-                            &mut route.window.screen.sugarloaf,
-                        )
-                    {
-                        self.router.routes.remove(&window_id);
-
-                        // Unschedule pending events.
-                        self.scheduler.unschedule_window(route_id);
-
-                        if self.router.routes.is_empty() {
-                            event_loop.exit();
-                        }
-                    } else {
-                        let size = route.window.screen.context_manager.len();
-                        route.window.screen.resize_top_or_bottom_line(size);
-                        // Force a repaint of the post-close state. The PTY
-                        // thread also queues a separate Render, but if that is
-                        // processed before this CloseTerminal (or coalesced),
-                        // the closed tab lingers on screen until some later
-                        // event — looking "frozen" until you click another
-                        // tab. mark_dirty + redraw makes the close show now.
-                        route.window.screen.mark_dirty();
-                        route.request_redraw();
-                    }
+                #[cfg(all(feature = "wayland", target_os = "linux"))]
+                if self.tab_drag.as_ref().is_some_and(|drag| {
+                    deferred_window_close(drag, window_id.into()).is_some()
+                        || drag
+                            .owner
+                            .as_ref()
+                            .is_some_and(|owner| owner.route_ids.contains(&route_id))
+                }) {
+                    self.defer_tab_drag_close(DeferredTabDragClose::Terminal(route_id));
+                    return;
                 }
+                self.close_terminal_at(event_loop, window_id, route_id);
             }
             RioEventType::Rio(RioEvent::CursorBlinkingChange) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
@@ -755,8 +2117,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         Topic::Render,
                         route.window.screen.ctx().current_route(),
                     );
-                    let event =
-                        EventPayload::new(RioEventType::Rio(RioEvent::Render), window_id);
+                    let event = EventPayload::new(
+                        RioEventType::Rio(RioEvent::Render),
+                        target.clone(),
+                    );
 
                     if !self.scheduler.scheduled(timer_id) {
                         self.scheduler.schedule(
@@ -772,7 +2136,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 let timer_id = TimerId::new(Topic::ScheduledRenderRoute, route_id);
                 let event = EventPayload::new(
                     RioEventType::Rio(RioEvent::RenderRoute(route_id)),
-                    window_id,
+                    target.clone(),
                 );
 
                 if !self.scheduler.scheduled(timer_id) {
@@ -788,7 +2152,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 let timer_id = TimerId::new(Topic::CursorBlinking, route_id);
                 let event = EventPayload::new(
                     RioEventType::Rio(RioEvent::CursorBlinkingChangeOnRoute(route_id)),
-                    window_id,
+                    target,
                 );
 
                 if !self.scheduler.scheduled(timer_id) {
@@ -938,6 +2302,37 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     self.app_id.as_deref(),
                 );
             }
+            RioEventType::Rio(RioEvent::MoveCurrentTabToNewWindow) => {
+                let Some(tab_id) = self.router.routes.get(&window_id).and_then(|route| {
+                    route
+                        .window
+                        .screen
+                        .context_manager
+                        .current_grid_opt()
+                        .map(|grid| grid.id())
+                }) else {
+                    tracing::warn!("current tab disappeared before detaching");
+                    return;
+                };
+                let _ = self.move_tab_to_new_window(event_loop, window_id, tab_id);
+            }
+            RioEventType::Rio(RioEvent::MergeWindow) => {
+                self.clear_merge_window();
+                if self.router.routes.get(&window_id).is_some_and(|route| {
+                    route.path == RoutePath::Terminal
+                        && !route.window.screen.context_manager.is_empty()
+                }) {
+                    if let Some(route) = self.router.routes.get_mut(&window_id) {
+                        let index = route.window.screen.context_manager.current_index();
+                        route.window.screen.set_transfer_source_marker(index);
+                    }
+                    self.set_window_overlay(
+                        window_id,
+                        Some(crate::renderer::WindowOverlay::MergeSource),
+                    );
+                    self.merge_window_source = Some(window_id);
+                }
+            }
             RioEventType::Rio(RioEvent::ToggleQuake) => {
                 self.toggle_quake_window(event_loop);
             }
@@ -980,7 +2375,13 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
             #[cfg(target_os = "macos")]
             RioEventType::Rio(RioEvent::CloseWindow) => {
-                self.router.routes.remove(&window_id);
+                if let Some(route) = self.router.routes.get(&window_id) {
+                    for route_id in route.window.screen.context_manager.route_ids() {
+                        self.scheduler.unschedule_window(route_id);
+                    }
+                }
+                self.clear_merge_if_window(window_id);
+                self.router.remove_route(window_id);
                 if self.router.routes.is_empty() && !self.config.confirm_before_quit {
                     event_loop.exit();
                 }
@@ -1140,44 +2541,121 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             return;
         }
 
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        let event = match event {
+            WindowEvent::ToplevelDrag(drag_event) => {
+                self.handle_toplevel_drag_event(event_loop, window_id, drag_event);
+                return;
+            }
+            event => event,
+        };
+
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        if matches!(event, WindowEvent::CloseRequested) {
+            let deferred = self
+                .tab_drag
+                .as_ref()
+                .and_then(|drag| deferred_window_close(drag, window_id));
+            if let Some(deferred) = deferred {
+                self.defer_tab_drag_close(deferred);
+                return;
+            }
+        }
+
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        if self
+            .tab_drag
+            .as_ref()
+            .is_some_and(|drag| deferred_window_close(drag, window_id).is_some())
+            && matches!(
+                event,
+                WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. }
+            )
+        {
+            return;
+        }
+
         // The event loop keys on rio-window's id; the router keys on the
         // core's `WindowId`. Convert once at this boundary.
         let window_id: rio_backend::event::WindowId = window_id.into();
+
+        if matches!(
+            &event,
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            }
+        ) {
+            if let Some(source_id) = self.merge_window_source {
+                let index = self
+                    .merge_target
+                    .filter(|(target, _)| *target == window_id)
+                    .map(|(_, index)| index);
+                self.clear_merge_window();
+                if source_id != window_id {
+                    self.merge_window_into_target(source_id, window_id, index);
+                    return;
+                }
+            }
+        }
+
+        if matches!(&event, WindowEvent::CloseRequested) {
+            self.clear_merge_if_window(window_id);
+            self.perform_close_requested(event_loop, window_id);
+            return;
+        }
+
+        if let WindowEvent::CursorMoved { position, .. } = &event {
+            self.update_merge_target(window_id, *position);
+        }
 
         let route = match self.router.routes.get_mut(&window_id) {
             Some(window) => window,
             None => return,
         };
 
-        match event {
-            WindowEvent::CloseRequested => {
-                // macOS: Cmd+Q quit confirmation is handled by
-                // `applicationShouldTerminate` in rio-window.
-                // Windows: per-window close confirmation is handled
-                // by `MessageBoxW` in rio-window's WM_CLOSE handler
-                // (see `set_confirm_before_quit` plumbing).
-                // Either way, by the time we see `CloseRequested`
-                // the user has already confirmed — just close.
-                if cfg!(any(target_os = "macos", target_os = "windows")) {
-                    self.router.routes.remove(&window_id);
-                    if self.router.routes.is_empty() {
-                        event_loop.exit();
+        if route.path == RoutePath::Terminal
+            && route.window.screen.context_manager.is_empty()
+            && matches!(
+                &event,
+                WindowEvent::CursorMoved { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::KeyboardInput { .. }
+            )
+        {
+            if let WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button,
+                ..
+            } = &event
+            {
+                match button {
+                    MouseButton::Left => {
+                        route.window.screen.mouse.left_button_state =
+                            ElementState::Released
                     }
-                    return;
+                    MouseButton::Middle => {
+                        route.window.screen.mouse.middle_button_state =
+                            ElementState::Released
+                    }
+                    MouseButton::Right => {
+                        route.window.screen.mouse.right_button_state =
+                            ElementState::Released
+                    }
+                    _ => {}
                 }
-
-                if self.config.confirm_before_quit {
-                    route.confirm_quit();
-                    return;
-                } else {
-                    self.router.routes.remove(&window_id);
+                if let Some(island) = route.window.screen.renderer.island.as_mut() {
+                    island.cancel_drag();
                 }
-
-                if self.router.routes.is_empty() {
-                    event_loop.exit();
-                }
+                route.window.screen.renderer.scrollbar.end_drag();
+                route.window.screen.resize_state = None;
             }
+            return;
+        }
 
+        match event {
             WindowEvent::ModifiersChanged(modifiers) => {
                 route.window.screen.set_modifiers(modifiers);
             }
@@ -1495,8 +2973,37 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
 
             WindowEvent::CursorLeft { .. } => {
+                #[cfg(all(feature = "wayland", target_os = "linux"))]
+                use rio_window::platform::wayland::WindowExtWayland;
+                #[cfg(all(feature = "wayland", target_os = "linux"))]
+                let start_external_drag = route.path == RoutePath::Terminal
+                    && route.window.screen.mouse.left_button_state.is_pressed()
+                    && route
+                        .window
+                        .screen
+                        .renderer
+                        .island
+                        .as_ref()
+                        .is_some_and(|island| island.is_dragging())
+                    && route.window.winit_window.supports_toplevel_drag();
+                let clear_merge_target = self
+                    .merge_target
+                    .is_some_and(|(target, _)| target == window_id);
                 if route.window.screen.clear_close_button_hover() {
                     route.request_redraw();
+                }
+                #[cfg(all(feature = "wayland", target_os = "linux"))]
+                if clear_merge_target || start_external_drag {
+                    if clear_merge_target {
+                        self.clear_merge_target();
+                    }
+                    if start_external_drag {
+                        self.start_external_drag(event_loop, window_id);
+                    }
+                }
+                #[cfg(not(all(feature = "wayland", target_os = "linux")))]
+                if clear_merge_target {
+                    self.clear_merge_target();
                 }
             }
 
@@ -1616,7 +3123,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         .is_some_and(|i| i.is_dragging())
                 {
                     let scale = route.window.screen.sugarloaf.scale_factor();
-                    route.window.screen.handle_tab_drag_move(x as f32 / scale);
+                    route
+                        .window
+                        .screen
+                        .handle_tab_drag_move(x as f32 / scale, false);
                     route.window.winit_window.set_cursor(CursorIcon::Default);
                     route.request_redraw();
                     return;
@@ -1661,12 +3171,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         .screen
                         .context_manager
                         .current_grid_mut()
-                        .resize_border(
-                            &border,
-                            original_sizes,
-                            delta,
-                            &mut route.window.screen.sugarloaf,
-                        );
+                        .resize_border(&border, original_sizes, delta);
                     let cursor = match border.direction {
                         crate::layout::BorderDirection::Vertical => CursorIcon::ColResize,
                         crate::layout::BorderDirection::Horizontal => {
@@ -1722,12 +3227,14 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     let delta = route.window.screen.selection_scroll_delta(position.y);
                     if delta != 0 {
                         let scroll_timer_id = route.window.screen.ctx().current_route();
+                        let scroll_target =
+                            route.window.screen.ctx().current().window_target.clone();
                         let timer_id =
                             TimerId::new(Topic::SelectionScrolling, scroll_timer_id);
                         if !self.scheduler.scheduled(timer_id) {
                             let event = EventPayload::new(
                                 RioEventType::Rio(RioEvent::SelectionScrollTick),
-                                window_id,
+                                scroll_target,
                             );
                             self.scheduler.schedule(
                                 event,
@@ -2153,9 +3660,34 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let control_flow = match self.scheduler.update() {
-            Some(instant) => ControlFlow::WaitUntil(instant),
-            None => ControlFlow::Wait,
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        if self
+            .tab_drag_detach_deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.tab_drag_detach_deadline = None;
+            if self
+                .tab_drag
+                .as_ref()
+                .is_some_and(|drag| !drag.whole_window && drag.hover.is_none())
+            {
+                self.dispatch_tab_drag_event(event_loop, TabDragEvent::Detach);
+            }
+        }
+
+        let scheduler_deadline = self.scheduler.update();
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        let detach_deadline = self.tab_drag_detach_deadline;
+        #[cfg(not(all(feature = "wayland", target_os = "linux")))]
+        let detach_deadline = None;
+        let control_flow = match (scheduler_deadline, detach_deadline) {
+            (Some(scheduler), Some(detach)) => {
+                ControlFlow::WaitUntil(scheduler.min(detach))
+            }
+            (Some(instant), None) | (None, Some(instant)) => {
+                ControlFlow::WaitUntil(instant)
+            }
+            (None, None) => ControlFlow::Wait,
         };
         event_loop.set_control_flow(control_flow);
     }
@@ -2182,6 +3714,16 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             Some(window_id) => window_id,
             None => return,
         };
+
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        if self.tab_drag.as_ref().is_some_and(|drag| {
+            rio_backend::event::WindowId::from(drag.source_window) == window_id
+                || drag.owner.as_ref().is_some_and(|owner| {
+                    rio_backend::event::WindowId::from(owner.window_id) == window_id
+                })
+        }) {
+            return;
+        }
 
         let route = match self.router.routes.get_mut(&window_id) {
             Some(window) => window,
@@ -2218,6 +3760,55 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
         self.router.clipboard = Clipboard::new_nop();
 
         std::process::exit(0);
+    }
+}
+
+#[cfg(all(test, feature = "wayland", target_os = "linux"))]
+mod tab_drag_executor_tests {
+    use super::*;
+    use crate::layout::TabId;
+
+    #[test]
+    fn close_deferral_matches_source_and_target_only() {
+        let state =
+            TabDrag::<u8, u8>::begin(WindowId::from(11), TabId::for_test(23), 1, 3)
+                .unwrap()
+                .state
+                .reduce(TabDragEvent::Prepared(7))
+                .state
+                .reduce(TabDragEvent::OwnerStarted {
+                    drag_id: 7,
+                    owner: OwnerRoute {
+                        window_id: WindowId::from(11),
+                        tab_id: TabId::for_test(23),
+                        route_ids: vec![4, 9],
+                    },
+                })
+                .state;
+
+        assert_eq!(
+            deferred_window_close(&state, WindowId::from(11)),
+            Some(DeferredTabDragClose::Window(
+                rio_backend::event::WindowId::from(WindowId::from(11))
+            ))
+        );
+        assert_eq!(deferred_window_close(&state, WindowId::from(44)), None);
+        assert!(!is_valid_tab_drag_target(&state, WindowId::from(11)));
+        assert!(is_valid_tab_drag_target(&state, WindowId::from(44)));
+
+        let state = state
+            .reduce(TabDragEvent::Enter {
+                offer_id: 3,
+                target_window: WindowId::from(22),
+                index: 0,
+            })
+            .state;
+        assert_eq!(
+            deferred_window_close(&state, WindowId::from(22)),
+            Some(DeferredTabDragClose::Window(
+                rio_backend::event::WindowId::from(WindowId::from(22))
+            ))
+        );
     }
 }
 

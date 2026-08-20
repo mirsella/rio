@@ -1071,7 +1071,7 @@ mod tests {
             .kitty_geometry(0, 8.0, 16.0)
             .expect("run resolves to geometry");
         assert_eq!(image_id, 7);
-        assert_eq!(z_index, -1, "virtual placements draw under text");
+        assert_eq!(z_index, 0, "virtual placements use Kitty's default z-index");
         // Placement box: 2 cols x 1 row of 8x16 cells = 16x16 px; the 2x2
         // image aspect-fits to exactly 16x16, and the run starts at cell
         // (row 3, col 2), i.e. pixel (16, 48).

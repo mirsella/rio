@@ -88,6 +88,7 @@ pub struct WgpuRenderer {
     image_pipeline: wgpu::RenderPipeline,
     image_bind_group_layout: wgpu::BindGroupLayout,
     image_vertex_buffer: wgpu::Buffer,
+    supported_image_instances: usize,
     /// Dedicated one-instance vertex buffer for the background image,
     /// kept separate from the kitty `image_vertex_buffer` so it cannot
     /// collide with kitty placement slots.
@@ -758,16 +759,16 @@ const IMAGE_TEXTURE_BUDGET_BYTES: usize = 256 << 20;
 /// Pick which textures to evict to get `total_bytes` back under
 /// `budget`. Never evicts entries referenced by the current frame.
 /// Returns the chosen keys; pure so the policy is unit-testable.
-fn select_texture_evictions(
-    entries: impl Iterator<Item = (u64, u64, usize)>,
+fn select_texture_evictions<K: Copy>(
+    entries: impl Iterator<Item = (K, u64, usize)>,
     total_bytes: usize,
     budget: usize,
     current_frame: u64,
-) -> Vec<u64> {
+) -> Vec<K> {
     if total_bytes <= budget {
         return Vec::new();
     }
-    let mut candidates: Vec<(u64, u64, usize)> = entries
+    let mut candidates: Vec<(K, u64, usize)> = entries
         .filter(|&(_, last_used, _)| last_used < current_frame)
         .collect();
     candidates.sort_by_key(|&(_, last_used, _)| last_used);
@@ -818,6 +819,13 @@ pub(crate) enum ImageLayer {
     AboveText,
 }
 
+#[derive(Clone, Copy)]
+#[cfg(feature = "wgpu")]
+pub(crate) enum WgpuRenderPart {
+    Images(ImageLayer),
+    Geometry,
+}
+
 /// Threshold separating `BelowBg` from `BelowText`. Matches ghostty's
 /// `bg_limit = std.math.minInt(i32) / 2` at
 /// `renderer/image.zig:377`.
@@ -825,7 +833,7 @@ pub(crate) const IMAGE_BG_LIMIT: i32 = i32::MIN / 2;
 
 /// A single image draw command for the image pipeline.
 struct ImageDraw {
-    image_id: u64,
+    image_id: crate::sugarloaf::graphics::GraphicKey,
     instance: ImageInstance,
     layer: ImageLayer,
 }
@@ -870,7 +878,7 @@ pub struct Renderer {
     draw_cmds: Vec<batch::DrawCmd>,
     images: ImageCache,
     /// Per-image GPU textures (one map, any backend).
-    image_textures: FxHashMap<u64, ImageTextureEntry>,
+    image_textures: FxHashMap<crate::sugarloaf::graphics::GraphicKey, ImageTextureEntry>,
     /// Sum of `bytes` across `image_textures`; compared against
     /// `IMAGE_TEXTURE_BUDGET_BYTES` after uploads.
     image_texture_bytes: usize,
@@ -1095,7 +1103,7 @@ impl Renderer {
         &mut self,
         context: &mut crate::context::Context,
         image_data: &mut rustc_hash::FxHashMap<
-            u64,
+            crate::sugarloaf::graphics::GraphicKey,
             crate::sugarloaf::graphics::GraphicDataEntry,
         >,
         image_overlays: &rustc_hash::FxHashMap<
@@ -1202,7 +1210,7 @@ impl Renderer {
         &mut self,
         context: &mut crate::context::Context,
         image_data: &mut rustc_hash::FxHashMap<
-            u64,
+            crate::sugarloaf::graphics::GraphicKey,
             crate::sugarloaf::graphics::GraphicDataEntry,
         >,
         overlays: &[&crate::sugarloaf::graphics::GraphicOverlay],
@@ -1405,7 +1413,10 @@ impl Renderer {
             }
         }
 
-        // Build image draw commands (one instance per image placement)
+        // Build image draw commands (one instance per image placement). Keep
+        // painter order independent of which panel produced the overlay.
+        let mut overlays = overlays.to_vec();
+        overlays.sort_by_key(|overlay| overlay.z_index);
         self.image_draws.clear();
         for overlay in overlays {
             if !self.image_textures.contains_key(&overlay.image_id) {
@@ -1443,7 +1454,10 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn draw_images_metal(
         image_draws: &[ImageDraw],
-        image_textures: &FxHashMap<u64, ImageTextureEntry>,
+        image_textures: &FxHashMap<
+            crate::sugarloaf::graphics::GraphicKey,
+            ImageTextureEntry,
+        >,
         brush: &MetalRenderer,
         render_encoder: &metal::RenderCommandEncoderRef,
         layer: ImageLayer,
@@ -1662,10 +1676,27 @@ impl Renderer {
     /// kitty eviction); without this, sequential atlas ids from e.g.
     /// sixel animations would grow the texture cache without bound.
     #[inline]
-    pub fn evict_image_texture(&mut self, key: u64) {
+    pub fn evict_image_texture(&mut self, key: crate::sugarloaf::graphics::GraphicKey) {
         if let Some(old) = self.image_textures.remove(&key) {
             self.image_texture_bytes -= old.bytes;
         }
+    }
+
+    pub fn evict_route_image_textures(
+        &mut self,
+        mut should_evict: impl FnMut(usize) -> bool,
+    ) {
+        let removed_bytes = self
+            .image_textures
+            .extract_if(|key, _| should_evict(key.route_id))
+            .map(|(_, entry)| entry.bytes)
+            .sum::<usize>();
+        self.image_texture_bytes = self
+            .image_texture_bytes
+            .checked_sub(removed_bytes)
+            .expect("removed image textures must be included in byte accounting");
+        self.image_draws
+            .retain(|draw| !should_evict(draw.image_id.route_id));
     }
 
     #[inline]
@@ -1855,10 +1886,20 @@ impl Renderer {
 
     #[inline]
     #[cfg(feature = "wgpu")]
-    pub fn render<'pass>(
-        &'pass mut self,
+    pub fn render(&mut self, ctx: &mut WgpuContext, rpass: &mut wgpu::RenderPass<'_>) {
+        self.render_wgpu_part(ctx, rpass, WgpuRenderPart::Images(ImageLayer::BelowBg));
+        self.render_wgpu_part(ctx, rpass, WgpuRenderPart::Images(ImageLayer::BelowText));
+        self.render_wgpu_part(ctx, rpass, WgpuRenderPart::Geometry);
+        self.render_wgpu_part(ctx, rpass, WgpuRenderPart::Images(ImageLayer::AboveText));
+    }
+
+    #[inline]
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn render_wgpu_part(
+        &mut self,
         ctx: &mut WgpuContext,
-        rpass: &mut wgpu::RenderPass<'pass>,
+        rpass: &mut wgpu::RenderPass<'_>,
+        part: WgpuRenderPart,
     ) {
         // Destructure to get independent borrows of different fields
         let Self {
@@ -1889,107 +1930,116 @@ impl Renderer {
             // Background image: drawn first so all subsequent text/rects
             // composite on top. Single fullscreen instance, dedicated
             // vertex buffer, reuses the kitty image pipeline + sampler.
-            if let Some(bg_tex) = background_image_texture.as_ref() {
-                if let ImageTexture::Wgpu { view, .. } = &bg_tex.gpu {
-                    let instance = ImageInstance {
-                        dest_pos: [0.0, 0.0],
-                        dest_size: [ctx.size.width, ctx.size.height],
-                        source_rect: [0.0, 0.0, 1.0, 1.0],
-                    };
-                    ctx.queue.write_buffer(
-                        &brush.background_image_vertex_buffer,
-                        0,
-                        bytemuck::bytes_of(&instance),
-                    );
-                    let bg_bind =
-                        ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some("background image bind group"),
-                            layout: &brush.image_bind_group_layout,
-                            entries: &[wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(view),
-                            }],
-                        });
+            if matches!(part, WgpuRenderPart::Images(ImageLayer::BelowBg)) {
+                if let Some(bg_tex) = background_image_texture.as_ref() {
+                    if let ImageTexture::Wgpu { view, .. } = &bg_tex.gpu {
+                        let instance = ImageInstance {
+                            dest_pos: [0.0, 0.0],
+                            dest_size: [ctx.size.width, ctx.size.height],
+                            source_rect: [0.0, 0.0, 1.0, 1.0],
+                        };
+                        ctx.queue.write_buffer(
+                            &brush.background_image_vertex_buffer,
+                            0,
+                            bytemuck::bytes_of(&instance),
+                        );
+                        let bg_bind =
+                            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("background image bind group"),
+                                layout: &brush.image_bind_group_layout,
+                                entries: &[wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(view),
+                                }],
+                            });
+                        rpass.set_pipeline(&brush.image_pipeline);
+                        rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
+                        rpass.set_bind_group(1, &bg_bind, &[]);
+                        rpass.set_vertex_buffer(
+                            0,
+                            brush.background_image_vertex_buffer.slice(..),
+                        );
+                        rpass.draw(0..4, 0..1);
+                        // Restore text pipeline state for downstream batches.
+                        rpass.set_pipeline(&brush.pipeline);
+                        rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
+                    }
+                }
+            }
+
+            if let WgpuRenderPart::Images(layer) = part {
+                if has_images && image_draws.iter().any(|d| d.layer == layer) {
+                    // Each draw must use a unique slot in the shared vertex
+                    // buffer. Writing every instance to offset 0 (the old
+                    // behaviour) made the GPU read only the last-written
+                    // instance, so a screen with N kitty placements only
+                    // ever rendered the most recent one. The buffer is
+                    // sized for `MAX_IMAGE_INSTANCES` instances; the same
+                    // index space is used by the AboveText pass below so
+                    // both layers see consistent instance data.
+                    // Bumped from 64 to accommodate kitty Unicode placeholders
+                    // which can produce up to cols*rows draws per visible image
+                    // (one per placeholder cell with its own source rect).
+                    if image_draws.len() > brush.supported_image_instances {
+                        brush.image_vertex_buffer.destroy();
+                        brush.supported_image_instances =
+                            (image_draws.len() as f32 * 1.25).ceil() as usize;
+                        brush.image_vertex_buffer =
+                            ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some("image instance buffer (resized)"),
+                                size: mem::size_of::<ImageInstance>() as u64
+                                    * brush.supported_image_instances as u64,
+                                usage: wgpu::BufferUsages::VERTEX
+                                    | wgpu::BufferUsages::COPY_DST,
+                                mapped_at_creation: false,
+                            });
+                    }
+                    let stride = std::mem::size_of::<ImageInstance>() as u64;
+
                     rpass.set_pipeline(&brush.image_pipeline);
                     rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
-                    rpass.set_bind_group(1, &bg_bind, &[]);
-                    rpass.set_vertex_buffer(
-                        0,
-                        brush.background_image_vertex_buffer.slice(..),
-                    );
-                    rpass.draw(0..4, 0..1);
-                    // Restore text pipeline state for downstream batches.
+                    for (i, draw) in image_draws.iter().enumerate() {
+                        if draw.layer != layer {
+                            continue;
+                        }
+                        if let Some(img) = image_textures.get(&draw.image_id) {
+                            if let ImageTexture::Wgpu { view, .. } = &img.gpu {
+                                let bg = ctx.device.create_bind_group(
+                                    &wgpu::BindGroupDescriptor {
+                                        label: None,
+                                        layout: &brush.image_bind_group_layout,
+                                        entries: &[wgpu::BindGroupEntry {
+                                            binding: 0,
+                                            resource: wgpu::BindingResource::TextureView(
+                                                view,
+                                            ),
+                                        }],
+                                    },
+                                );
+                                let offset = i as u64 * stride;
+                                ctx.queue.write_buffer(
+                                    &brush.image_vertex_buffer,
+                                    offset,
+                                    bytemuck::bytes_of(&draw.instance),
+                                );
+                                rpass.set_bind_group(1, &bg, &[]);
+                                rpass.set_vertex_buffer(
+                                    0,
+                                    brush
+                                        .image_vertex_buffer
+                                        .slice(offset..offset + stride),
+                                );
+                                rpass.draw(0..4, 0..1);
+                            }
+                        }
+                    }
                     rpass.set_pipeline(&brush.pipeline);
                     rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
                 }
             }
 
-            if has_images && image_draws.iter().any(|d| d.layer == ImageLayer::BelowText)
-            {
-                // Each draw must use a unique slot in the shared vertex
-                // buffer. Writing every instance to offset 0 (the old
-                // behaviour) made the GPU read only the last-written
-                // instance, so a screen with N kitty placements only
-                // ever rendered the most recent one. The buffer is
-                // sized for `MAX_IMAGE_INSTANCES` instances; the same
-                // index space is used by the AboveText pass below so
-                // both layers see consistent instance data.
-                // Bumped from 64 to accommodate kitty Unicode placeholders
-                // which can produce up to cols*rows draws per visible image
-                // (one per placeholder cell with its own source rect).
-                const MAX_IMAGE_INSTANCES: usize = 1024;
-                if image_draws.len() > MAX_IMAGE_INSTANCES {
-                    tracing::warn!(
-                        "image_draws ({}) exceeds vertex buffer capacity ({}); \
-                         extra placements will not render this frame",
-                        image_draws.len(),
-                        MAX_IMAGE_INSTANCES
-                    );
-                }
-                let limit = image_draws.len().min(MAX_IMAGE_INSTANCES);
-                let stride = std::mem::size_of::<ImageInstance>() as u64;
-
-                rpass.set_pipeline(&brush.image_pipeline);
-                rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
-                for (i, draw) in image_draws.iter().take(limit).enumerate() {
-                    if draw.layer != ImageLayer::BelowText {
-                        continue;
-                    }
-                    if let Some(img) = image_textures.get(&draw.image_id) {
-                        if let ImageTexture::Wgpu { view, .. } = &img.gpu {
-                            let bg = ctx.device.create_bind_group(
-                                &wgpu::BindGroupDescriptor {
-                                    label: None,
-                                    layout: &brush.image_bind_group_layout,
-                                    entries: &[wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            view,
-                                        ),
-                                    }],
-                                },
-                            );
-                            let offset = i as u64 * stride;
-                            ctx.queue.write_buffer(
-                                &brush.image_vertex_buffer,
-                                offset,
-                                bytemuck::bytes_of(&draw.instance),
-                            );
-                            rpass.set_bind_group(1, &bg, &[]);
-                            rpass.set_vertex_buffer(
-                                0,
-                                brush.image_vertex_buffer.slice(offset..offset + stride),
-                            );
-                            rpass.draw(0..4, 0..1);
-                        }
-                    }
-                }
-                rpass.set_pipeline(&brush.pipeline);
-                rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
-            }
-
             // Upload buffers once
-            if !instances.is_empty() {
+            if matches!(part, WgpuRenderPart::Geometry) && !instances.is_empty() {
                 if instances.len() > brush.supported_instance_buffer {
                     brush.instance_buffer.destroy();
                     brush.supported_instance_buffer =
@@ -2010,7 +2060,7 @@ impl Renderer {
                     bytemuck::cast_slice(instances),
                 );
             }
-            if !vertices.is_empty() {
+            if matches!(part, WgpuRenderPart::Geometry) && !vertices.is_empty() {
                 if vertices.len() > brush.supported_vertex_buffer {
                     brush.vertex_buffer.destroy();
                     brush.supported_vertex_buffer =
@@ -2032,113 +2082,66 @@ impl Renderer {
                 );
             }
 
-            // Text pipeline: dispatch draw commands
-            let mut current_pipeline_instanced = false;
-            let mut pipeline_set = false;
+            if matches!(part, WgpuRenderPart::Geometry) {
+                // Text pipeline: dispatch draw commands
+                let mut current_pipeline_instanced = false;
+                let mut pipeline_set = false;
 
-            for cmd in draw_cmds {
-                let (color_layer, mask_layer) = match cmd {
-                    batch::DrawCmd::Instanced {
-                        color_layer,
-                        mask_layer,
-                        ..
-                    } => (*color_layer, *mask_layer),
-                    batch::DrawCmd::Vertices {
-                        color_layer,
-                        mask_layer,
-                        ..
-                    } => (*color_layer, *mask_layer),
-                };
+                for cmd in draw_cmds {
+                    let (color_layer, mask_layer) = match cmd {
+                        batch::DrawCmd::Instanced {
+                            color_layer,
+                            mask_layer,
+                            ..
+                        } => (*color_layer, *mask_layer),
+                        batch::DrawCmd::Vertices {
+                            color_layer,
+                            mask_layer,
+                            ..
+                        } => (*color_layer, *mask_layer),
+                    };
 
-                // Bind textures for this batch
-                let color_view = if color_layer > 0 {
-                    let idx = (color_layer - 1) as usize;
-                    color_views.get(idx).unwrap_or(&color_views[0])
-                } else {
-                    &color_views[0]
-                };
-                let final_mask_view = if mask_layer > 0 {
-                    mask_texture_view.unwrap_or(color_views[0])
-                } else {
-                    color_views[0]
-                };
-                brush.update_bind_group(ctx, color_view, final_mask_view);
+                    // Bind textures for this batch
+                    let color_view = if color_layer > 0 {
+                        let idx = (color_layer - 1) as usize;
+                        color_views.get(idx).unwrap_or(&color_views[0])
+                    } else {
+                        &color_views[0]
+                    };
+                    let final_mask_view = if mask_layer > 0 {
+                        mask_texture_view.unwrap_or(color_views[0])
+                    } else {
+                        color_views[0]
+                    };
+                    brush.update_bind_group(ctx, color_view, final_mask_view);
 
-                match cmd {
-                    batch::DrawCmd::Instanced { offset, count, .. } => {
-                        if !pipeline_set || !current_pipeline_instanced {
-                            rpass.set_pipeline(&brush.instanced_pipeline);
-                            rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
-                            current_pipeline_instanced = true;
-                            pipeline_set = true;
-                        }
-                        rpass.set_bind_group(1, &brush.layout_bind_group, &[]);
-                        let byte_offset =
-                            *offset as u64 * mem::size_of::<batch::QuadInstance>() as u64;
-                        rpass.set_vertex_buffer(
-                            0,
-                            brush.instance_buffer.slice(byte_offset..),
-                        );
-                        rpass.draw(0..4, 0..*count);
-                    }
-                    batch::DrawCmd::Vertices { offset, count, .. } => {
-                        if !pipeline_set || current_pipeline_instanced {
-                            rpass.set_pipeline(&brush.pipeline);
-                            rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
-                            rpass.set_vertex_buffer(0, brush.vertex_buffer.slice(..));
-                            current_pipeline_instanced = false;
-                            pipeline_set = true;
-                        }
-                        rpass.set_bind_group(1, &brush.layout_bind_group, &[]);
-                        rpass.draw(*offset..*offset + *count, 0..1);
-                    }
-                }
-            }
-
-            if has_images && image_draws.iter().any(|d| d.layer == ImageLayer::AboveText)
-            {
-                // See BelowText pass above for the rationale; both
-                // passes share the same indexing into image_draws so
-                // each placement always reads its own slot.
-                // Bumped from 64 to accommodate kitty Unicode placeholders
-                // which can produce up to cols*rows draws per visible image
-                // (one per placeholder cell with its own source rect).
-                const MAX_IMAGE_INSTANCES: usize = 1024;
-                let limit = image_draws.len().min(MAX_IMAGE_INSTANCES);
-                let stride = std::mem::size_of::<ImageInstance>() as u64;
-
-                rpass.set_pipeline(&brush.image_pipeline);
-                rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
-                for (i, draw) in image_draws.iter().take(limit).enumerate() {
-                    if draw.layer != ImageLayer::AboveText {
-                        continue;
-                    }
-                    if let Some(img) = image_textures.get(&draw.image_id) {
-                        if let ImageTexture::Wgpu { view, .. } = &img.gpu {
-                            let bg = ctx.device.create_bind_group(
-                                &wgpu::BindGroupDescriptor {
-                                    label: None,
-                                    layout: &brush.image_bind_group_layout,
-                                    entries: &[wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            view,
-                                        ),
-                                    }],
-                                },
-                            );
-                            let offset = i as u64 * stride;
-                            ctx.queue.write_buffer(
-                                &brush.image_vertex_buffer,
-                                offset,
-                                bytemuck::bytes_of(&draw.instance),
-                            );
-                            rpass.set_bind_group(1, &bg, &[]);
+                    match cmd {
+                        batch::DrawCmd::Instanced { offset, count, .. } => {
+                            if !pipeline_set || !current_pipeline_instanced {
+                                rpass.set_pipeline(&brush.instanced_pipeline);
+                                rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
+                                current_pipeline_instanced = true;
+                                pipeline_set = true;
+                            }
+                            rpass.set_bind_group(1, &brush.layout_bind_group, &[]);
+                            let byte_offset = *offset as u64
+                                * mem::size_of::<batch::QuadInstance>() as u64;
                             rpass.set_vertex_buffer(
                                 0,
-                                brush.image_vertex_buffer.slice(offset..offset + stride),
+                                brush.instance_buffer.slice(byte_offset..),
                             );
-                            rpass.draw(0..4, 0..1);
+                            rpass.draw(0..4, 0..*count);
+                        }
+                        batch::DrawCmd::Vertices { offset, count, .. } => {
+                            if !pipeline_set || current_pipeline_instanced {
+                                rpass.set_pipeline(&brush.pipeline);
+                                rpass.set_bind_group(0, &brush.constant_bind_group, &[]);
+                                rpass.set_vertex_buffer(0, brush.vertex_buffer.slice(..));
+                                current_pipeline_instanced = false;
+                                pipeline_set = true;
+                            }
+                            rpass.set_bind_group(1, &brush.layout_bind_group, &[]);
+                            rpass.draw(*offset..*offset + *count, 0..1);
                         }
                     }
                 }
@@ -3050,7 +3053,6 @@ impl WgpuRenderer {
 
         let image_vertex_buffer = context.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("image instance buffer"),
-            // 1024 max — see `MAX_IMAGE_INSTANCES` comment in render path.
             size: mem::size_of::<ImageInstance>() as u64 * 1024,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -3079,6 +3081,7 @@ impl WgpuRenderer {
             image_pipeline,
             image_bind_group_layout,
             image_vertex_buffer,
+            supported_image_instances: 1024,
             background_image_vertex_buffer,
         }
     }

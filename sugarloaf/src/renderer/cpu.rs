@@ -13,7 +13,7 @@ use crate::context::cpu::CpuContext;
 use crate::renderer::compositor::Vertex;
 use crate::renderer::image_cache::ImageCache;
 use crate::renderer::Renderer;
-use crate::sugarloaf::graphics::{GraphicDataEntry, GraphicOverlay};
+use crate::sugarloaf::graphics::{GraphicDataEntry, GraphicKey, GraphicOverlay};
 use rustc_hash::FxHashMap;
 use std::hash::Hasher;
 use wide::{u32x4, u32x8};
@@ -21,7 +21,7 @@ use wide::{u32x4, u32x8};
 /// Image overlays and their pixel stores for a CPU frame.
 pub struct ImageLayers<'a> {
     pub overlays: &'a FxHashMap<usize, Vec<GraphicOverlay>>,
-    pub data: &'a FxHashMap<u64, GraphicDataEntry>,
+    pub data: &'a FxHashMap<GraphicKey, GraphicDataEntry>,
 }
 
 #[derive(Default)]
@@ -350,7 +350,8 @@ pub fn render_cpu(
         // retransmitted image gets a fresh handle id).
         h.write_usize(image_overlays.len());
         for overlay in &image_overlays {
-            h.write_u64(overlay.image_id);
+            h.write_usize(overlay.image_id.route_id);
+            h.write_u64(overlay.image_id.image_id);
             h.write_u32(overlay.x.to_bits());
             h.write_u32(overlay.y.to_bits());
             h.write_u32(overlay.width.to_bits());
@@ -557,7 +558,7 @@ fn draw_image_overlays(
     buf_w: i32,
     buf_h: i32,
     overlays: &[&GraphicOverlay],
-    data: &FxHashMap<u64, GraphicDataEntry>,
+    data: &FxHashMap<GraphicKey, GraphicDataEntry>,
 ) {
     for overlay in overlays {
         let entry = match data.get(&overlay.image_id) {
@@ -1006,7 +1007,7 @@ mod image_overlay_tests {
 
     fn overlay(x: f32, y: f32, width: f32, height: f32) -> GraphicOverlay {
         GraphicOverlay {
-            image_id: 1,
+            image_id: GraphicKey::new(1, 1),
             x,
             y,
             width,

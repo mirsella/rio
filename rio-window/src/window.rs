@@ -1604,6 +1604,42 @@ impl Window {
         self.window.maybe_wait_on_main(|w| w.drag_window())
     }
 
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    pub fn drag_window_from_active_grab(
+        &self,
+        source_window_id: u64,
+    ) -> Result<(), ExternalError> {
+        let _span =
+            tracing::debug_span!("rio_window::Window::drag_window_from_active_grab")
+                .entered();
+        self.window
+            .maybe_wait_on_main(|w| w.drag_window_from_active_grab(source_window_id))
+    }
+
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    pub fn drag_window_from_frame_grab(
+        &self,
+        source_window_id: u64,
+        seat_id: u32,
+        pointer_id: u32,
+    ) -> Result<(), ExternalError> {
+        self.window.maybe_wait_on_main(|w| {
+            w.drag_window_from_frame_grab(source_window_id, seat_id, pointer_id)
+        })
+    }
+
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    pub fn forget_frame_drag(&self) {
+        self.window.maybe_queue_on_main(|w| w.forget_frame_drag());
+    }
+
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    pub fn forget_frame_drag_for_pointer(&self, seat_id: u32, pointer_id: u32) {
+        self.window.maybe_queue_on_main(move |w| {
+            w.forget_frame_drag_for_pointer(seat_id, pointer_id)
+        });
+    }
+
     /// Resizes the window with the left mouse button until the button is released.
     ///
     /// There's no guarantee that this will work unless the left mouse button was pressed

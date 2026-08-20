@@ -8,6 +8,7 @@ use rio_backend::crosswords::grid::Dimensions;
 use rio_backend::event::EventListener;
 use rio_backend::sugarloaf::{layout::TextDimensions, Rect, Sugarloaf};
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use taffy::{
     geometry, style_helpers::length, AvailableSpace, Display, NodeId, Style, TaffyError,
@@ -16,6 +17,26 @@ use taffy::{
 
 const MIN_COLS: usize = 2;
 const MIN_LINES: usize = 1;
+
+static TAB_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+/// Stable process-local identity for a tab's complete grid.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TabId(usize);
+
+impl TabId {
+    fn next() -> Self {
+        let id = TAB_ID_COUNTER
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("TabId counter exhausted");
+        Self(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(raw: usize) -> Self {
+        Self(raw)
+    }
+}
 
 /// Direction of a draggable panel border
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -106,6 +127,7 @@ impl Default for BorderConfig {
 }
 
 pub struct ContextGrid<T: EventListener> {
+    id: TabId,
     pub width: f32,
     pub height: f32,
     pub current: NodeId,
@@ -145,12 +167,6 @@ impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
     pub fn context_mut(&mut self) -> &mut Context<T> {
         &mut self.val
     }
-
-    /// Previously stashed panel position into the rich-text object's
-    /// render_data; that object tree is gone with the Content drop.
-    /// The grid renderer reads panel positions directly from
-    /// `layout_rect`.
-    fn set_position(&mut self, _position: [f32; 2]) {}
 }
 
 impl<T: rio_backend::event::EventListener> ContextGrid<T> {
@@ -224,6 +240,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         };
 
         let mut grid = Self {
+            id: TabId::next(),
             inner,
             current: panel_node,
             scaled_margin,
@@ -238,14 +255,39 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             root_node,
             border_config,
         };
-        grid.calculate_positions();
+        let _ = grid.compute_layout();
         grid
     }
 
+    /// Identity remains unchanged when the grid is reordered or moved between managers.
     #[inline]
-    #[allow(dead_code)]
-    pub fn get_mut(&mut self, key: NodeId) -> Option<&mut ContextGridItem<T>> {
-        self.inner.get_mut(&key)
+    pub fn id(&self) -> TabId {
+        self.id
+    }
+
+    /// Route IDs for every split in this grid, in deterministic order.
+    pub fn route_ids(&self) -> Vec<usize> {
+        let mut route_ids: Vec<_> =
+            self.inner.values().map(|item| item.val.route_id).collect();
+        route_ids.sort_unstable();
+        route_ids
+    }
+
+    /// Reassign every split in this grid to a new owning window.
+    pub fn rebind_window(&mut self, window_id: rio_backend::event::WindowId) {
+        for item in self.inner.values_mut() {
+            item.val.rebind_window(window_id);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn add_split_for_test(&mut self, context: Context<T>) {
+        let node = self
+            .try_split_right()
+            .expect("test grid should accept another split");
+        self.inner.insert(node, ContextGridItem::new(context));
+        self.current = node;
+        let _ = self.compute_layout();
     }
 
     /// Get item by route_id (used for event routing)
@@ -264,12 +306,8 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         self.inner.len()
     }
 
-    pub fn panel_count(&self) -> usize {
-        self.inner.len()
-    }
-
     pub fn should_draw_borders(&self) -> bool {
-        self.panel_count() > 1
+        self.len() > 1
     }
 
     fn try_update_size(&mut self, width: f32, height: f32) -> Result<(), TaffyError> {
@@ -399,7 +437,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         border: &PanelBorder,
         original_sizes: (f32, f32),
         delta: f32,
-        sugarloaf: &mut Sugarloaf,
     ) {
         let min_size = 50.0 * self.scale;
 
@@ -417,7 +454,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             }
         }
 
-        self.apply_taffy_layout(sugarloaf);
+        self.apply_taffy_layout();
     }
 
     /// Get separator lines between adjacent panels for rendering.
@@ -894,19 +931,13 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         None
     }
 
-    fn apply_taffy_layout(&mut self, sugarloaf: &mut Sugarloaf) -> bool {
+    fn apply_taffy_layout(&mut self) -> bool {
         if self.compute_layout().is_err() {
             return false;
         }
 
-        let scale = sugarloaf.ctx.scale();
-        let is_multi_panel = self.inner.len() > 1;
-
         for item in self.inner.values_mut() {
-            let [abs_x, abs_y, width, height] = item.layout_rect;
-
-            let x = (abs_x + self.scaled_margin.left) / scale;
-            let y = (abs_y + self.scaled_margin.top) / scale;
+            let [_, _, width, height] = item.layout_rect;
 
             // Clear margin since Taffy layout already accounts for spacing
             item.val.dimension.margin = Margin::all(0.0);
@@ -926,12 +957,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             // `pending_update.is_dirty()` and skips the panel before reading
             // that. Mark it dirty so an idle terminal still presents.
             item.val.renderable_content.pending_update.set_dirty();
-
-            // Panel position / clipping bounds are tracked rio-side
-            // now; the grid pass reads `panel_rect` from the renderer's
-            // own per-panel iteration. Sugarloaf no longer carries
-            // panel metadata.
-            let _ = (x, y, abs_x, abs_y, width, height, is_multi_panel);
         }
         true
     }
@@ -939,16 +964,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     #[inline]
     pub fn contexts_mut(&mut self) -> &mut FxHashMap<NodeId, ContextGridItem<T>> {
         &mut self.inner
-    }
-
-    /// Immutable view into the panel map. Kept even though the
-    /// emission loop uses `contexts_mut` (it needs `&mut
-    /// renderable_content` to take damage) — this one is handy for
-    /// read-only cross-panel queries like the damage audit.
-    #[allow(dead_code)]
-    #[inline]
-    pub fn contexts(&self) -> &FxHashMap<NodeId, ContextGridItem<T>> {
-        &self.inner
     }
 
     /// Get contexts ordered by visual position (top-to-bottom, left-to-right)
@@ -1258,11 +1273,11 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
 
         // Always apply Taffy layout for consistent positioning
-        self.apply_taffy_layout(sugarloaf);
+        self.apply_taffy_layout();
     }
 
     /// Resize grid - always uses Taffy for consistent layout
-    pub fn resize(&mut self, new_width: f32, new_height: f32, sugarloaf: &mut Sugarloaf) {
+    pub fn resize(&mut self, new_width: f32, new_height: f32) {
         self.width = new_width;
         self.height = new_height;
 
@@ -1270,26 +1285,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         let _ = self.try_update_size(new_width, new_height);
 
         // Apply layout - works for both single and multi-panel
-        self.apply_taffy_layout(sugarloaf);
-    }
-
-    #[inline]
-    pub fn calculate_positions(&mut self) {
-        if self.inner.is_empty() {
-            return;
-        }
-
-        // Compute Taffy layout (also updates layout_rect via update_layout_rects)
-        if self.compute_layout().is_err() {
-            return;
-        }
-
-        // Update positions from layout_rect for all panels
-        for item in self.inner.values_mut() {
-            let x = item.layout_rect[0] + self.scaled_margin.left;
-            let y = item.layout_rect[1] + self.scaled_margin.top;
-            item.set_position([x, y]);
-        }
+        self.apply_taffy_layout();
     }
 
     pub fn remove_current(&mut self, sugarloaf: &mut Sugarloaf) {
@@ -1363,16 +1359,39 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         self.collapse_single_child_containers();
 
         // Recompute layout
-        if self.panel_count() > 0 {
+        if !self.inner.is_empty() {
             // When back to a single panel, reset to flexible so it fills the window
-            if self.panel_count() == 1 {
+            if self.len() == 1 {
                 self.reset_panel_styles_to_flexible();
             }
-            self.apply_taffy_layout(sugarloaf);
+            self.apply_taffy_layout();
         }
     }
 
-    pub fn split_right(&mut self, context: Context<T>, sugarloaf: &mut Sugarloaf) {
+    /// Remove the split identified by its terminal route without changing
+    /// another split's selection.
+    pub fn remove_route(&mut self, route_id: usize, sugarloaf: &mut Sugarloaf) -> bool {
+        let Some(to_remove) = self
+            .inner
+            .iter()
+            .find_map(|(&node, item)| (item.val.route_id == route_id).then_some(node))
+        else {
+            return false;
+        };
+        if self.inner.len() == 1 {
+            return false;
+        }
+
+        let selected = self.current;
+        self.current = to_remove;
+        self.remove_current(sugarloaf);
+        if selected != to_remove {
+            self.current = selected;
+        }
+        true
+    }
+
+    pub fn split_right(&mut self, context: Context<T>) {
         if !self.inner.contains_key(&self.current) {
             return;
         }
@@ -1381,13 +1400,13 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         if let Ok(new_node) = self.try_split_right() {
             let new_context = ContextGridItem::new(context);
             self.inner.insert(new_node, new_context);
-            self.apply_taffy_layout(sugarloaf);
+            self.apply_taffy_layout();
             self.current = new_node;
         }
     }
 
     /// Split down - create new panel below using Taffy
-    pub fn split_down(&mut self, context: Context<T>, sugarloaf: &mut Sugarloaf) {
+    pub fn split_down(&mut self, context: Context<T>) {
         if !self.inner.contains_key(&self.current) {
             return;
         }
@@ -1396,13 +1415,13 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         if let Ok(new_node) = self.try_split_down() {
             let new_context = ContextGridItem::new(context);
             self.inner.insert(new_node, new_context);
-            self.apply_taffy_layout(sugarloaf);
+            self.apply_taffy_layout();
             self.current = new_node;
         }
     }
 
-    pub fn move_divider_up(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        if self.panel_count() <= 1 {
+    pub fn move_divider_up(&mut self, amount: f32) -> bool {
+        if self.len() <= 1 {
             return false;
         }
 
@@ -1446,14 +1465,14 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             let _ = self.set_panel_size(bottom_node, None, Some(new_bottom_height));
 
             // Apply layout and update all contexts
-            return self.apply_taffy_layout(sugarloaf);
+            return self.apply_taffy_layout();
         }
 
         false
     }
 
-    pub fn move_divider_down(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        if self.panel_count() <= 1 {
+    pub fn move_divider_down(&mut self, amount: f32) -> bool {
+        if self.len() <= 1 {
             return false;
         }
 
@@ -1497,14 +1516,14 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             let _ = self.set_panel_size(bottom_node, None, Some(new_bottom_height));
 
             // Apply layout and update all contexts
-            return self.apply_taffy_layout(sugarloaf);
+            return self.apply_taffy_layout();
         }
 
         false
     }
 
-    pub fn move_divider_left(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        if self.panel_count() <= 1 {
+    pub fn move_divider_left(&mut self, amount: f32) -> bool {
+        if self.len() <= 1 {
             return false;
         }
 
@@ -1549,14 +1568,14 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             let _ = self.set_panel_size(right_node, Some(new_right_width), None);
 
             // Apply layout and update all contexts
-            return self.apply_taffy_layout(sugarloaf);
+            return self.apply_taffy_layout();
         }
 
         false
     }
 
-    pub fn move_divider_right(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        if self.panel_count() <= 1 {
+    pub fn move_divider_right(&mut self, amount: f32) -> bool {
+        if self.len() <= 1 {
             return false;
         }
 
@@ -1601,25 +1620,10 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             let _ = self.set_panel_size(right_node, Some(new_right_width), None);
 
             // Apply layout and update all contexts
-            return self.apply_taffy_layout(sugarloaf);
+            return self.apply_taffy_layout();
         }
 
         false
-    }
-
-    /// Hide the panel set by clearing per-panel image overlays. The
-    /// `visible=true` case is a no-op — the next `Renderer::run` will
-    /// repopulate overlays naturally for whichever tab/group is
-    /// active. (Naming preserved for callers; the function used to
-    /// drive sugarloaf's content visibility flag, which is gone.)
-    #[inline]
-    pub fn set_all_rich_text_visibility(&self, sugarloaf: &mut Sugarloaf, visible: bool) {
-        if visible {
-            return;
-        }
-        for item in self.inner.values() {
-            sugarloaf.clear_image_overlays_for(item.val.rich_text_id);
-        }
     }
 
     /// Drop image overlays for every panel in the grid. Used on tab

@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fmt::Formatter;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[cfg(feature = "rio-window")]
@@ -49,6 +50,58 @@ impl From<WindowId> for rio_window::window::WindowId {
 impl From<rio_window::window::WindowId> for WindowId {
     fn from(id: rio_window::window::WindowId) -> Self {
         WindowId(u64::from(id))
+    }
+}
+
+/// Destination for an event produced by a terminal context.
+///
+/// UI events use a fixed target. Context-bound producers use a dynamic target
+/// so events already queued by a moved context resolve its current owner when
+/// the frontend dispatches them.
+#[derive(Clone)]
+pub enum WindowTarget {
+    Fixed(WindowId),
+    Dynamic(Arc<AtomicU64>),
+}
+
+impl WindowTarget {
+    pub fn fixed(window_id: WindowId) -> Self {
+        Self::Fixed(window_id)
+    }
+
+    pub fn dynamic(window_id: WindowId) -> Self {
+        Self::Dynamic(Arc::new(AtomicU64::new(window_id.into())))
+    }
+
+    pub fn window_id(&self) -> WindowId {
+        match self {
+            Self::Fixed(window_id) => *window_id,
+            Self::Dynamic(window_id) => WindowId::from(window_id.load(Ordering::Acquire)),
+        }
+    }
+
+    pub fn rebind(&self, window_id: WindowId) {
+        match self {
+            Self::Dynamic(target) => target.store(window_id.into(), Ordering::Release),
+            Self::Fixed(_) => panic!("cannot rebind a fixed window target"),
+        }
+    }
+}
+
+impl Debug for WindowTarget {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed(window_id) => f.debug_tuple("Fixed").field(window_id).finish(),
+            Self::Dynamic(_) => {
+                f.debug_tuple("Dynamic").field(&self.window_id()).finish()
+            }
+        }
+    }
+}
+
+impl From<WindowId> for WindowTarget {
+    fn from(window_id: WindowId) -> Self {
+        Self::fixed(window_id)
     }
 }
 
@@ -176,6 +229,8 @@ pub enum RioEvent {
     HideOtherApplications,
     UpdateConfig,
     CreateWindow,
+    MoveCurrentTabToNewWindow,
+    MergeWindow,
     ToggleQuake,
     CloseWindow,
     CreateNativeTab(Option<String>),
@@ -347,6 +402,10 @@ impl Debug for RioEvent {
                 write!(f, "ChildExited(route={route}, status={status:?})")
             }
             RioEvent::CreateWindow => write!(f, "CreateWindow"),
+            RioEvent::MoveCurrentTabToNewWindow => {
+                write!(f, "MoveCurrentTabToNewWindow")
+            }
+            RioEvent::MergeWindow => write!(f, "MergeWindow"),
             RioEvent::ToggleQuake => write!(f, "ToggleQuake"),
             RioEvent::CloseWindow => write!(f, "CloseWindow"),
             RioEvent::CreateNativeTab(_) => write!(f, "CreateNativeTab"),
@@ -386,12 +445,19 @@ impl Debug for RioEvent {
 pub struct EventPayload {
     /// Event payload.
     pub payload: RioEventType,
-    pub window_id: WindowId,
+    pub target: WindowTarget,
 }
 
 impl EventPayload {
-    pub fn new(payload: RioEventType, window_id: WindowId) -> Self {
-        Self { payload, window_id }
+    pub fn new(payload: RioEventType, target: impl Into<WindowTarget>) -> Self {
+        Self {
+            payload,
+            target: target.into(),
+        }
+    }
+
+    pub fn window_id(&self) -> WindowId {
+        self.target.window_id()
     }
 }
 
@@ -415,6 +481,16 @@ pub trait EventListener {
     fn send_redraw(&self, _id: WindowId) {}
 
     fn send_global_event(&self, _event: RioEvent) {}
+
+    /// Clone this listener for producers owned by a terminal context.
+    ///
+    /// Listener implementations without window routing can keep the default.
+    fn with_window_target(&self, _target: WindowTarget) -> Self
+    where
+        Self: Clone + Sized,
+    {
+        self.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -432,12 +508,16 @@ impl EventListener for VoidListener {}
 #[cfg(feature = "rio-window")]
 pub struct EventProxy {
     proxy: EventLoopProxy<EventPayload>,
+    target: Option<WindowTarget>,
 }
 
 #[cfg(feature = "rio-window")]
 impl EventProxy {
     pub fn new(proxy: EventLoopProxy<EventPayload>) -> Self {
-        Self { proxy }
+        Self {
+            proxy,
+            target: None,
+        }
     }
 
     pub fn send_event(&self, event: RioEventType, id: WindowId) {
@@ -448,7 +528,45 @@ impl EventProxy {
 #[cfg(feature = "rio-window")]
 impl EventListener for EventProxy {
     fn send_event(&self, event: RioEvent, id: WindowId) {
-        let _ = self.proxy.send_event(EventPayload::new(event.into(), id));
+        let target = self.target.clone().unwrap_or_else(|| id.into());
+        let _ = self
+            .proxy
+            .send_event(EventPayload::new(event.into(), target));
+    }
+
+    fn with_window_target(&self, target: WindowTarget) -> Self {
+        Self {
+            proxy: self.proxy.clone(),
+            target: Some(target),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EventPayload, RioEvent, RioEventType, WindowId, WindowTarget};
+
+    #[test]
+    fn dynamic_window_target_rebinds_all_clones() {
+        let target = WindowTarget::dynamic(WindowId::from(1));
+        let clone = target.clone();
+
+        target.rebind(WindowId::from(2));
+
+        assert_eq!(clone.window_id(), WindowId::from(2));
+    }
+
+    #[test]
+    fn cloned_queued_payload_resolves_rebound_target() {
+        let target = WindowTarget::dynamic(WindowId::from(1));
+        let queued =
+            EventPayload::new(RioEventType::Rio(RioEvent::Render), target.clone());
+        let repeated = queued.clone();
+
+        target.rebind(WindowId::from(3));
+
+        assert_eq!(queued.window_id(), WindowId::from(3));
+        assert_eq!(repeated.window_id(), WindowId::from(3));
     }
 }
 

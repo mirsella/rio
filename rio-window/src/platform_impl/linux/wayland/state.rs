@@ -23,6 +23,7 @@ use sctk::shm::slot::SlotPool;
 use sctk::shm::{Shm, ShmHandler};
 use sctk::subcompositor::SubcompositorState;
 
+use crate::platform_impl::wayland::data_device::ToplevelDragBackend;
 use crate::platform_impl::wayland::event_loop::sink::EventSink;
 use crate::platform_impl::wayland::output::MonitorHandle;
 use crate::platform_impl::wayland::seat::{
@@ -78,6 +79,9 @@ pub struct WinitState {
 
     /// Currently handled seats.
     pub seats: AHashMap<ObjectId, WinitSeatState>,
+
+    /// Shared data-device drag state.
+    pub(crate) toplevel_drag: Arc<Mutex<ToplevelDragBackend>>,
 
     /// Currently present cursor surfaces.
     pub pointer_surfaces: AHashMap<ObjectId, Arc<ThemedPointer<WinitPointerData>>>,
@@ -187,9 +191,16 @@ impl WinitState {
 
         let seat_state = SeatState::new(globals, queue_handle);
 
+        let toplevel_drag =
+            Arc::new(Mutex::new(ToplevelDragBackend::new(globals, queue_handle)));
+
         let mut seats = AHashMap::default();
         for seat in seat_state.seats() {
-            seats.insert(seat.id(), WinitSeatState::new());
+            toplevel_drag
+                .lock()
+                .unwrap()
+                .register_seat(queue_handle, &seat);
+            seats.insert(seat.id(), WinitSeatState::default());
         }
 
         let (viewporter_state, fractional_scaling_manager) =
@@ -224,6 +235,7 @@ impl WinitState {
             kwin_blur_manager: KWinBlurManager::new(globals, queue_handle).ok(),
 
             seats,
+            toplevel_drag,
             text_input_state: TextInputState::new(globals, queue_handle).ok(),
 
             relative_pointer: RelativePointerState::new(globals, queue_handle).ok(),

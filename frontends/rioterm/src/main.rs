@@ -23,6 +23,8 @@ mod renderer;
 mod router;
 mod scheduler;
 mod screen;
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+mod tab_drag;
 mod watcher;
 
 use clap::Parser;

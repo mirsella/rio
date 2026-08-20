@@ -7,6 +7,7 @@
 // which is licensed under MIT license.
 
 use crate::context::ContextManager;
+use crate::layout::TabId;
 use crate::renderer::helpers::spring::Spring;
 use rio_backend::config::navigation::Navigation;
 use rio_backend::event::{EventProxy, ProgressReport, ProgressState};
@@ -26,6 +27,8 @@ const DRAG_THRESHOLD: f32 = 4.0;
 const DRAG_ANIMATION_LENGTH: f32 = 0.15;
 const DRAG_MAX_DT: f32 = 0.05;
 const ISLAND_MARGIN_RIGHT: f32 = 8.0;
+const DROP_MARKER_WIDTH: f32 = 3.0;
+const DROP_MARKER_INSET_Y: f32 = 4.0;
 
 /// Color picker constants
 const PICKER_SWATCH_SIZE: f32 = 18.0;
@@ -72,8 +75,14 @@ const CLOSE_STROKE_WIDTH: f32 = 1.2;
 const INACTIVE_CUSTOM_MUTE: f32 = 0.55;
 
 struct TabDrag {
-    // Index of the dragged tab, follows the tab as it reorders.
-    tab_index: usize,
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    tab_id: TabId,
+    // Index of the dragged tab, follows the tab as it reorders. `None` is a
+    // whole-window drag.
+    tab_index: Option<usize>,
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    // Index at pointer press, before local browser-style reordering.
+    original_index: usize,
     // Mouse x at press (unscaled), for the drag threshold.
     press_x: f32,
     // press_x − tab_left_x, keeps the grab point under the cursor.
@@ -82,6 +91,21 @@ struct TabDrag {
     current_x: f32,
     // True once movement exceeded `DRAG_THRESHOLD`.
     started: bool,
+    // One-shot notification for the platform-level external drag handoff.
+    external_handoff_pending: bool,
+}
+
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ExternalDragHandoff {
+    Tab {
+        tab_id: TabId,
+        original_index: usize,
+        grab_offset: f32,
+    },
+    Window {
+        grab_offset: f32,
+    },
 }
 
 fn fit_title_to_width<'a>(
@@ -129,6 +153,8 @@ pub struct TabStripLayout {
     pub left_margin: f32,
     pub tab_width: f32,
     pub tabs_width: f32,
+    /// Full custom strip width, including gaps and space after capped tabs.
+    pub strip_width: f32,
 }
 
 /// Compute the tab strip layout from the physical window width.
@@ -144,7 +170,7 @@ pub fn tab_strip_layout(
     let left_margin = 0.0;
 
     let available_width =
-        (window_width / scale_factor) - ISLAND_MARGIN_RIGHT - left_margin;
+        ((window_width / scale_factor) - ISLAND_MARGIN_RIGHT - left_margin).max(0.0);
     let cap = if max_tab_width > 0.0 {
         max_tab_width
     } else {
@@ -155,7 +181,61 @@ pub fn tab_strip_layout(
         left_margin,
         tab_width,
         tabs_width: tab_width * num_tabs as f32,
+        strip_width: available_width,
     }
+}
+
+/// Pick the insertion slot nearest `x` from `0..=tab_count`.
+#[inline]
+pub fn tab_insertion_index(layout: &TabStripLayout, tab_count: usize, x: f32) -> usize {
+    if tab_count == 0 || layout.tab_width <= 0.0 {
+        return 0;
+    }
+
+    (((x - layout.left_margin) / layout.tab_width + 0.5).floor() as usize).min(tab_count)
+}
+
+/// Hit-test a physical point and return its insertion slot in the strip.
+#[inline]
+pub fn tab_drop_index(
+    layout: &TabStripLayout,
+    tab_count: usize,
+    x: f64,
+    y: f64,
+    scale_factor: f32,
+    tab_bar_height: f32,
+) -> Option<usize> {
+    if scale_factor <= 0.0 {
+        return None;
+    }
+    let x = x as f32 / scale_factor;
+    let y = y as f32 / scale_factor;
+    (x >= layout.left_margin
+        && x <= layout.left_margin + layout.strip_width
+        && y >= 0.0
+        && y <= tab_bar_height)
+        .then(|| tab_insertion_index(layout, tab_count, x))
+}
+
+#[inline]
+fn insertion_marker_rect(
+    layout: &TabStripLayout,
+    tab_count: usize,
+    index: usize,
+    tab_bar_height: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    if index > tab_count || layout.strip_width <= 0.0 {
+        return None;
+    }
+
+    let right = layout.left_margin + layout.strip_width;
+    let marker_x = layout.left_margin + index as f32 * layout.tab_width;
+    let x = (marker_x - DROP_MARKER_WIDTH / 2.0).clamp(
+        layout.left_margin,
+        (right - DROP_MARKER_WIDTH).max(layout.left_margin),
+    );
+    let height = (tab_bar_height - DROP_MARKER_INSET_Y * 2.0).max(0.0);
+    Some((x, DROP_MARKER_INSET_Y, DROP_MARKER_WIDTH, height))
 }
 
 struct IslandFills {
@@ -373,6 +453,10 @@ pub struct Island {
     /// Cursor is over the active island's close button — draws the
     /// hover backdrop. Updated on every cursor move by `Screen`.
     close_hover: bool,
+    /// External drop target insertion slot, independent of normal tab visibility.
+    drop_marker: Option<usize>,
+    /// Tab that is being moved into another window.
+    transfer_source: Option<usize>,
 }
 
 impl Island {
@@ -393,6 +477,60 @@ impl Island {
             slide_springs: FxHashMap::default(),
             last_anim_frame: Instant::now(),
             close_hover: false,
+            drop_marker: None,
+            transfer_source: None,
+        }
+    }
+
+    /// Set the external drop target marker. Returns whether it changed.
+    pub fn set_drop_marker(&mut self, index: usize) -> bool {
+        self.drop_marker.replace(index) != Some(index)
+    }
+
+    /// Clear the external drop target marker. Returns whether it changed.
+    pub fn clear_drop_marker(&mut self) -> bool {
+        self.drop_marker.take().is_some()
+    }
+
+    /// Mark the tab whose contents will be transferred. Returns whether it changed.
+    pub fn set_transfer_source(&mut self, index: usize) -> bool {
+        let changed = self.transfer_source != Some(index);
+        self.transfer_source = Some(index);
+        changed
+    }
+
+    /// Clear the transfer source marker. Returns whether it changed.
+    pub fn clear_transfer_source(&mut self) -> bool {
+        self.transfer_source.take().is_some()
+    }
+
+    #[inline]
+    fn render_drop_marker(
+        &self,
+        sugarloaf: &mut Sugarloaf,
+        layout: &TabStripLayout,
+        tab_count: usize,
+        tab_bar_height: f32,
+        color: [f32; 4],
+    ) {
+        let Some(index) = self.drop_marker else {
+            return;
+        };
+        debug_assert!(index <= tab_count, "drop marker index exceeds tab count");
+        if let Some((x, y, width, height)) =
+            insertion_marker_rect(layout, tab_count, index, tab_bar_height)
+        {
+            sugarloaf.rounded_rect(
+                None,
+                x,
+                y,
+                width,
+                height,
+                color,
+                0.0,
+                width / 2.0,
+                20,
+            );
         }
     }
 
@@ -447,13 +585,42 @@ impl Island {
 
     /// Arm a tab drag at mouse press. The drag only `started`s once the
     /// pointer moves past `DRAG_THRESHOLD`.
-    pub fn start_drag(&mut self, tab_index: usize, grab_offset: f32, x: f32) {
+    #[cfg_attr(
+        not(all(feature = "wayland", target_os = "linux")),
+        allow(unused_variables)
+    )]
+    pub fn start_drag(
+        &mut self,
+        tab_id: TabId,
+        tab_index: usize,
+        grab_offset: f32,
+        x: f32,
+    ) {
         self.drag = Some(TabDrag {
-            tab_index,
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            tab_id,
+            tab_index: Some(tab_index),
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            original_index: tab_index,
             press_x: x,
             grab_offset,
             current_x: x,
             started: false,
+            external_handoff_pending: false,
+        });
+    }
+
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    pub fn start_window_drag(&mut self, tab_id: TabId, grab_offset: f32, x: f32) {
+        self.drag = Some(TabDrag {
+            tab_id,
+            tab_index: None,
+            original_index: 0,
+            press_x: x,
+            grab_offset,
+            current_x: x,
+            started: false,
+            external_handoff_pending: false,
         });
     }
 
@@ -465,6 +632,7 @@ impl Island {
                 drag.current_x = x;
                 if !drag.started && (x - drag.press_x).abs() > DRAG_THRESHOLD {
                     drag.started = true;
+                    drag.external_handoff_pending = true;
                 }
                 drag.started
             }
@@ -479,10 +647,27 @@ impl Island {
 
     /// Index of the dragged tab, if a drag is active.
     pub fn drag_index(&self) -> Option<usize> {
-        self.drag
-            .as_ref()
-            .filter(|d| d.started)
-            .map(|d| d.tab_index)
+        self.drag.as_ref().filter(|d| d.started)?.tab_index
+    }
+
+    /// Take the one-shot external handoff emitted when an armed drag starts.
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    pub fn take_external_drag_handoff(&mut self) -> Option<ExternalDragHandoff> {
+        let drag = self
+            .drag
+            .as_mut()
+            .filter(|drag| drag.started && drag.external_handoff_pending)?;
+        drag.external_handoff_pending = false;
+        match drag.tab_index {
+            Some(_) => Some(ExternalDragHandoff::Tab {
+                tab_id: drag.tab_id,
+                original_index: drag.original_index,
+                grab_offset: drag.grab_offset,
+            }),
+            None => Some(ExternalDragHandoff::Window {
+                grab_offset: drag.grab_offset,
+            }),
+        }
     }
 
     /// Left edge of the floating (dragged) tab, clamped to the tabs
@@ -512,14 +697,15 @@ impl Island {
             self.drag_floating_left(layout),
             self.drag.as_ref().filter(|d| d.started),
         ) {
-            let slot_x = layout.left_margin + drag.tab_index as f32 * layout.tab_width;
-            let offset = floating_left - slot_x;
-            if offset.abs() > 0.01 {
-                let spring = self
-                    .slide_springs
-                    .entry(drag.tab_index)
-                    .or_insert_with(Spring::new);
-                spring.position = offset;
+            if let Some(tab_index) = drag.tab_index {
+                let slot_x = layout.left_margin + tab_index as f32 * layout.tab_width;
+                let offset = floating_left - slot_x;
+                if offset.abs() > 0.01 {
+                    self.slide_springs
+                        .entry(tab_index)
+                        .or_insert_with(Spring::new)
+                        .position = offset;
+                }
             }
         }
         self.drag = None;
@@ -561,7 +747,9 @@ impl Island {
             self.color_picker_tab = Some(Self::remap_index(picker, from, to));
         }
         if let Some(ref mut drag) = self.drag {
-            drag.tab_index = Self::remap_index(drag.tab_index, from, to);
+            if let Some(tab_index) = drag.tab_index {
+                drag.tab_index = Some(Self::remap_index(tab_index, from, to));
+            }
         }
 
         // Displaced tabs shifted one slot away from `from` toward `to`'s
@@ -609,6 +797,11 @@ impl Island {
             .collect();
         if let Some(picker) = self.color_picker_tab {
             self.color_picker_tab = Some(swap_key(picker));
+        }
+        if let Some(ref mut drag) = self.drag {
+            if let Some(tab_index) = drag.tab_index {
+                drag.tab_index = Some(swap_key(tab_index));
+            }
         }
 
         if a.abs_diff(b) == 1 {
@@ -725,39 +918,50 @@ impl Island {
         active_text_color: [f32; 4],
         bg_color: [f32; 4],
     ) {
-        let (window_width, _window_height, scale_factor) = dimensions;
+        let (window_width, _, scale_factor) = dimensions;
         let num_tabs = context_manager.len();
         let current_tab_index = context_manager.current_index();
+
+        let layout = tab_strip_layout(
+            window_width,
+            scale_factor,
+            num_tabs,
+            navigation.tab_max_width,
+        );
 
         // Immediate-mode: no cached ids to hide. If we early-return
         // without drawing, the tabs just don't appear this frame.
         if navigation.hide_if_single && num_tabs == 1 {
-            // No tab strip — drop any leftover drag/slide state so
-            // `needs_redraw` doesn't keep frames alive for invisible
-            // tabs.
-            self.drag = None;
-            self.slide_springs.clear();
+            if self.transfer_source == Some(0) {
+                sugarloaf.rect(
+                    None,
+                    0.0,
+                    0.0,
+                    window_width / scale_factor,
+                    navigation.tab_bar_height,
+                    [0.45, 0.45, 0.45, 0.28],
+                    0.0,
+                    0,
+                );
+            }
+            self.render_drop_marker(
+                sugarloaf,
+                &layout,
+                num_tabs,
+                navigation.tab_bar_height,
+                active_text_color,
+            );
             self.render_progress_bar(sugarloaf, window_width, scale_factor, 0.0);
             return;
         }
 
-        // A lone tab draws as a centred title with no island, and cannot be
-        // reordered. A drag can only start with two or more tabs, but one can
-        // outlive the second tab (its shell exits mid-drag), and that would
-        // float an island where the title belongs.
-        if num_tabs == 1 {
-            self.drag = None;
-            self.slide_springs.clear();
-        }
-
         // A reorder that didn't come from this drag (tab closed via
-        // shell exit, keyboard move) breaks the drag.tab_index ==
-        // current_index invariant — drop the drag instead of floating
-        // a phantom tab over the wrong slot.
+        // shell exit, keyboard move) breaks the dragged-tab/current-index
+        // invariant. Whole-window drags have no dragged tab to validate.
         if self
             .drag
             .as_ref()
-            .is_some_and(|d| d.tab_index != current_tab_index)
+            .is_some_and(|d| d.tab_index.is_some_and(|i| i != current_tab_index))
         {
             self.drag = None;
         }
@@ -773,12 +977,6 @@ impl Island {
         self.slide_springs
             .retain(|_, s| s.update(dt, DRAG_ANIMATION_LENGTH));
 
-        let layout = tab_strip_layout(
-            window_width,
-            scale_factor,
-            num_tabs,
-            navigation.tab_max_width,
-        );
         let TabStripLayout {
             left_margin,
             tab_width,
@@ -850,7 +1048,7 @@ impl Island {
                 navigation.tab_font_size,
             );
 
-            let text_color = if single {
+            let mut text_color = if single {
                 match context_manager.custom_color(tab_index) {
                     Some(mut custom) => {
                         custom[3] = 1.0;
@@ -863,6 +1061,9 @@ impl Island {
             } else {
                 inactive_text_color
             };
+            if self.transfer_source == Some(tab_index) {
+                text_color[3] *= 0.45;
+            }
 
             let title_opts = DrawOpts {
                 font_size: navigation.tab_font_size,
@@ -907,18 +1108,22 @@ impl Island {
             // bleach custom colors to pastel on light themes, so the
             // hierarchy is carried by the mute instead.
             let (ix, iy, iw, ih, radius) = island_rect(tab_x, tab_width, navigation);
-            let fill = match context_manager.custom_color(tab_index) {
-                Some(mut custom) => {
-                    if !is_active {
-                        custom[3] *= INACTIVE_CUSTOM_MUTE;
+            let fill = if self.transfer_source == Some(tab_index) {
+                [0.45, 0.45, 0.45, 0.35]
+            } else {
+                match context_manager.custom_color(tab_index) {
+                    Some(mut custom) => {
+                        if !is_active {
+                            custom[3] *= INACTIVE_CUSTOM_MUTE;
+                        }
+                        custom
                     }
-                    custom
-                }
-                None => {
-                    if is_active {
-                        fills.active
-                    } else {
-                        fills.inactive
+                    None => {
+                        if is_active {
+                            fills.active
+                        } else {
+                            fills.inactive
+                        }
                     }
                 }
             };
@@ -1055,6 +1260,13 @@ impl Island {
             }
         }
 
+        self.render_drop_marker(
+            sugarloaf,
+            &layout,
+            num_tabs,
+            navigation.tab_bar_height,
+            active_text_color,
+        );
         // Render the progress bar below the island
         self.render_progress_bar(
             sugarloaf,
@@ -1836,6 +2048,112 @@ mod tests {
     }
 
     #[test]
+    fn empty_strip_accepts_the_band_as_slot_zero() {
+        let layout = tab_strip_layout(800.0, 1.0, 0, 180.0);
+        let x = layout.left_margin + layout.strip_width / 2.0;
+        assert_eq!(
+            tab_drop_index(&layout, 0, x as f64, 10.0, 1.0, 32.0),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn single_and_multi_strips_offer_every_insertion_slot() {
+        let single = tab_strip_layout(208.0, 1.0, 1, 0.0);
+        assert_eq!(tab_insertion_index(&single, 1, single.left_margin), 0);
+        assert_eq!(
+            tab_insertion_index(&single, 1, single.left_margin + single.tab_width),
+            1
+        );
+
+        let multi = tab_strip_layout(308.0, 1.0, 3, 0.0);
+        for index in 0..=3 {
+            let x = multi.left_margin + index as f32 * multi.tab_width;
+            assert_eq!(tab_insertion_index(&multi, 3, x), index);
+        }
+    }
+
+    #[test]
+    fn capped_strip_gaps_and_empty_right_space_are_drop_targets() {
+        let layout = tab_strip_layout(1000.0, 1.0, 2, 100.0);
+        assert_eq!(layout.tab_width, 100.0);
+        assert!(layout.strip_width > layout.tabs_width);
+
+        // The visual gap around the boundary between the two islands belongs
+        // to insertion slot 1 rather than falling through to window chrome.
+        let gap_center = layout.left_margin + layout.tab_width;
+        assert_eq!(tab_insertion_index(&layout, 2, gap_center - 1.0), 1);
+        assert_eq!(tab_insertion_index(&layout, 2, gap_center + 1.0), 1);
+
+        // Space after max-width tabs remains part of the custom strip and
+        // appends at slot 2. Only the reserved right margin is outside.
+        let right_space = layout.left_margin + layout.strip_width - 1.0;
+        assert_eq!(
+            tab_drop_index(&layout, 2, right_space as f64, 10.0, 1.0, 32.0),
+            Some(2)
+        );
+        assert_eq!(
+            tab_drop_index(
+                &layout,
+                2,
+                (layout.left_margin + layout.strip_width + 1.0) as f64,
+                10.0,
+                1.0,
+                32.0,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn drop_hit_test_converts_physical_coordinates_by_scale() {
+        let layout = tab_strip_layout(1600.0, 2.0, 2, 180.0);
+        let logical_x = layout.left_margin + layout.strip_width - 1.0;
+        assert_eq!(
+            tab_drop_index(&layout, 2, (logical_x * 2.0) as f64, 40.0, 2.0, 32.0,),
+            Some(2)
+        );
+        assert_eq!(
+            tab_drop_index(&layout, 2, 10.0, 66.0, 2.0, 32.0),
+            None,
+            "point below the physical-height band must miss"
+        );
+    }
+
+    #[test]
+    fn hidden_single_still_has_marker_geometry() {
+        let layout = tab_strip_layout(800.0, 1.0, 1, 180.0);
+        let mut island = test_island();
+        assert!(island.set_drop_marker(1));
+        assert_eq!(island.drop_marker, Some(1));
+
+        let marker = insertion_marker_rect(&layout, 1, 1, 32.0);
+        assert!(
+            marker.is_some(),
+            "marker geometry must not depend on tab visibility"
+        );
+        let (x, y, width, height) = marker.unwrap();
+        assert_eq!(x + width / 2.0, layout.left_margin + layout.tab_width);
+        assert_eq!((y, width, height), (4.0, 3.0, 24.0));
+    }
+
+    #[test]
+    fn drop_marker_state_reports_changes_and_clears() {
+        let mut island = test_island();
+        assert!(island.set_drop_marker(0));
+        assert!(!island.set_drop_marker(0));
+        assert!(island.set_drop_marker(1));
+        assert!(!island.set_drop_marker(1));
+        assert!(island.clear_drop_marker());
+        assert_eq!(island.drop_marker, None);
+        assert!(!island.clear_drop_marker());
+        assert!(island.set_transfer_source(0));
+        assert!(!island.set_transfer_source(0));
+        assert!(island.clear_transfer_source());
+        assert!(!island.clear_transfer_source());
+    }
+
+    #[test]
     fn remap_tab_move_forward_rotates_indices() {
         // Move tab 1 → 3: tabs 2 and 3 shift left by one.
         assert_eq!(Island::remap_index(1, 1, 3), 3);
@@ -1876,7 +2194,7 @@ mod tests {
     #[test]
     fn drag_threshold_gates_start() {
         let mut island = test_island();
-        island.start_drag(0, 10.0, 50.0);
+        island.start_drag(TabId::for_test(1), 0, 10.0, 50.0);
         assert!(island.is_dragging());
         assert_eq!(island.drag_index(), None, "not started below threshold");
         assert!(!island.update_drag(52.0));
@@ -1886,11 +2204,60 @@ mod tests {
         assert!(!island.is_dragging());
     }
 
+    #[test]
+    fn insertion_markers_stay_centered_inside_strip_edges() {
+        let layout = tab_strip_layout(308.0, 1.0, 3, 0.0);
+        let first = insertion_marker_rect(&layout, 3, 0, 32.0).unwrap();
+        let last = insertion_marker_rect(&layout, 3, 3, 32.0).unwrap();
+        assert_eq!(first.0 + first.2 / 2.0, layout.left_margin + first.2 / 2.0);
+        assert_eq!(
+            last.0 + last.2 / 2.0,
+            layout.left_margin + layout.strip_width - last.2 / 2.0
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    fn drag_threshold_emits_one_external_handoff() {
+        let mut island = test_island();
+        island.start_drag(TabId::for_test(7), 2, 10.0, 50.0);
+        island.update_drag(54.0);
+        assert_eq!(island.take_external_drag_handoff(), None);
+
+        island.update_drag(54.1);
+        island.remap_tab_move(2, 1, 100.0);
+        assert_eq!(
+            island.take_external_drag_handoff(),
+            Some(ExternalDragHandoff::Tab {
+                tab_id: TabId::for_test(7),
+                original_index: 2,
+                grab_offset: 10.0,
+            })
+        );
+        assert_eq!(island.take_external_drag_handoff(), None);
+        assert!(island.update_drag(80.0), "local drag remains active");
+        assert_eq!(island.take_external_drag_handoff(), None);
+    }
+
+    #[test]
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    fn window_drag_emits_a_window_handoff() {
+        let mut island = test_island();
+        island.start_window_drag(TabId::for_test(7), 10.0, 50.0);
+        island.update_drag(60.0);
+        assert_eq!(island.drag_index(), None);
+        assert_eq!(
+            island.take_external_drag_handoff(),
+            Some(ExternalDragHandoff::Window { grab_offset: 10.0 })
+        );
+    }
+
     fn test_layout() -> TabStripLayout {
         TabStripLayout {
             left_margin: 0.0,
             tab_width: 100.0,
             tabs_width: 400.0,
+            strip_width: 400.0,
         }
     }
 
@@ -1903,6 +2270,7 @@ mod tests {
             left_margin: 0.0,
             tab_width: 180.0,
             tabs_width: 360.0,
+            strip_width: 360.0,
         };
         let cx = close_button_center_x(&layout, 1, &navigation).unwrap();
         assert_eq!(
@@ -1919,6 +2287,7 @@ mod tests {
             left_margin: 0.0,
             tab_width: 60.0,
             tabs_width: 600.0,
+            strip_width: 600.0,
         };
         assert_eq!(close_button_center_x(&narrow, 3, &navigation), None);
     }
@@ -1933,6 +2302,7 @@ mod tests {
             left_margin: 0.0,
             tab_width: 180.0,
             tabs_width: 360.0,
+            strip_width: 360.0,
         };
         let cx = close_button_center_x(&layout, 0, &Navigation::default()).unwrap();
         let title_max_right = layout.tab_width - TAB_PADDING_X;
@@ -1944,7 +2314,7 @@ mod tests {
         let mut island = test_island();
         // Tab 0 grabbed 10px from its left edge, tabs region spans
         // 0..400 with 100-wide slots.
-        island.start_drag(0, 10.0, 50.0);
+        island.start_drag(TabId::for_test(1), 0, 10.0, 50.0);
         island.update_drag(200.0); // started
         let center = island.drag_center(&test_layout()).unwrap();
         assert_eq!(center, 190.0 + 50.0);
@@ -1961,7 +2331,7 @@ mod tests {
     #[test]
     fn end_drag_seeds_settle_spring() {
         let mut island = test_island();
-        island.start_drag(2, 0.0, 200.0);
+        island.start_drag(TabId::for_test(1), 2, 0.0, 200.0);
         island.update_drag(250.0); // floating left = 250, slot x = 200
         island.end_drag(&test_layout());
         assert!(!island.is_dragging());

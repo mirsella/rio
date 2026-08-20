@@ -12,7 +12,7 @@ use crate::sugarloaf::Handle;
 
 pub use rio_graphics::{
     atlas_image_key, kitty_image_key, ColorType, Graphic, GraphicData, GraphicId,
-    GraphicOverlay, ResizeCommand, ResizeParameter, MAX_GRAPHIC_DIMENSIONS,
+    GraphicKey, GraphicOverlay, ResizeCommand, ResizeParameter, MAX_GRAPHIC_DIMENSIONS,
 };
 
 pub struct GraphicDataEntry {

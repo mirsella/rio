@@ -126,3 +126,27 @@ impl Scheduler {
         self.timers.retain(|timer| timer.id.id != id);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Timer, TimerId, Topic};
+    use crate::event::{EventPayload, RioEvent, RioEventType, WindowId, WindowTarget};
+    use std::time::Instant;
+
+    #[test]
+    fn repeated_timer_payload_keeps_dynamic_target() {
+        let target = WindowTarget::dynamic(WindowId::from(1));
+        let timer = Timer {
+            deadline: Instant::now(),
+            event: EventPayload::new(RioEventType::Rio(RioEvent::Render), target.clone()),
+            id: TimerId::new(Topic::Render, 1),
+            interval: None,
+        };
+        let repeated = timer.event.clone();
+
+        target.rebind(WindowId::from(2));
+
+        assert_eq!(timer.event.window_id(), WindowId::from(2));
+        assert_eq!(repeated.window_id(), WindowId::from(2));
+    }
+}

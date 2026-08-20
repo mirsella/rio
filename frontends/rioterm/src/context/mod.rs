@@ -8,7 +8,7 @@ use crate::context::title::{
 use crate::event::sync::FairMutex;
 use crate::event::{Msg, RioEvent};
 use crate::ime::Ime;
-pub use crate::layout::{ContextDimension, ContextGrid};
+pub use crate::layout::{ContextDimension, ContextGrid, TabId};
 use crate::messenger::Messenger;
 use crate::performer::{self, Machine};
 use renderable::Cursor;
@@ -20,7 +20,7 @@ use smallvec::{smallvec, SmallVec};
 use rio_backend::crosswords::{Crosswords, MIN_COLUMNS, MIN_LINES};
 use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
 use rio_backend::event::EventListener;
-use rio_backend::event::WindowId;
+use rio_backend::event::{WindowId, WindowTarget};
 use rio_backend::selection::SelectionRange;
 use rio_backend::sugarloaf::{font::SugarloafFont, Rect, Sugarloaf, SugarloafErrors};
 use std::error::Error;
@@ -47,6 +47,7 @@ use teletypewriter::{create_pty_with_fork, create_pty_with_spawn};
 
 pub struct Context<T: EventListener> {
     pub route_id: usize,
+    pub window_target: WindowTarget,
     pub terminal: Arc<FairMutex<Crosswords<T>>>,
     pub renderable_content: RenderableContent,
     pub messenger: Messenger,
@@ -67,6 +68,12 @@ impl<T: rio_backend::event::EventListener> Drop for Context<T> {
 }
 
 impl<T: EventListener> Context<T> {
+    /// Reassign this context and all of its queued producer events to a window.
+    pub fn rebind_window(&mut self, window_id: WindowId) {
+        self.window_target.rebind(window_id);
+        self.terminal.lock().window_id = window_id;
+    }
+
     fn foreground_process_name(&self) -> Option<String> {
         #[cfg(not(target_os = "windows"))]
         return self.pty.as_ref().map(|(main_fd, shell_pid)| {
@@ -161,8 +168,6 @@ const DEFAULT_CONTEXT_CAPACITY: usize = 28;
 pub struct ContextManager<T: EventListener> {
     contexts: SmallVec<[ContextGrid<T>; DEFAULT_CONTEXT_CAPACITY]>,
     current_index: usize,
-    current_route: usize,
-    #[allow(unused)]
     capacity: usize,
     event_proxy: T,
     window_id: WindowId,
@@ -170,13 +175,41 @@ pub struct ContextManager<T: EventListener> {
     last_title_update: Option<Instant>,
 }
 
-pub fn create_dead_context<T: rio_backend::event::EventListener>(
+/// Ownership bundle for moving a complete grid and all of its split routes.
+pub struct GridTransfer<T: EventListener> {
+    route_ids: Vec<usize>,
+    grid: Box<ContextGrid<T>>,
+}
+
+impl<T: EventListener> GridTransfer<T> {
+    fn new(grid: ContextGrid<T>) -> Self {
+        Self {
+            route_ids: grid.route_ids(),
+            grid: Box::new(grid),
+        }
+    }
+
+    pub fn id(&self) -> TabId {
+        self.grid.id()
+    }
+
+    pub fn route_ids(&self) -> &[usize] {
+        &self.route_ids
+    }
+}
+
+pub fn create_dead_context<T>(
     event_proxy: T,
     window_id: WindowId,
     route_id: usize,
     rich_text_id: usize,
     dimension: ContextDimension,
-) -> Context<T> {
+) -> Context<T>
+where
+    T: rio_backend::event::EventListener + Clone,
+{
+    let window_target = WindowTarget::dynamic(window_id);
+    let event_proxy = event_proxy.with_window_target(window_target.clone());
     let terminal = Crosswords::new(
         dimension,
         CursorShape::Block,
@@ -191,6 +224,7 @@ pub fn create_dead_context<T: rio_backend::event::EventListener>(
 
     Context {
         route_id,
+        window_target,
         #[cfg(not(target_os = "windows"))]
         pty: None,
         messenger: Messenger::new(sender),
@@ -229,6 +263,10 @@ pub fn create_mock_context<
 }
 
 impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
+    fn next_route_id() -> usize {
+        ROUTE_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
+    }
+
     #[inline]
     fn create_context(
         cursor_state: (&Cursor, bool),
@@ -238,8 +276,27 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         dimension: ContextDimension,
         config: &ContextManagerConfig,
     ) -> Result<Context<T>, Box<dyn Error>> {
-        let route_id = ROUTE_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
+        Self::create_context_with_route_id(
+            cursor_state,
+            event_proxy,
+            window_id,
+            rich_text_id,
+            dimension,
+            config,
+            Self::next_route_id(),
+        )
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn create_context_with_route_id(
+        cursor_state: (&Cursor, bool),
+        event_proxy: T,
+        window_id: WindowId,
+        rich_text_id: usize,
+        dimension: ContextDimension,
+        config: &ContextManagerConfig,
+        route_id: usize,
+    ) -> Result<Context<T>, Box<dyn Error>> {
         #[cfg(test)]
         if config.dead_pty {
             return Ok(create_dead_context(
@@ -250,6 +307,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 dimension,
             ));
         }
+
+        let window_target = WindowTarget::dynamic(window_id);
+        let event_proxy = event_proxy.with_window_target(window_target.clone());
 
         let cols: u16 = dimension.columns.try_into().unwrap_or(MIN_COLUMNS as u16);
         let rows: u16 = dimension.lines.try_into().unwrap_or(MIN_LINES as u16);
@@ -349,6 +409,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
         Ok(Context {
             route_id,
+            window_target,
             #[cfg(not(target_os = "windows"))]
             pty: Some((main_fd, shell_pid)),
             messenger,
@@ -368,20 +429,21 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         cursor_state: (&Cursor, bool),
         event_proxy: T,
         window_id: WindowId,
-        route_id: usize,
         rich_text_id: usize,
         ctx_config: ContextManagerConfig,
         size: ContextDimension,
         scaled_margin: Margin,
         sugarloaf_errors: Option<SugarloafErrors>,
     ) -> Result<Self, Box<dyn Error>> {
-        let initial_context = match ContextManager::create_context(
+        let route_id = Self::next_route_id();
+        let initial_context = match ContextManager::create_context_with_route_id(
             cursor_state,
             event_proxy.clone(),
             window_id,
             rich_text_id,
             size,
             &ctx_config,
+            route_id,
         ) {
             Ok(context) => context,
             Err(err_message) => {
@@ -401,7 +463,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     event_proxy.clone(),
                     window_id,
                     route_id,
-                    0,
+                    rich_text_id,
                     ContextDimension::default(),
                 )
             }
@@ -424,7 +486,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
         Ok(ContextManager {
             current_index: 0,
-            current_route: 0,
             contexts: smallvec![ContextGrid::new(
                 initial_context,
                 scaled_margin,
@@ -462,7 +523,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
         Ok(ContextManager {
             current_index: 0,
-            current_route: 0,
             contexts: smallvec![ContextGrid::new(
                 initial_context,
                 Margin::default(),
@@ -478,14 +538,33 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         })
     }
 
+    /// Construct a manager from a transfer and bind every split to its new owner.
+    #[allow(dead_code)]
+    pub fn from_transfer(
+        transfer: GridTransfer<T>,
+        event_proxy: T,
+        window_id: WindowId,
+        config: ContextManagerConfig,
+    ) -> Self {
+        let mut grid = *transfer.grid;
+        grid.rebind_window(window_id);
+        Self {
+            contexts: smallvec![grid],
+            current_index: 0,
+            capacity: DEFAULT_CONTEXT_CAPACITY,
+            event_proxy,
+            window_id,
+            config,
+            last_title_update: None,
+        }
+    }
+
     #[inline]
     pub fn should_close_context_manager(
         &mut self,
         route_id: usize,
         sugarloaf: &mut Sugarloaf,
     ) -> bool {
-        let requires_change_route = self.current_route == route_id;
-
         // should_close_context_manager is only called when terminal.exit()
         // is triggered. The terminal.exit() happens for any drop on context
         // by tab removal or if the Pty is exited (e.g: exit/control+d)
@@ -496,41 +575,20 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         // However if the tab is killed by Pty and not a tab action then
         // it means we need to clean the context with the specified route_id.
         // If there's no context then should return true and kill the window.
+        let Some(index_to_remove) = self.grid_index_for_route(route_id) else {
+            return self.contexts.is_empty();
+        };
+
+        if self.contexts[index_to_remove].len() > 1 {
+            self.contexts[index_to_remove].remove_route(route_id, sugarloaf);
+            return false;
+        }
+
+        self.contexts[index_to_remove].remove_all_rich_text(sugarloaf);
+        self.contexts.remove(index_to_remove);
+        self.update_selection_after_grid_removal(index_to_remove);
         if !self.contexts.is_empty() {
-            // In case Grid has more than one item
-            if self.current_grid().len() > 1 {
-                if self.current().route_id == route_id {
-                    self.remove_current_grid(sugarloaf);
-                }
-
-                return false;
-            }
-
-            // In case Grid has only one item
-            if let Some(index_to_remove) = self
-                .contexts
-                .iter()
-                .position(|ctx| ctx.current().route_id == route_id)
-            {
-                let mut should_set_current = false;
-                if requires_change_route {
-                    if index_to_remove > 1 {
-                        self.set_current(index_to_remove - 1);
-                    } else {
-                        should_set_current = true;
-                    }
-                }
-                self.contexts[index_to_remove].remove_all_rich_text(sugarloaf);
-                self.contexts.remove(index_to_remove);
-
-                if should_set_current {
-                    self.set_current(0);
-                }
-
-                if !self.contexts.is_empty() {
-                    self.keep_only_active_context_visible(sugarloaf);
-                }
-            };
+            self.keep_only_active_context_visible(sugarloaf);
         }
 
         self.contexts.is_empty()
@@ -539,7 +597,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn request_render(&mut self) {
         self.event_proxy
-            .send_event(RioEvent::RenderRoute(self.current_route), self.window_id);
+            .send_event(RioEvent::RenderRoute(self.current_route()), self.window_id);
     }
 
     #[inline]
@@ -547,7 +605,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         // PrepareRender will force a render for any route that is focused on window
         // PrepareRenderOnRoute only call render function for specific route ids.
         self.event_proxy.send_event(
-            RioEvent::BlinkCursor(scheduled_time, self.current_route),
+            RioEvent::BlinkCursor(scheduled_time, self.current_route()),
             self.window_id,
         );
     }
@@ -555,7 +613,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn schedule_render_on_route(&mut self, millis: u64) {
         self.event_proxy.send_event(
-            RioEvent::PrepareRenderOnRoute(millis, self.current_route),
+            RioEvent::PrepareRenderOnRoute(millis, self.current_route()),
             self.window_id,
         );
     }
@@ -582,18 +640,36 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
+    pub fn move_current_tab_to_new_window(&self) {
+        self.event_proxy
+            .send_event(RioEvent::MoveCurrentTabToNewWindow, self.window_id);
+    }
+
+    #[inline]
+    pub fn merge_window(&self) {
+        self.event_proxy
+            .send_event(RioEvent::MergeWindow, self.window_id);
+    }
+
+    #[inline]
     pub fn toggle_quake(&self) {
         self.event_proxy
             .send_event(RioEvent::ToggleQuake, self.window_id);
     }
 
     #[inline]
-    pub fn close_unfocused_tabs(&mut self) {
+    pub fn close_unfocused_tabs(&mut self) -> Vec<usize> {
         let current_route_id = self.current().route_id;
+        let removed = self
+            .contexts
+            .iter()
+            .filter(|grid| grid.current().route_id != current_route_id)
+            .flat_map(ContextGrid::route_ids)
+            .collect();
         self.contexts
             .retain(|ctx| ctx.current().route_id == current_route_id);
-        self.current_route = self.contexts[0].current().route_id;
         self.set_current(0);
+        removed
     }
 
     #[inline]
@@ -604,19 +680,16 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn select_next_split(&mut self) {
         self.contexts[self.current_index].select_next_split();
-        self.current_route = self.current().route_id;
     }
 
     #[inline]
     pub fn select_prev_split(&mut self) {
         self.contexts[self.current_index].select_prev_split();
-        self.current_route = self.current().route_id;
     }
 
     #[inline]
     pub fn switch_to_next_split_or_tab(&mut self) {
         if self.contexts[self.current_index].select_next_split_no_loop() {
-            self.current_route = self.current().route_id;
             return;
         }
         self.switch_to_next();
@@ -625,13 +698,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if let Some(root) = current_tab.root {
             current_tab.current = root;
         }
-        self.current_route = self.current().route_id;
     }
 
     #[inline]
     pub fn switch_to_prev_split_or_tab(&mut self) {
         if self.contexts[self.current_index].select_prev_split_no_loop() {
-            self.current_route = self.current().route_id;
             return;
         }
         self.switch_to_prev();
@@ -641,27 +712,26 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if let Some(&last_key) = ordered_keys.last() {
             current_tab.current = last_key;
         }
-        self.current_route = self.current().route_id;
     }
 
     #[inline]
-    pub fn move_divider_up(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        self.contexts[self.current_index].move_divider_up(amount, sugarloaf)
+    pub fn move_divider_up(&mut self, amount: f32) -> bool {
+        self.contexts[self.current_index].move_divider_up(amount)
     }
 
     #[inline]
-    pub fn move_divider_down(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        self.contexts[self.current_index].move_divider_down(amount, sugarloaf)
+    pub fn move_divider_down(&mut self, amount: f32) -> bool {
+        self.contexts[self.current_index].move_divider_down(amount)
     }
 
     #[inline]
-    pub fn move_divider_left(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        self.contexts[self.current_index].move_divider_left(amount, sugarloaf)
+    pub fn move_divider_left(&mut self, amount: f32) -> bool {
+        self.contexts[self.current_index].move_divider_left(amount)
     }
 
     #[inline]
-    pub fn move_divider_right(&mut self, amount: f32, sugarloaf: &mut Sugarloaf) -> bool {
-        self.contexts[self.current_index].move_divider_right(amount, sugarloaf)
+    pub fn move_divider_right(&mut self, amount: f32) -> bool {
+        self.contexts[self.current_index].move_divider_right(amount)
     }
 
     #[inline]
@@ -712,13 +782,19 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn select_last_tab(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+
         if self.config.is_native {
             self.event_proxy
                 .send_event(RioEvent::SelectNativeTabLast, self.window_id);
             return;
         }
 
-        self.set_current(self.contexts.len() - 1);
+        if let Some(last) = self.contexts.len().checked_sub(1) {
+            self.set_current(last);
+        }
     }
 
     #[inline]
@@ -728,13 +804,21 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn select_route_from_current_grid(&mut self) {
-        self.current_route = self.current().route_id;
+    pub fn len(&self) -> usize {
+        self.contexts.len()
+    }
+
+    pub fn tab_index(&self, tab_id: TabId) -> Option<usize> {
+        self.contexts.iter().position(|grid| grid.id() == tab_id)
+    }
+
+    pub fn tab_id_at(&self, index: usize) -> Option<TabId> {
+        self.contexts.get(index).map(|grid| grid.id())
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
-        self.contexts.len()
+    pub fn is_empty(&self) -> bool {
+        self.contexts.is_empty()
     }
 
     #[inline]
@@ -769,18 +853,17 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn resize_all_grids(
-        &mut self,
-        width: f32,
-        height: f32,
-        sugarloaf: &mut Sugarloaf,
-    ) {
+    pub fn resize_all_grids(&mut self, width: f32, height: f32) {
         for context_grid in self.contexts.iter_mut() {
-            context_grid.resize(width, height, sugarloaf);
+            context_grid.resize(width, height);
         }
     }
 
     pub fn update_titles(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+
         let interval_time = Duration::from_secs(2);
         if self
             .last_title_update
@@ -816,6 +899,17 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             .find_map(|grid| grid.get_by_route_id(route_id).map(|item| &mut item.val))
     }
 
+    fn grid_index_for_route(&self, route_id: usize) -> Option<usize> {
+        self.contexts
+            .iter()
+            .position(|grid| grid.route_ids().contains(&route_id))
+    }
+
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    pub fn contains_route_id(&self, route_id: usize) -> bool {
+        self.grid_index_for_route(route_id).is_some()
+    }
+
     #[inline]
     pub fn contexts_mut(
         &mut self,
@@ -823,35 +917,115 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         &mut self.contexts
     }
 
-    #[inline]
-    pub fn current_grid_len(&self) -> usize {
-        self.contexts[self.current_index].len()
+    fn mark_all_full_damage(&mut self) {
+        for grid in &mut self.contexts {
+            for context in grid.contexts_mut().values_mut() {
+                context
+                    .context_mut()
+                    .renderable_content
+                    .pending_update
+                    .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+            }
+        }
+    }
+
+    fn update_selection_after_grid_removal(&mut self, removed_index: usize) {
+        if self.contexts.is_empty() {
+            self.current_index = 0;
+            return;
+        }
+
+        if removed_index < self.current_index {
+            self.current_index -= 1;
+        } else if removed_index == self.current_index {
+            self.current_index = removed_index.min(self.contexts.len() - 1);
+        }
+    }
+
+    /// Remove a complete grid into a rollback-capable ownership bundle.
+    pub fn extract_grid(&mut self, index: usize) -> Option<GridTransfer<T>> {
+        if index >= self.contexts.len() {
+            return None;
+        }
+
+        let grid = self.contexts.remove(index);
+        self.update_selection_after_grid_removal(index);
+        self.mark_all_full_damage();
+
+        Some(GridTransfer::new(grid))
+    }
+
+    /// Insert and activate a transferred grid at `index`.
+    ///
+    /// Capacity and index failures return the exact, unchanged transfer bundle.
+    pub fn insert_grid(
+        &mut self,
+        index: usize,
+        mut transfer: GridTransfer<T>,
+    ) -> Result<(), GridTransfer<T>> {
+        if self.contexts.len() >= self.capacity || index > self.contexts.len() {
+            return Err(transfer);
+        }
+
+        transfer.grid.rebind_window(self.window_id);
+        self.contexts.insert(index, *transfer.grid);
+        self.current_index = index;
+        self.mark_all_full_damage();
+        Ok(())
+    }
+
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    pub fn can_insert_grid(&self, index: usize) -> bool {
+        self.can_insert_grids(index, 1)
+    }
+
+    pub fn can_insert_grids(&self, index: usize, count: usize) -> bool {
+        index <= self.contexts.len()
+            && count <= self.capacity.saturating_sub(self.contexts.len())
+    }
+
+    pub fn route_ids(&self) -> Vec<usize> {
+        self.contexts
+            .iter()
+            .flat_map(ContextGrid::route_ids)
+            .collect()
     }
 
     #[inline]
     pub fn remove_current_grid(&mut self, sugarloaf: &mut Sugarloaf) {
-        self.contexts[self.current_index].remove_current(sugarloaf);
-        self.current_route = self.contexts[self.current_index].current().route_id;
+        if let Some(grid) = self.contexts.get_mut(self.current_index) {
+            grid.remove_current(sugarloaf);
+        }
     }
 
     #[inline]
     pub fn current_grid_mut(&mut self) -> &mut ContextGrid<T> {
-        &mut self.contexts[self.current_index]
+        self.contexts
+            .get_mut(self.current_index)
+            .expect("context manager has no current grid")
     }
 
     #[inline]
     pub fn current_grid(&self) -> &ContextGrid<T> {
-        &self.contexts[self.current_index]
+        self.current_grid_opt()
+            .expect("context manager has no current grid")
+    }
+
+    #[inline]
+    pub fn current_grid_opt(&self) -> Option<&ContextGrid<T>> {
+        self.contexts.get(self.current_index)
     }
 
     #[inline]
     pub fn get_panel_borders(&self) -> Vec<Rect> {
-        self.contexts[self.current_index].get_panel_borders()
+        self.current_grid_opt()
+            .map_or_else(Vec::new, ContextGrid::get_panel_borders)
     }
 
     #[inline]
     pub fn get_current_grid_scaled_margin(&self) -> rio_backend::config::layout::Margin {
-        self.contexts[self.current_index].get_scaled_margin()
+        self.current_grid_opt()
+            .map_or_else(Margin::default, ContextGrid::get_scaled_margin)
     }
 
     #[cfg(test)]
@@ -863,9 +1037,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     pub fn set_current(&mut self, context_id: usize) {
         if context_id < self.contexts.len() {
             self.current_index = context_id;
-            self.current_route = self.current().route_id;
+            let current = self.current();
             self.event_proxy.send_event(
-                RioEvent::Title(self.current_route, self.current().title.content.clone()),
+                RioEvent::Title(current.route_id, current.title.content.clone()),
                 self.window_id,
             );
         }
@@ -873,7 +1047,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn close_current_context(&mut self, sugarloaf: &mut Sugarloaf) {
-        if self.contexts.len() == 1 {
+        if self.contexts.len() <= 1 {
             // MacOS: Close last tab will work, leading to hide and
             // keep Rio running in background.
             #[cfg(target_os = "macos")]
@@ -910,21 +1084,26 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn current_route(&self) -> usize {
-        self.current_route
+        self.current_grid_opt()
+            .map_or(0, |grid| grid.current().route_id)
     }
 
     #[inline]
     pub fn current(&self) -> &Context<T> {
-        self.contexts[self.current_index].current()
+        self.current_grid().current()
     }
 
     #[inline]
     pub fn current_mut(&mut self) -> &mut Context<T> {
-        self.contexts[self.current_index].current_mut()
+        self.current_grid_mut().current_mut()
     }
 
     #[inline]
     pub fn switch_to_next(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+
         if self.config.is_native {
             self.event_proxy
                 .send_event(RioEvent::SelectNativeTabNext, self.window_id);
@@ -941,6 +1120,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn switch_to_prev(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+
         if self.config.is_native {
             self.event_proxy
                 .send_event(RioEvent::SelectNativeTabPrev, self.window_id);
@@ -997,12 +1180,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.set_current(target);
     }
 
-    pub fn split(
-        &mut self,
-        rich_text_id: usize,
-        split_down: bool,
-        sugarloaf: &mut Sugarloaf,
-    ) {
+    pub fn split(&mut self, rich_text_id: usize, split_down: bool) {
         let mut cloned_config = self.config.clone();
         cloned_config.working_dir = self.working_dir_for_new_context();
 
@@ -1018,14 +1196,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             &cloned_config,
         ) {
             Ok(new_context) => {
-                let new_route_id = new_context.route_id;
                 if split_down {
-                    self.contexts[self.current_index].split_down(new_context, sugarloaf);
+                    self.contexts[self.current_index].split_down(new_context);
                 } else {
-                    self.contexts[self.current_index].split_right(new_context, sugarloaf);
+                    self.contexts[self.current_index].split_right(new_context);
                 }
-
-                self.current_route = new_route_id;
             }
             Err(..) => {
                 tracing::error!("not able to create a new context");
@@ -1038,7 +1213,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         rich_text_id: usize,
         split_down: bool,
         config: rio_backend::config::Config,
-        sugarloaf: &mut Sugarloaf,
     ) {
         let (shell, working_dir) = process_open_url(
             config.shell.to_owned(),
@@ -1080,14 +1254,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             &context_manager_config,
         ) {
             Ok(new_context) => {
-                let new_route_id = new_context.route_id;
                 if split_down {
-                    self.contexts[self.current_index].split_down(new_context, sugarloaf);
+                    self.contexts[self.current_index].split_down(new_context);
                 } else {
-                    self.contexts[self.current_index].split_right(new_context, sugarloaf);
+                    self.contexts[self.current_index].split_right(new_context);
                 }
-
-                self.current_route = new_route_id;
             }
             Err(..) => {
                 tracing::error!("not able to create a new context");
@@ -1141,7 +1312,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     ));
                     if redirect {
                         self.current_index = last_index;
-                        self.current_route = self.current().route_id;
                     }
                 }
                 Err(..) => {
@@ -1166,29 +1336,17 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn keep_only_active_context_visible(&self, sugarloaf: &mut Sugarloaf) {
         for (idx, context) in self.contexts.iter().enumerate() {
-            // Skip the current tab
-            if idx == self.current_index {
-                context.set_all_rich_text_visibility(sugarloaf, true);
-                continue;
+            if idx != self.current_index {
+                context.remove_all_rich_text(sugarloaf);
             }
-
-            context.set_all_rich_text_visibility(sugarloaf, false);
         }
     }
 
     /// Switch visibility between two contexts (hide old, show new)
     #[inline]
-    pub fn switch_context_visibility(
-        &self,
-        sugarloaf: &mut Sugarloaf,
-        old_index: usize,
-        new_index: usize,
-    ) {
+    pub fn clear_context_overlays(&self, sugarloaf: &mut Sugarloaf, old_index: usize) {
         if let Some(old_context) = self.contexts.get(old_index) {
-            old_context.set_all_rich_text_visibility(sugarloaf, false);
-        }
-        if let Some(new_context) = self.contexts.get(new_index) {
-            new_context.set_all_rich_text_visibility(sugarloaf, true);
+            old_context.remove_all_rich_text(sugarloaf);
         }
     }
 }
@@ -1226,7 +1384,7 @@ pub fn process_open_url(
 #[cfg(test)]
 pub mod test {
     use super::*;
-    use crate::event::VoidListener;
+    use crate::event::{EventPayload, RioEventType, VoidListener};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
@@ -1279,6 +1437,7 @@ pub mod test {
             .get_by_route_id(hidden_route_id)
             .expect("hidden tab's route_id must still resolve via get_by_route_id");
         assert_eq!(found.route_id, hidden_route_id);
+        assert_eq!(context_manager.close_unfocused_tabs(), [hidden_route_id]);
     }
 
     #[test]
@@ -1383,6 +1542,274 @@ pub mod test {
         (0..cm.len())
             .map(|i| cm.title(i).unwrap().content.clone())
             .collect()
+    }
+
+    fn tab_ids(cm: &ContextManager<VoidListener>) -> Vec<TabId> {
+        cm.contexts.iter().map(ContextGrid::id).collect()
+    }
+
+    #[test]
+    fn tab_identity_is_unique_and_stable_across_reordering() {
+        let mut manager =
+            ContextManager::start_with_capacity(4, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        manager.add_context(false, 0);
+        manager.add_context(false, 0);
+
+        let original = tab_ids(&manager);
+        assert_eq!(original.len(), 3);
+        assert!(original.iter().all(|id| original
+            .iter()
+            .filter(|other| *other == id)
+            .count()
+            == 1));
+
+        manager.set_current(0);
+        manager.move_current_tab_to(2);
+        assert_eq!(tab_ids(&manager), [original[1], original[2], original[0]]);
+        assert_eq!(manager.current_grid().id(), original[0]);
+    }
+
+    #[test]
+    fn extraction_captures_the_whole_grid_and_all_split_routes() {
+        let mut manager =
+            ContextManager::start_with_capacity(4, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        manager.add_context(false, 0);
+        manager.add_context(false, 0);
+        for (index, title) in ["first", "second", "third"].iter().enumerate() {
+            set_tab_title(&mut manager, index, title);
+        }
+        manager.set_custom_title(1, Some("custom".into()));
+        manager.set_custom_color(1, Some([0.1, 0.2, 0.3, 1.0]));
+        manager.set_current(1);
+        let split_route = 1_000_000;
+        manager
+            .current_grid_mut()
+            .add_split_for_test(create_dead_context(
+                VoidListener {},
+                WindowId::from(0),
+                split_route,
+                99,
+                ContextDimension::default(),
+            ));
+        manager.current_mut().title.content = "active split".into();
+        let extracted_id = manager.current_grid().id();
+        let extracted_route = manager.current_route();
+        let expected_routes = manager.current_grid().route_ids();
+
+        let transfer = manager.extract_grid(1).unwrap();
+
+        assert_eq!(transfer.id(), extracted_id);
+        assert_eq!(transfer.route_ids(), expected_routes);
+        assert!(transfer.route_ids().contains(&split_route));
+        assert_eq!(transfer.grid.len(), 2);
+        assert_eq!(transfer.grid.current().route_id, extracted_route);
+        assert_eq!(transfer.grid.current().title.content, "active split");
+        assert_eq!(transfer.grid.custom_title.as_deref(), Some("custom"));
+        assert_eq!(transfer.grid.custom_color, Some([0.1, 0.2, 0.3, 1.0]));
+        assert_eq!(tab_titles(&manager), ["first", "third"]);
+        assert_eq!(manager.current_index(), 1);
+        assert_eq!(manager.current_route(), manager.current().route_id);
+    }
+
+    #[test]
+    fn hidden_split_route_resolves_its_grid_and_removal_keeps_current_tab() {
+        let window_id = WindowId::from(0);
+        let mut manager =
+            ContextManager::start_with_capacity(4, VoidListener {}, window_id).unwrap();
+        manager.add_context(false, 0);
+        manager.add_context(true, 0);
+        let selected_tab = manager.current_grid().id();
+        let hidden_split_route = 1_000_002;
+        manager.contexts[0].add_split_for_test(create_dead_context(
+            VoidListener {},
+            window_id,
+            hidden_split_route,
+            2,
+            ContextDimension::default(),
+        ));
+
+        let hidden_index = manager
+            .grid_index_for_route(hidden_split_route)
+            .expect("a hidden split route must resolve to its owning tab");
+        let removed = manager.extract_grid(hidden_index).unwrap();
+
+        assert!(removed.route_ids().contains(&hidden_split_route));
+        assert_eq!(manager.current_grid().id(), selected_tab);
+        assert_eq!(manager.current_index(), 1);
+        assert_eq!(manager.current_route(), manager.current().route_id);
+    }
+
+    #[test]
+    fn transfer_rebinds_queued_events_for_every_split() {
+        let old_window = WindowId::from(11);
+        let new_window = WindowId::from(22);
+        let mut source =
+            ContextManager::start_with_capacity(2, VoidListener {}, old_window).unwrap();
+        source
+            .current_grid_mut()
+            .add_split_for_test(create_dead_context(
+                VoidListener {},
+                old_window,
+                1_000_001,
+                1,
+                ContextDimension::default(),
+            ));
+        let routes = source.current_grid().route_ids();
+        let queued = EventPayload::new(
+            RioEventType::Rio(RioEvent::Render),
+            source.current().window_target.clone(),
+        );
+        let transfer = source.extract_grid(0).unwrap();
+
+        let mut destination =
+            ContextManager::start_with_capacity(2, VoidListener {}, new_window).unwrap();
+        destination
+            .insert_grid(1, transfer)
+            .unwrap_or_else(|_| panic!("destination should accept transfer"));
+
+        assert_eq!(queued.window_id(), new_window);
+        for route_id in routes {
+            let context = destination.get_by_route_id(route_id).unwrap();
+            assert_eq!(context.window_target.window_id(), new_window);
+            assert_eq!(context.terminal.lock().window_id, new_window);
+        }
+    }
+
+    #[test]
+    fn indexed_insert_preserves_order_and_activates_grid() {
+        let window_id = WindowId::from(0);
+        let mut source =
+            ContextManager::start_with_capacity(3, VoidListener {}, window_id).unwrap();
+        source.set_custom_title(0, Some("moved".into()));
+        let route = source.current_route();
+        let transfer = source.extract_grid(0).unwrap();
+        assert!(source.is_empty());
+        assert_eq!(source.current_route(), 0);
+
+        let mut destination =
+            ContextManager::start_with_capacity(3, VoidListener {}, window_id).unwrap();
+        destination.add_context(false, 0);
+        let previous_ids = tab_ids(&destination);
+        let moved_id = transfer.id();
+        destination
+            .insert_grid(1, transfer)
+            .unwrap_or_else(|_| panic!("transfer should fit"));
+
+        assert_eq!(
+            tab_ids(&destination),
+            [previous_ids[0], moved_id, previous_ids[1]]
+        );
+        assert_eq!(destination.current_index(), 1);
+        assert_eq!(destination.current_route(), route);
+        assert_eq!(destination.custom_title(1), Some("moved"));
+    }
+
+    #[test]
+    fn insert_failures_return_the_unchanged_transfer() {
+        let window_id = WindowId::from(0);
+        let mut source =
+            ContextManager::start_with_capacity(2, VoidListener {}, window_id).unwrap();
+        source.set_custom_title(0, Some("owned".into()));
+        source.set_custom_color(0, Some([1.0, 0.5, 0.0, 1.0]));
+        let transfer = source.extract_grid(0).unwrap();
+        let id = transfer.id();
+        let routes = transfer.route_ids().to_vec();
+
+        let mut full =
+            ContextManager::start_with_capacity(1, VoidListener {}, window_id).unwrap();
+        let returned = full
+            .insert_grid(1, transfer)
+            .expect_err("capacity must reject the insert");
+
+        assert_eq!(returned.id(), id);
+        assert_eq!(returned.route_ids(), routes);
+        assert_eq!(returned.grid.custom_title.as_deref(), Some("owned"));
+        assert_eq!(returned.grid.custom_color, Some([1.0, 0.5, 0.0, 1.0]));
+        assert_eq!(full.len(), 1);
+        assert_eq!(full.current_index(), 0);
+        assert_eq!(full.current_route(), full.current().route_id);
+
+        let mut room =
+            ContextManager::start_with_capacity(2, VoidListener {}, window_id).unwrap();
+        let returned = room
+            .insert_grid(2, returned)
+            .expect_err("out-of-bounds index must reject the insert");
+        assert_eq!(returned.id(), id);
+        assert_eq!(returned.route_ids(), routes);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn failed_initial_pty_preserves_allocated_route_id() {
+        let mut config = ContextManagerConfig {
+            dead_pty: false,
+            ..ContextManagerConfig::default()
+        };
+        config.shell.program = Some("/rio/does/not/exist".into());
+
+        let manager = ContextManager::start(
+            (&Cursor::default(), false),
+            VoidListener {},
+            WindowId::from(1),
+            7,
+            config,
+            ContextDimension::default(),
+            Margin::default(),
+            None,
+        )
+        .expect("failed PTY startup should create a dead fallback context");
+
+        assert_ne!(manager.current_route(), 0);
+        assert_eq!(manager.current().route_id, manager.current_route());
+        assert_eq!(manager.current().rich_text_id, 7);
+    }
+
+    #[test]
+    fn manager_from_transfer_preserves_identity_and_active_route() {
+        let window_id = WindowId::from(0);
+        let mut source =
+            ContextManager::start_with_capacity(2, VoidListener {}, window_id).unwrap();
+        source.set_custom_title(0, Some("detached".into()));
+        let transfer = source.extract_grid(0).unwrap();
+        let id = transfer.id();
+        let route = transfer.grid.current().route_id;
+
+        let manager = ContextManager::from_transfer(
+            transfer,
+            VoidListener {},
+            window_id,
+            ContextManagerConfig {
+                dead_pty: true,
+                ..ContextManagerConfig::default()
+            },
+        );
+
+        assert_eq!(manager.current_grid().id(), id);
+        assert_eq!(manager.current_route(), route);
+        assert_eq!(manager.custom_title(0), Some("detached"));
+    }
+
+    #[test]
+    fn transferred_grid_accepts_destination_window_geometry() {
+        let mut manager =
+            ContextManager::start_with_capacity(2, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        let margin = Margin::new(11.25, 2.5, 6.25, 3.75);
+        let grid = manager.current_grid_mut();
+
+        grid.width = 901.0;
+        grid.height = 607.0;
+        grid.update_scaled_margin(margin);
+        grid.update_scale(1.25);
+        for context in grid.contexts_mut().values_mut() {
+            context.context_mut().dimension.update_scale(1.25);
+        }
+
+        assert_eq!((grid.width, grid.height), (901.0, 607.0));
+        assert_eq!(grid.scaled_margin, margin);
+        assert_eq!(grid.current().dimension.dimension.scale, 1.25);
     }
 
     #[test]

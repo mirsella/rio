@@ -80,6 +80,8 @@ pub enum PaletteAction {
     SelectPrevSplit,
     ConfigEditor,
     WindowCreateNew,
+    MoveCurrentTabToNewWindow,
+    MergeWindow,
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
@@ -104,6 +106,18 @@ struct Command {
     title: &'static str,
     shortcut: &'static str,
     action: PaletteAction,
+}
+
+impl Command {
+    fn score(&self, query: &str) -> Option<i32> {
+        match fuzzy_score(query, self.title) {
+            Some(score) => Some(score),
+            None if self.action == PaletteAction::MoveCurrentTabToNewWindow => {
+                fuzzy_score(query, "detatch").or_else(|| fuzzy_score(query, "detach"))
+            }
+            None => None,
+        }
+    }
 }
 
 const COMMANDS: &[Command] = &[
@@ -166,6 +180,16 @@ const COMMANDS: &[Command] = &[
         title: "New Window",
         shortcut: "Cmd+N",
         action: PaletteAction::WindowCreateNew,
+    },
+    Command {
+        title: "Move Current Tab to New Window",
+        shortcut: "",
+        action: PaletteAction::MoveCurrentTabToNewWindow,
+    },
+    Command {
+        title: "Merge Window Into Another Window",
+        shortcut: "",
+        action: PaletteAction::MergeWindow,
     },
     Command {
         title: "Increase Font Size",
@@ -516,6 +540,19 @@ impl CommandPalette {
         self.last_scroll_time = None;
     }
 
+    pub fn delete_previous_word(&mut self) {
+        let mut query = self.query.chars();
+        while query
+            .next_back()
+            .is_some_and(|character| character.is_whitespace())
+        {}
+        while query
+            .next_back()
+            .is_some_and(|character| !character.is_whitespace())
+        {}
+        self.set_query(query.collect());
+    }
+
     pub fn move_selection_up(&mut self) {
         if self.selected_index > 0 {
             self.selected_index -= 1;
@@ -572,7 +609,7 @@ impl CommandPalette {
                         true
                     })
                     .filter_map(|cmd| {
-                        let score = fuzzy_score(&self.query, cmd.title)?;
+                        let score = cmd.score(&self.query)?;
                         Some((
                             score,
                             PaletteRow::Command {
@@ -636,6 +673,9 @@ impl CommandPalette {
 
         let relative_y = mouse_y - results_y;
         let row = (relative_y / RESULT_ITEM_HEIGHT) as usize;
+        if row >= MAX_VISIBLE_RESULTS {
+            return Ok(None);
+        }
         let filtered_count = self.filtered_rows().len();
         let actual_index = self.scroll_offset + row;
 
@@ -1024,6 +1064,34 @@ mod tests {
     }
 
     #[test]
+    fn move_tab_to_new_window_command_is_actionable() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("move current tab".to_string());
+        assert_eq!(
+            palette.get_selected_action(),
+            Some(PaletteAction::MoveCurrentTabToNewWindow)
+        );
+    }
+
+    #[test]
+    fn detach_alias_selects_move_tab_command() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("detatch".to_string());
+        assert_eq!(
+            palette.get_selected_action(),
+            Some(PaletteAction::MoveCurrentTabToNewWindow)
+        );
+    }
+
+    #[test]
+    fn delete_previous_word_handles_unicode_and_trailing_space() {
+        let mut palette = CommandPalette::new();
+        palette.set_query("one café  ".to_string());
+        palette.delete_previous_word();
+        assert_eq!(palette.query, "one");
+    }
+
+    #[test]
     fn test_scroll_offset_on_move_down() {
         let mut palette = CommandPalette::new();
         palette.set_enabled(true);
@@ -1037,6 +1105,23 @@ mod tests {
     fn test_hit_test_outside() {
         let palette = CommandPalette::new();
         assert!(palette.hit_test(0.0, 0.0, 1200.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn hit_test_does_not_select_below_visible_results() {
+        let palette = CommandPalette::new();
+        let (_, py, _, _) = palette.palette_rect(1200.0, 1.0);
+        let results_y =
+            py + PALETTE_PADDING + INPUT_HEIGHT + SEPARATOR_HEIGHT + RESULTS_MARGIN_TOP;
+        assert_eq!(
+            palette.hit_test(
+                600.0,
+                results_y + RESULT_ITEM_HEIGHT * MAX_VISIBLE_RESULTS as f32,
+                1200.0,
+                1.0,
+            ),
+            Ok(None)
+        );
     }
 
     #[test]
