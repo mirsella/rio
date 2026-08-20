@@ -65,6 +65,7 @@ impl PointerHandler for WinitState {
 
         let device_id =
             crate::event::DeviceId(crate::platform_impl::DeviceId::Wayland(DeviceId));
+        let mut deferred_releases = Vec::new();
 
         for (event_index, event) in events.iter().enumerate() {
             let surface = &event.surface;
@@ -273,14 +274,26 @@ impl PointerHandler for WinitState {
                     } else {
                         ElementState::Released
                     };
-                    self.events_sink.push_window_event(
-                        WindowEvent::MouseInput {
-                            device_id,
-                            state,
-                            button,
-                        },
-                        window_id,
-                    );
+                    if !pressed
+                        && button == MouseButton::Left
+                        && events[event_index + 1..].iter().any(|event| {
+                            matches!(event.kind, PointerEventKind::Leave { .. })
+                                && wayland::make_wid(&wayland::root_surface(
+                                    &event.surface,
+                                )) == window_id
+                        })
+                    {
+                        deferred_releases.push((window_id, button));
+                    } else {
+                        self.events_sink.push_window_event(
+                            WindowEvent::MouseInput {
+                                device_id,
+                                state,
+                                button,
+                            },
+                            window_id,
+                        );
+                    }
                 }
                 PointerEventKind::Axis {
                     horizontal,
@@ -340,6 +353,17 @@ impl PointerHandler for WinitState {
                     )
                 }
             }
+        }
+
+        for (window_id, button) in deferred_releases {
+            self.events_sink.push_window_event(
+                WindowEvent::MouseInput {
+                    device_id,
+                    state: ElementState::Released,
+                    button,
+                },
+                window_id,
+            );
         }
     }
 }
