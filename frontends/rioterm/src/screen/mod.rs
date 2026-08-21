@@ -1182,7 +1182,7 @@ impl Screen<'_> {
         if quick_select_active {
             {
                 let terminal = self.context_manager.current().terminal.lock();
-                self.hint_state.refresh_matches_for_scroll(&*terminal);
+                self.hint_state.refresh_matches(&*terminal);
             }
             self.update_hint_state();
         }
@@ -1295,8 +1295,7 @@ impl Screen<'_> {
             return;
         }
 
-        let ignore_chars = self.process_key_bindings(key, &mode, mods, clipboard);
-        if ignore_chars || self.hint_state.is_active() {
+        if self.process_key_bindings(key, &mode, mods, clipboard) {
             return;
         }
 
@@ -1975,7 +1974,8 @@ impl Screen<'_> {
             }
         }
 
-        ignore_chars.unwrap_or(false)
+        // Hint activation always consumes its key, even with an overlapping `ReceiveChar`.
+        ignore_chars.unwrap_or(false) || self.hint_state.is_active()
     }
 
     pub fn split_right_with_config(&mut self, config: rio_backend::config::Config) {
@@ -2243,6 +2243,7 @@ impl Screen<'_> {
         terminal.scroll_display(Scroll::Delta(-self.search_state.display_offset_delta));
         drop(terminal);
         self.search_state.origin = new_origin;
+        self.refresh_hints_after_scroll();
     }
 
     /// Whether we should send `ESC` due to `Alt` being pressed.
@@ -2431,9 +2432,10 @@ impl Screen<'_> {
     /// Update hint highlighting based on mouse position and modifiers
     pub fn update_highlighted_hints(&mut self) -> bool {
         // Check if any hint configuration has matching modifiers
-        let should_highlight = self.hints_config.iter().any(|hint_config| {
-            hint_config.mouse.enabled && self.modifiers_match(&hint_config.mouse.mods)
-        });
+        let should_highlight = self.contains_point(self.mouse.x, self.mouse.y)
+            && self.hints_config.iter().any(|hint_config| {
+                hint_config.mouse.enabled && self.modifiers_match(&hint_config.mouse.mods)
+            });
 
         let had_highlight = self
             .context_manager
@@ -3082,9 +3084,13 @@ impl Screen<'_> {
                     let mut terminal = self.context_manager.current_mut().terminal.lock();
                     let current = terminal.display_offset();
                     let delta = new_offset as i32 - current as i32;
-                    terminal.scroll_display(Scroll::Delta(delta));
+                    if delta != 0 {
+                        terminal.scroll_display(Scroll::Delta(delta));
+                    }
                     drop(terminal);
-                    self.refresh_hints_after_scroll();
+                    if delta != 0 {
+                        self.refresh_hints_after_scroll();
+                    }
                 }
             }
             self.mark_dirty();
@@ -3902,6 +3908,7 @@ impl Screen<'_> {
             drop(terminal);
         }
         self.search_state.display_offset_delta = 0;
+        self.refresh_hints_after_scroll();
     }
 
     /// Jump to the first regex match from the search origin.
@@ -3969,6 +3976,8 @@ impl Screen<'_> {
 
         if should_reset_search_state {
             self.search_reset_state();
+        } else {
+            self.refresh_hints_after_scroll();
         }
     }
 
@@ -5352,7 +5361,7 @@ impl Screen<'_> {
         // Keep hint mode active when this viewport has no matches; the user
         // can scroll to a matching line without the activation key reaching
         // the terminal and forcing the view to the bottom.
-        self.hint_state.refresh_matches_for_scroll(&*terminal);
+        self.hint_state.refresh_matches(&*terminal);
         drop(terminal);
 
         // Update hint state and trigger damage tracking
