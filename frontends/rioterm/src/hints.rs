@@ -149,22 +149,24 @@ impl HintState {
         &mut self,
         term: &rio_backend::crosswords::Crosswords<T>,
     ) {
-        self.update_matches_inner(term, false);
+        self.rebuild_matches(term);
+        if self.matches.is_empty() {
+            self.stop();
+        }
     }
 
-    /// Refresh matches after the viewport moved without leaving hint mode.
-    pub fn refresh_matches_for_scroll<T: EventListener>(
+    /// Refresh matches without leaving hint mode when none are visible.
+    pub fn refresh_matches<T: EventListener>(
         &mut self,
         term: &rio_backend::crosswords::Crosswords<T>,
     ) {
         self.keys.clear();
-        self.update_matches_inner(term, true);
+        self.rebuild_matches(term);
     }
 
-    fn update_matches_inner<T: EventListener>(
+    fn rebuild_matches<T: EventListener>(
         &mut self,
         term: &rio_backend::crosswords::Crosswords<T>,
-        keep_active_when_empty: bool,
     ) {
         self.matches.clear();
 
@@ -188,12 +190,8 @@ impl HintState {
             }
         }
 
-        // Cancel hint mode if no matches found
         if self.matches.is_empty() {
             self.labels.clear();
-            if !keep_active_when_empty {
-                self.stop();
-            }
             return;
         }
 
@@ -715,17 +713,22 @@ mod tests {
 
     #[test]
     fn scrolling_keeps_hint_mode_active_until_matches_reappear() {
-        let hint = hint();
-        let empty = mock_term_with_line("");
-        let matching = mock_term_with_line("test");
-        let mut state = HintState::new("ab".to_string());
-        state.start(hint);
+        let mut term = mock_term_with_line("xxxx");
+        term.resize(CrosswordsSize::new(4, 2));
+        for (column, character) in "test".chars().enumerate() {
+            term.grid[Line(0)][Column(column)].set_c(character);
+        }
+        term.grid.scroll_up(&(Line(0)..Line(2)), 1);
 
-        state.refresh_matches_for_scroll(&empty);
+        let mut state = HintState::new("ab".to_string());
+        state.start(hint());
+
+        state.refresh_matches(&term);
         assert!(state.is_active());
         assert!(state.matches().is_empty());
 
-        state.refresh_matches_for_scroll(&matching);
+        term.scroll_display(rio_backend::crosswords::grid::Scroll::Delta(1));
+        state.refresh_matches(&term);
         assert!(state.is_active());
         assert_eq!(state.matches().len(), 1);
         assert_eq!(state.visible_labels().count(), 1);
@@ -879,8 +882,14 @@ mod tests {
         let num_cols = num_cols.max(1) + 4;
         let size = CrosswordsSize::new(num_cols, 1);
         let window_id = WindowId::from(0);
-        let mut term =
-            Crosswords::new(size, CursorShape::Block, VoidListener {}, window_id, 0, 0);
+        let mut term = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
 
         let line = Line(0);
         let mut col = 0usize;
