@@ -1046,9 +1046,23 @@ impl Screen<'_> {
             let mut terminal = current.terminal.lock();
             let scroll_lines =
                 terminal.grid.screen_lines() as i32 * if up { 1 } else { -1 };
-            terminal.vi_mode_cursor =
-                terminal.vi_mode_cursor.scroll(&terminal, scroll_lines);
+            terminal.vi_scroll(scroll_lines);
             terminal.scroll_display(if up { Scroll::PageUp } else { Scroll::PageDown });
+        }
+        self.renderer.scrollbar.notify_scroll(rich_text_id);
+        self.refresh_hints_after_scroll();
+        self.mark_dirty();
+    }
+
+    pub fn scroll_half_page(&mut self, up: bool) {
+        let current = self.context_manager.current_mut();
+        let rich_text_id = current.rich_text_id;
+        {
+            let mut terminal = current.terminal.lock();
+            let half = terminal.grid.screen_lines() as i32 / 2;
+            let scroll_lines = if up { half } else { -half };
+            terminal.vi_scroll(scroll_lines);
+            terminal.scroll_display(Scroll::Delta(scroll_lines));
         }
         self.renderer.scrollbar.notify_scroll(rich_text_id);
         self.refresh_hints_after_scroll();
@@ -1643,36 +1657,10 @@ impl Screen<'_> {
                         self.scroll_page(false);
                     }
                     Act::ScrollHalfPageUp => {
-                        // Move vi mode cursor.
-                        let current = self.context_manager.current_mut();
-                        let rtid = current.rich_text_id;
-                        let mut terminal = current.terminal.lock();
-                        let scroll_lines = terminal.grid.screen_lines() as i32 / 2;
-
-                        terminal.vi_mode_cursor =
-                            terminal.vi_mode_cursor.scroll(&terminal, scroll_lines);
-
-                        terminal.scroll_display(Scroll::Delta(scroll_lines));
-                        drop(terminal);
-                        self.refresh_hints_after_scroll();
-                        self.renderer.scrollbar.notify_scroll(rtid);
-                        self.mark_dirty();
+                        self.scroll_half_page(true);
                     }
                     Act::ScrollHalfPageDown => {
-                        // Move vi mode cursor.
-                        let current = self.context_manager.current_mut();
-                        let rtid = current.rich_text_id;
-                        let mut terminal = current.terminal.lock();
-                        let scroll_lines = -(terminal.grid.screen_lines() as i32 / 2);
-
-                        terminal.vi_mode_cursor =
-                            terminal.vi_mode_cursor.scroll(&terminal, scroll_lines);
-
-                        terminal.scroll_display(Scroll::Delta(scroll_lines));
-                        drop(terminal);
-                        self.refresh_hints_after_scroll();
-                        self.renderer.scrollbar.notify_scroll(rtid);
-                        self.mark_dirty();
+                        self.scroll_half_page(false);
                     }
                     Act::ScrollToTop => {
                         let current = self.context_manager.current_mut();

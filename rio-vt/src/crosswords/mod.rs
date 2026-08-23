@@ -1004,6 +1004,21 @@ impl<U: EventListener> Crosswords<U> {
         self.vi_mode_recompute_selection();
     }
 
+    /// Scroll the vi mode cursor up/down by `lines`, keeping the selection in sync.
+    #[inline]
+    pub fn vi_scroll(&mut self, lines: i32)
+    where
+        U: EventListener,
+    {
+        // Require vi mode to be active.
+        if !self.mode.contains(Mode::VI) {
+            return;
+        }
+
+        self.vi_mode_cursor = self.vi_mode_cursor.scroll(self, lines);
+        self.vi_mode_recompute_selection();
+    }
+
     /// Move vi cursor to a point in the grid.
     #[inline]
     pub fn vi_goto_pos(&mut self, pos: Pos)
