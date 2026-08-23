@@ -1049,6 +1049,7 @@ impl Screen<'_> {
             terminal.vi_scroll(scroll_lines);
             terminal.scroll_display(if up { Scroll::PageUp } else { Scroll::PageDown });
         }
+        self.refresh_selection_range();
         self.renderer.scrollbar.notify_scroll(rich_text_id);
         self.refresh_hints_after_scroll();
         self.mark_dirty();
@@ -1064,9 +1065,23 @@ impl Screen<'_> {
             terminal.vi_scroll(scroll_lines);
             terminal.scroll_display(Scroll::Delta(scroll_lines));
         }
+        self.refresh_selection_range();
         self.renderer.scrollbar.notify_scroll(rich_text_id);
         self.refresh_hints_after_scroll();
         self.mark_dirty();
+    }
+
+    /// Sync the cached selection range after a scroll moved the vi cursor
+    /// or clamped it back into the viewport.
+    fn refresh_selection_range(&mut self) {
+        let context = self.context_manager.current_mut();
+        let mut terminal = context.terminal.lock();
+        let selection_range = terminal
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&terminal));
+        drop(terminal);
+        context.set_selection(selection_range);
     }
 
     pub fn refresh_hints_after_scroll(&mut self) {
@@ -1455,11 +1470,6 @@ impl Screen<'_> {
                         if terminal.mode().contains(Mode::VI) {
                             terminal.vi_motion(*motion);
                         }
-
-                        if let Some(selection) = &terminal.selection {
-                            context.renderable_content.selection_range =
-                                selection.to_range(&terminal);
-                        };
                         drop(terminal);
                         context
                             .renderable_content
@@ -1467,6 +1477,7 @@ impl Screen<'_> {
                             .set_terminal_damage(
                                 rio_backend::event::TerminalDamage::Full,
                             );
+                        self.refresh_selection_range();
                         self.mark_dirty();
                     }
                     Act::Vi(ViAction::CenterAroundViCursor) => {
@@ -1664,6 +1675,7 @@ impl Screen<'_> {
                         terminal.vi_mode_cursor.pos.row = topmost_line;
                         terminal.vi_motion(ViMotion::FirstOccupied);
                         drop(terminal);
+                        self.refresh_selection_range();
                         self.refresh_hints_after_scroll();
                         self.renderer.scrollbar.notify_scroll(rtid);
                         self.mark_dirty();
@@ -1681,6 +1693,7 @@ impl Screen<'_> {
                         terminal.vi_motion(ViMotion::FirstOccupied);
                         terminal.vi_motion(ViMotion::FirstOccupied);
                         drop(terminal);
+                        self.refresh_selection_range();
                         self.refresh_hints_after_scroll();
                         self.renderer.scrollbar.notify_scroll(rtid);
                         self.mark_dirty();
@@ -1691,6 +1704,7 @@ impl Screen<'_> {
                         let mut terminal = current.terminal.lock();
                         terminal.scroll_display(Scroll::Delta(*delta));
                         drop(terminal);
+                        self.refresh_selection_range();
                         self.refresh_hints_after_scroll();
                         self.renderer.scrollbar.notify_scroll(rtid);
                         self.mark_dirty();
