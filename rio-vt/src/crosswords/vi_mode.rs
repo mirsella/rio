@@ -193,7 +193,6 @@ impl ViModeCursor {
     }
 
     /// Get target cursor pos for vim-like page movement.
-    #[allow(unused)]
     #[must_use = "this returns the result of the operation, without modifying the original"]
     pub fn scroll<T: EventListener>(mut self, term: &Crosswords<T>, lines: i32) -> Self {
         // Clamp movement to within visible region.
