@@ -1483,6 +1483,7 @@ impl Screen<'_> {
                     }
                     Act::Copy => {
                         self.copy_selection(ClipboardType::Clipboard, clipboard);
+                        self.set_vi_mode(false);
                     }
                     Act::SelectAll => {
                         self.select_all();
@@ -1541,17 +1542,14 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::ToggleViMode => {
-                        let context = self.context_manager.current_mut();
-                        let mut terminal = context.terminal.lock();
-                        terminal.toggle_vi_mode();
-                        drop(terminal);
-                        context
-                            .renderable_content
-                            .pending_update
-                            .set_terminal_damage(
-                                rio_backend::event::TerminalDamage::Full,
-                            );
-                        self.mark_dirty();
+                        let vi_mode_enabled = self
+                            .context_manager
+                            .current()
+                            .terminal
+                            .lock()
+                            .mode()
+                            .contains(Mode::VI);
+                        self.set_vi_mode(!vi_mode_enabled);
                     }
                     Act::ViMotion(motion) => {
                         let context = self.context_manager.current_mut();
@@ -2265,6 +2263,21 @@ impl Screen<'_> {
         drop(terminal);
 
         clipboard.set(ty, text);
+    }
+
+    fn set_vi_mode(&mut self, enabled: bool) {
+        let context = self.context_manager.current_mut();
+        let mut terminal = context.terminal.lock();
+        if terminal.mode().contains(Mode::VI) == enabled {
+            return;
+        }
+        terminal.toggle_vi_mode();
+        drop(terminal);
+        context
+            .renderable_content
+            .pending_update
+            .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+        self.mark_dirty();
     }
 
     pub fn copy_selection_on_pointer_release(
@@ -4337,14 +4350,14 @@ impl Screen<'_> {
                 self.change_font_size(FontSizeAction::Reset);
             }
             PaletteAction::ToggleViMode => {
-                let context = self.context_manager.current_mut();
-                let mut terminal = context.terminal.lock();
-                terminal.toggle_vi_mode();
-                drop(terminal);
-                context
-                    .renderable_content
-                    .pending_update
-                    .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+                let vi_mode_enabled = self
+                    .context_manager
+                    .current()
+                    .terminal
+                    .lock()
+                    .mode()
+                    .contains(Mode::VI);
+                self.set_vi_mode(!vi_mode_enabled);
             }
             PaletteAction::ToggleFullscreen => {
                 self.context_manager.toggle_full_screen();
