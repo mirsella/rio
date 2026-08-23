@@ -1115,7 +1115,7 @@ impl Screen<'_> {
     /// or clamped it back into the viewport.
     fn refresh_selection_range(&mut self) {
         let context = self.context_manager.current_mut();
-        let mut terminal = context.terminal.lock();
+        let terminal = context.terminal.lock();
         let selection_range = terminal
             .selection
             .as_ref()
@@ -1540,6 +1540,7 @@ impl Screen<'_> {
                                     rio_backend::event::TerminalDamage::Full,
                                 );
                         }
+                        self.refresh_selection_range();
                         self.refresh_hints_after_scroll();
                         self.mark_dirty();
                     }
@@ -3031,6 +3032,7 @@ impl Screen<'_> {
                     }
                     drop(terminal);
                     if delta != 0 {
+                        self.refresh_selection_range();
                         self.refresh_hints_after_scroll();
                     }
                 }
@@ -3056,6 +3058,7 @@ impl Screen<'_> {
             }
             drop(terminal);
             if delta != 0 {
+                self.refresh_selection_range();
                 self.refresh_hints_after_scroll();
             }
             self.mark_dirty();
@@ -3866,6 +3869,7 @@ impl Screen<'_> {
             drop(terminal);
         }
         self.search_state.display_offset_delta = 0;
+        self.refresh_selection_range();
         self.refresh_hints_after_scroll();
     }
 
@@ -3932,6 +3936,7 @@ impl Screen<'_> {
             drop(terminal);
         }
 
+        self.refresh_selection_range();
         if should_reset_search_state {
             self.search_reset_state();
         } else {
@@ -4175,6 +4180,7 @@ impl Screen<'_> {
                 let mut terminal = current.terminal.lock();
                 terminal.scroll_display(Scroll::Delta(lines));
                 drop(terminal);
+                self.refresh_selection_range();
                 self.renderer.scrollbar.notify_scroll(rich_text_id);
             }
             if old_display_offset != self.display_offset() {
@@ -5272,10 +5278,11 @@ impl Screen<'_> {
                     self.mark_dirty();
                 }
                 HintInternalAction::MoveViModeCursor => {
-                    // Move vi mode cursor to hint position
+                    // Move vi mode cursor to hint position.
                     let mut terminal = self.context_manager.current().terminal.lock();
-                    terminal.vi_mode_cursor.pos = hint_match.start;
+                    terminal.vi_goto_pos(hint_match.start);
                     drop(terminal);
+                    self.refresh_selection_range();
                     self.mark_dirty();
                 }
                 HintInternalAction::Open => {
