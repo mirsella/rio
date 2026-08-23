@@ -1388,8 +1388,7 @@ impl Screen<'_> {
                         self.paste(&content, true);
                     }
                     Act::Copy => {
-                        self.copy_selection(ClipboardType::Clipboard, clipboard);
-                        self.set_vi_mode(false);
+                        self.yank_selection(clipboard);
                     }
                     Act::SelectAll => {
                         self.select_all();
@@ -1448,14 +1447,7 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::ToggleViMode => {
-                        let vi_mode_enabled = self
-                            .context_manager
-                            .current()
-                            .terminal
-                            .lock()
-                            .mode()
-                            .contains(Mode::VI);
-                        self.set_vi_mode(!vi_mode_enabled);
+                        self.toggle_vi_mode();
                     }
                     Act::ViMotion(motion) => {
                         let context = self.context_manager.current_mut();
@@ -2118,15 +2110,37 @@ impl Screen<'_> {
         }
     }
 
-    pub fn copy_selection(&mut self, ty: ClipboardType, clipboard: &mut Clipboard) {
+    pub fn copy_selection(
+        &mut self,
+        ty: ClipboardType,
+        clipboard: &mut Clipboard,
+    ) -> bool {
         let terminal = self.context_manager.current_mut().terminal.lock();
         let text = match terminal.selection_to_string().filter(|s| !s.is_empty()) {
             Some(text) => text,
-            None => return,
+            None => return false,
         };
         drop(terminal);
 
         clipboard.set(ty, text);
+        true
+    }
+
+    fn yank_selection(&mut self, clipboard: &mut Clipboard) {
+        if self.copy_selection(ClipboardType::Clipboard, clipboard) {
+            self.set_vi_mode(false);
+        }
+    }
+
+    fn toggle_vi_mode(&mut self) {
+        let vi_mode_enabled = self
+            .context_manager
+            .current()
+            .terminal
+            .lock()
+            .mode()
+            .contains(Mode::VI);
+        self.set_vi_mode(!vi_mode_enabled);
     }
 
     fn set_vi_mode(&mut self, enabled: bool) {
@@ -4196,14 +4210,7 @@ impl Screen<'_> {
                 self.change_font_size(FontSizeAction::Reset);
             }
             PaletteAction::ToggleViMode => {
-                let vi_mode_enabled = self
-                    .context_manager
-                    .current()
-                    .terminal
-                    .lock()
-                    .mode()
-                    .contains(Mode::VI);
-                self.set_vi_mode(!vi_mode_enabled);
+                self.toggle_vi_mode();
             }
             PaletteAction::ToggleFullscreen => {
                 self.context_manager.toggle_full_screen();
@@ -4212,7 +4219,7 @@ impl Screen<'_> {
                 self.context_manager.toggle_appearance_theme();
             }
             PaletteAction::Copy => {
-                self.copy_selection(ClipboardType::Clipboard, clipboard);
+                self.yank_selection(clipboard);
             }
             PaletteAction::Paste => {
                 let content = clipboard.get(ClipboardType::Clipboard);
