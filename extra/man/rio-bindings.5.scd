@@ -239,7 +239,7 @@ action = "CreateWindow"
 	Switch to next tab.
 
 *Copy*
-	Copy selected text.
+	Copy selected text; exits vi mode when active.
 
 *Paste*
 	Paste from clipboard.
