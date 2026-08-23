@@ -6361,6 +6361,56 @@ mod tests {
     }
 
     #[test]
+    fn selection_follows_vi_scroll() {
+        let size = CrosswordsSize::new(10, 10);
+        let window_id = crate::event::WindowId::from(0);
+
+        let mut term = Crosswords::new(
+            size,
+            CursorShape::Block,
+            VoidListener {},
+            window_id,
+            0,
+            10_000,
+        );
+        for row in 0..4 {
+            for col in 0..4 {
+                term.grid[Line(row)][Column(col)].set_c('a');
+            }
+        }
+        // Push three rows into scrollback so upward movement has history.
+        term.grid.scroll_up(&(Line(0)..Line(4)), 3);
+
+        term.toggle_vi_mode();
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            Pos {
+                row: Line(1),
+                col: Column(0),
+            },
+            Side::Left,
+        ));
+        if let Some(s) = term.selection.as_mut() {
+            s.update(
+                Pos {
+                    row: Line(1),
+                    col: Column(3),
+                },
+                Side::Right,
+            );
+        }
+
+        // Scroll the vi cursor up two lines; the selection must follow it.
+        term.vi_scroll(2);
+
+        assert_eq!(term.vi_mode_cursor.pos.row, Line(-2));
+
+        let range = term.selection.as_ref().unwrap().to_range(&term).unwrap();
+        assert_eq!(range.start.row, Line(-2));
+        assert_eq!(range.end.row, Line(1));
+    }
+
+    #[test]
     fn line_selection_works() {
         let size = CrosswordsSize::new(5, 1);
         let window_id = crate::event::WindowId::from(0);
