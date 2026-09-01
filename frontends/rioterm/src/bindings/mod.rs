@@ -760,8 +760,14 @@ pub fn default_key_bindings(config: &rio_backend::config::Config) -> Vec<KeyBind
         config.keyboard,
     ));
 
-    // Add hint bindings
-    bindings.extend(create_hint_bindings(&config.hints.rules));
+    // Hint bindings are user-defined and must replace defaults, not run alongside them.
+    let hint_bindings = create_hint_bindings(&config.hints.rules);
+    bindings.retain(|binding| {
+        !hint_bindings
+            .iter()
+            .any(|hint| binding.triggers_match(hint))
+    });
+    bindings.extend(hint_bindings);
 
     config_key_bindings(config.bindings.keys.to_owned(), bindings)
 }
@@ -1749,6 +1755,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn hint_binding_replaces_conflicting_default() {
+        let mut config = rio_backend::config::Config::default();
+        config.hints.rules[0].binding = Some(rio_backend::config::hints::HintBinding {
+            key: "f2".into(),
+            mods: Vec::new(),
+            mode: Vec::new(),
+        });
+
+        let bindings = default_key_bindings(&config);
+        let f2 = BindingKey::Keycode {
+            key: Key::Named(F2),
+            location: KeyLocation::Standard,
+        };
+        let f2_bindings: Vec<_> = bindings
+            .iter()
+            .filter(|binding| binding.trigger == f2 && binding.mods.is_empty())
+            .collect();
+
+        assert_eq!(f2_bindings.len(), 1);
+        assert!(matches!(f2_bindings[0].action, Action::Hint(_)));
     }
 
     #[test]
