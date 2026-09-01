@@ -3477,6 +3477,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
 
                 match ime {
+                    // The matching keyboard event already handles hint input; do not let its
+                    // IME commit reach paste and reset the scrollback position.
+                    Ime::Commit(_) if route.window.screen.hint_state.is_active() => {}
                     Ime::Commit(text) => {
                         // Don't use bracketed paste for single char input.
                         route.window.screen.paste(&text, text.chars().count() > 1);
