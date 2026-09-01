@@ -3604,6 +3604,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 // stays open to IME (commits route into the search
                 // input via `paste`).
                 match ime {
+                    // The matching keyboard event already handles hint input; do not let its
+                    // IME commit reach paste and reset the scrollback position.
+                    Ime::Commit(_) if route.window.screen.hint_state.is_active() => {}
                     Ime::Commit(text) => {
                         // Text-input overlays (island rename, palette)
                         // consume commits first, in `has_key_wait`'s
