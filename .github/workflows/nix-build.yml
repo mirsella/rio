@@ -51,7 +51,6 @@ jobs:
       - uses: cachix/cachix-action@v17
         with:
           name: rioterm
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-          skipPush: ${{ github.event_name == 'pull_request' }}
+          skipPush: true
       - uses: DeterminateSystems/flake-checker-action@main
       - run: nix build --max-jobs auto --build-max-jobs auto --print-build-logs
