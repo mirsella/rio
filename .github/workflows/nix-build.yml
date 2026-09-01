@@ -7,6 +7,9 @@ on:
       - '**/*.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'pkgRio.nix'
       - '.github/workflows/nix-build.yml'
   push:
     branches:
@@ -15,6 +18,9 @@ on:
       - '**/*.rs'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'pkgRio.nix'
       - '.github/workflows/nix-build.yml'
 
 jobs:
@@ -24,6 +30,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: cachix/cachix-action@v17
+        with:
+          name: rioterm
+          skipPush: true
       - uses: DeterminateSystems/flake-checker-action@main
       - run: nix build --max-jobs auto --build-max-jobs auto --print-build-logs
