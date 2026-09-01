@@ -1108,12 +1108,14 @@ mod resolve_working_dir_tests {
 
     #[test]
     fn working_directory_resolution() {
-        let home = dirs::home_dir().unwrap().to_string_lossy().into_owned();
+        let home = dirs::home_dir()
+            .filter(|home| home.is_dir())
+            .map(|home| home.to_string_lossy().into_owned());
         for (input, expected) in [
             (None, None),
-            (Some("~"), Some(home.clone())),
-            (Some("~/."), Some(format!("{home}/."))),
-            (Some("~//."), Some(format!("{home}/."))),
+            (Some("~"), home.clone()),
+            (Some("~/."), home.clone().map(|home| format!("{home}/."))),
+            (Some("~//."), home.map(|home| format!("{home}/."))),
             (Some("/"), Some("/".into())),
             (Some("/definitely/not/a/real/dir"), None),
             (Some("/tmp/~x"), None),
