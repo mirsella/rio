@@ -54,17 +54,18 @@ fn temporary_directory() -> PathBuf {
 }
 
 fn spec(command: &str, working_dir: Option<&Path>) -> SessionSpec {
-    let mut spec = SessionSpec::default();
-    spec.shell = Some("/bin/sh".into());
-    spec.args = vec!["-c".into(), command.into()];
-    spec.working_dir = working_dir.map(|path| path.to_str().unwrap().to_owned());
-    spec.environment = vec![
-        EnvVar::new("HOME", std::env::temp_dir().to_str().unwrap()),
-        EnvVar::new("PATH", "/usr/bin:/bin"),
-        EnvVar::new("RIO_SESSION_TEST", "preserved"),
-        EnvVar::new("TERM", "xterm-rio"),
-    ];
-    spec
+    SessionSpec {
+        shell: Some("/bin/sh".into()),
+        args: vec!["-c".into(), command.into()],
+        working_dir: working_dir.map(|path| path.to_str().unwrap().to_owned()),
+        environment: vec![
+            EnvVar::new("HOME", std::env::temp_dir().to_str().unwrap()),
+            EnvVar::new("PATH", "/usr/bin:/bin"),
+            EnvVar::new("RIO_SESSION_TEST", "preserved"),
+            EnvVar::new("TERM", "xterm-rio"),
+        ],
+        ..Default::default()
+    }
 }
 
 fn snapshot_until(
@@ -863,9 +864,11 @@ fn semantic_frames_and_worker_navigation_are_authoritative() {
     let navigation = client
         .search_begin(
             "needle",
-            0,
-            0,
-            frame.display_offset,
+            rio_session::SearchOrigin {
+                line: 0,
+                column: 0,
+                display_offset: frame.display_offset,
+            },
             SearchDirection::Forward,
             SelectionSide::Left,
             None,

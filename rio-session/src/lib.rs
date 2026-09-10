@@ -11,9 +11,9 @@ pub mod worker;
 pub use protocol::{
     CellContentFrame, CellFrame, ClientMessage, FrameDelta, FrameUpdate, FullFrame,
     GlyphStatus, KeyAction, KeyCode, KeyInput, RequestKind, RequestRefusalReason,
-    RowUpdate, SearchDirection, SearchMatch, SearchNavigation, SelectionKind,
-    SelectionSide, ServerMessage, SessionCommand, SessionDescriptor, SessionEvent,
-    SessionId, SessionReply, SessionSpec, ViMotion,
+    RowUpdate, SearchDirection, SearchMatch, SearchNavigation, SearchOrigin,
+    SelectionKind, SelectionSide, ServerMessage, SessionCommand, SessionDescriptor,
+    SessionEvent, SessionId, SessionReply, SessionSpec, ViMotion,
 };
 
 use protocol::PROTOCOL_VERSION;
@@ -250,7 +250,7 @@ impl SessionClient {
         #[cfg(unix)]
         {
             let worker = worker_binary()?;
-            return Self::spawn_with_worker_path(spec, worker);
+            Self::spawn_with_worker_path(spec, worker)
         }
 
         #[cfg(not(unix))]
@@ -634,9 +634,7 @@ impl SessionClient {
     pub fn search_begin(
         &self,
         pattern: impl Into<String>,
-        origin_line: i32,
-        origin_column: u16,
-        origin_display_offset: u32,
+        origin: SearchOrigin,
         direction: SearchDirection,
         side: SelectionSide,
         max_lines: Option<u32>,
@@ -644,9 +642,9 @@ impl SessionClient {
         self.value(
             SessionCommand::SearchBegin {
                 pattern: pattern.into(),
-                origin_line,
-                origin_column,
-                origin_display_offset,
+                origin_line: origin.line,
+                origin_column: origin.column,
+                origin_display_offset: origin.display_offset,
                 direction,
                 side,
                 max_lines,
@@ -872,21 +870,21 @@ impl SessionClient {
                                     "worker returned a stale event generation",
                                 ));
                             }
-                            return Ok(Some(event));
+                            Ok(Some(event))
                         }
                         ServerMessage::Error { code, message } => {
                             self.poison_stream(&connection.stream);
-                            return Err(server_error(code, message));
+                            Err(server_error(code, message))
                         }
                         ServerMessage::Detached => {
                             self.poison_stream(&connection.stream);
-                            return Err(SessionError::Detached);
+                            Err(SessionError::Detached)
                         }
                         _ => {
                             self.poison_stream(&connection.stream);
-                            return Err(SessionError::protocol(
+                            Err(SessionError::protocol(
                                 "unexpected message while polling events",
-                            ));
+                            ))
                         }
                     }
                 }
@@ -899,7 +897,7 @@ impl SessionClient {
                     ) {
                         return Err(SessionError::WorkerExited);
                     }
-                    return Err(error);
+                    Err(error)
                 }
             }
         }

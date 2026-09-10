@@ -551,8 +551,7 @@ impl WindowState {
         self.cancel_pending_move_for_seat(seat_id);
         self.frame
             .as_mut()
-            .map(|frame| frame.click_point_moved(timestamp, &surface.id(), x, y))
-            .flatten()
+            .and_then(|frame| frame.click_point_moved(timestamp, &surface.id(), x, y))
     }
 
     /// Get the stored resizable state.

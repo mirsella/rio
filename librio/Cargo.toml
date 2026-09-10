@@ -7,7 +7,6 @@ license.workspace = true
 keywords.workspace = true
 repository = "https://github.com/raphamorim/rio"
 description = "Embeddable terminal core extracted from Rio: PTY, VT state, render-state pull API, exposed as a C ABI"
-readme = "README.md"
 publish = false
 
 [lib]

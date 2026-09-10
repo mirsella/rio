@@ -318,7 +318,7 @@ impl SessionDescriptor {
             }
             let descriptor: Self = crate::codec::decode(&bytes)?;
             descriptor.validate()?;
-            return Ok(descriptor);
+            Ok(descriptor)
         }
         #[cfg(not(unix))]
         {
@@ -497,6 +497,13 @@ pub enum ViMotion {
 pub enum SearchDirection {
     Forward,
     Backward,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SearchOrigin {
+    pub line: i32,
+    pub column: u16,
+    pub display_offset: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, bincode::Encode, bincode::Decode)]
@@ -1588,17 +1595,32 @@ fn validate_row(row: &RowFrame, columns: u16) -> Result<usize, crate::SessionErr
     Ok(row.cells.len())
 }
 
-fn validate_frame_metadata(
+struct FrameMetadata<'a> {
     columns: u16,
     lines: u16,
     display_offset: u32,
     history_size: u32,
-    cursor: &CursorFrame,
-    selection: Option<&SelectionFrame>,
-    colors: &[Option<[f32; 4]>],
-    title: &str,
-    working_dir: Option<&str>,
+    cursor: &'a CursorFrame,
+    selection: Option<&'a SelectionFrame>,
+    colors: &'a [Option<[f32; 4]>],
+    title: &'a str,
+    working_dir: Option<&'a str>,
+}
+
+fn validate_frame_metadata(
+    metadata: FrameMetadata<'_>,
 ) -> Result<(), crate::SessionError> {
+    let FrameMetadata {
+        columns,
+        lines,
+        display_offset,
+        history_size,
+        cursor,
+        selection,
+        colors,
+        title,
+        working_dir,
+    } = metadata;
     validate_colors(colors)?;
     if display_offset > history_size {
         return Err(crate::SessionError::protocol(
@@ -1736,17 +1758,17 @@ impl FrameDelta {
         if cells > MAX_FRAME_CELLS {
             return Err(crate::SessionError::protocol("delta has too many cells"));
         }
-        validate_frame_metadata(
-            self.columns,
-            self.lines,
-            self.display_offset,
-            self.history_size,
-            &self.cursor,
-            self.selection.as_ref(),
-            &self.colors,
-            &self.title,
-            self.working_dir.as_deref(),
-        )
+        validate_frame_metadata(FrameMetadata {
+            columns: self.columns,
+            lines: self.lines,
+            display_offset: self.display_offset,
+            history_size: self.history_size,
+            cursor: &self.cursor,
+            selection: self.selection.as_ref(),
+            colors: &self.colors,
+            title: &self.title,
+            working_dir: self.working_dir.as_deref(),
+        })
     }
 }
 
@@ -1775,17 +1797,17 @@ impl FullFrame {
         if cells > MAX_FRAME_CELLS {
             return Err(crate::SessionError::protocol("frame has too many cells"));
         }
-        validate_frame_metadata(
-            self.columns,
-            self.lines,
-            self.display_offset,
-            self.history_size,
-            &self.cursor,
-            self.selection.as_ref(),
-            &self.colors,
-            &self.title,
-            self.working_dir.as_deref(),
-        )?;
+        validate_frame_metadata(FrameMetadata {
+            columns: self.columns,
+            lines: self.lines,
+            display_offset: self.display_offset,
+            history_size: self.history_size,
+            cursor: &self.cursor,
+            selection: self.selection.as_ref(),
+            colors: &self.colors,
+            title: &self.title,
+            working_dir: self.working_dir.as_deref(),
+        })?;
         self.graphics.validate()?;
         Ok(())
     }

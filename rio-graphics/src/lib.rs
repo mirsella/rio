@@ -302,7 +302,7 @@ impl GraphicData {
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .any(|pixel| pixel.last() != Some(&255))
+                .any(|pixel| pixel[3] != 255)
             {
                 return false;
             }

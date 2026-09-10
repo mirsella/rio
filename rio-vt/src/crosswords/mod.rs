@@ -7908,8 +7908,12 @@ mod tests {
 
         assert_eq!(term.keyboard_mode_idx, 0);
         // All modes should be cleared to NO_MODE
-        for i in 0..KEYBOARD_MODE_STACK_MAX_DEPTH {
-            assert_eq!(term.keyboard_mode_stack[i], KeyboardModes::NO_MODE.bits());
+        for mode in term
+            .keyboard_mode_stack
+            .iter()
+            .take(KEYBOARD_MODE_STACK_MAX_DEPTH)
+        {
+            assert_eq!(*mode, KeyboardModes::NO_MODE.bits());
         }
     }
 

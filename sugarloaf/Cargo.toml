@@ -50,22 +50,18 @@ image_rs = { workspace = true }
 rio-graphics = { workspace = true, features = ["glyph"] }
 rio-fonts = { workspace = true }
 rio-unicode = { workspace = true }
-guillotiere = "0.6.2"
 rustc-hash = { workspace = true }
 raw-window-handle = { workspace = true }
 parking_lot = { workspace = true }
 dashmap = { workspace = true }
-approx = "0.5.1"
-lru = "0.16.1"
 smallvec = { workspace = true }
 skrifa = "0.37.0"
-halfbrown = "0.3.0"
 half = "2.6.0"
 num-traits = "0.2.19"
 yazi = { version = "0.2.1", optional = true }
 zeno = "0.3.3"
 swash = "0.2.10"
-futures = { workspace = true }
+futures = { workspace = true, optional = true }
 tiny-skia = "0.12.0"
 wide = "1.2.0"
 
@@ -95,7 +91,6 @@ twox-hash = { version = "2.1.1", default-features = false, features = [
     "std",
     "xxhash64",
 ] }
-wyhash = "0.5.0"
 memmap2 = { workspace = true }
 font-kit = "0.14.3"
 walkdir = "2.5.0"
@@ -103,7 +98,6 @@ softbuffer = "0.4.8"
 ttf-parser = { version = "0.25.1", default-features = false, features = ["std", "opentype-layout", "apple-layout", "variable-fonts", "glyph-names"] }
 
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]
-fontconfig-parser = { version = "0.5.8", default-features = false }
 # Direct fontconfig FFI for per-codepoint discovery (the missing
 # piece on Linux that macOS gets for free via CoreText). Already in
 # the dep tree as a transitive of font-kit; promoted to a direct
@@ -148,15 +142,16 @@ wgpu = [
     "dep:librashader-reflect",
     "dep:librashader-runtime",
     "dep:librashader-cache",
+    "dep:futures",
 ]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-console_error_panic_hook = "0.1.7"
-console_log = "0.2.2"
+console_error_panic_hook = { workspace = true }
+console_log = { workspace = true }
 js-sys = "0.3.61"
-wasm-bindgen = "0.2.87"
-wasm-bindgen-futures = "0.4.34"
-wasm-bindgen-test = "0.3.42"
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+wasm-bindgen-test = { workspace = true }
 web-sys = { version = "0.3.77", features = [
     "Location",
     "Document",
