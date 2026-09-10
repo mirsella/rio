@@ -7,7 +7,7 @@ mod render_state;
 pub use key::{
     encode as encode_key, EncodeContext, Key, KeyAction, KeyEvent, KittyFlags, Modifiers,
 };
-pub use render_state::{RenderState, ViewportSelection};
+pub use render_state::{RenderState, SurfaceSnapshot, ViewportSelection};
 pub use rio_vt::clipboard::ClipboardType;
 pub use rio_vt::config::colors::term::TermColors;
 pub use rio_vt::config::colors::{AnsiColor, ColorRgb, NamedColor};
@@ -18,6 +18,7 @@ pub use rio_vt::crosswords::style::{Style, StyleFlags};
 pub use rio_vt::grapheme_lut::cluster_width;
 pub use rio_vt::selection::SelectionRange;
 
+use rio_vt::ansi::graphics::{KittyPlacement, VirtualPlacement};
 pub use rio_vt::ansi::CursorShape;
 pub use rio_vt::crosswords::pos::Side;
 use rio_vt::crosswords::pos::{Column as PosColumn, Line, Pos};
@@ -27,20 +28,22 @@ use rio_vt::event::sync::FairMutex;
 use rio_vt::event::Msg;
 #[cfg(feature = "pty")]
 use rio_vt::event::WindowSize;
-use rio_vt::event::{EventListener, RioEvent, WindowId};
+use rio_vt::event::{EventListener, InputBudget, InputBudgetError, RioEvent, WindowId};
 #[cfg(feature = "pty")]
 use rio_vt::performer::Machine;
 use rio_vt::selection::{Selection, SelectionType};
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
+#[cfg(feature = "pty")]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-#[cfg(feature = "pty")]
 use std::sync::Mutex;
 #[cfg(all(feature = "pty", target_os = "windows"))]
 use teletypewriter::create_pty;
 #[cfg(all(feature = "pty", not(target_os = "windows")))]
-use teletypewriter::create_pty_with_spawn;
+use teletypewriter::{create_pty_with_spawn, create_pty_with_spawn_clear_env};
 
 pub type SurfaceId = usize;
 
@@ -130,6 +133,217 @@ pub enum Action {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputError {
+    WouldBlock,
+    Disconnected,
+}
+
+impl std::fmt::Display for InputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WouldBlock => formatter.write_str("PTY input queue is full"),
+            Self::Disconnected => formatter.write_str("PTY input queue is disconnected"),
+        }
+    }
+}
+
+impl Error for InputError {}
+
+/// A copy of active terminal graphics metadata for a session frontend.
+/// Process-local timestamps are deliberately omitted; frame sequences and
+/// image identity are the cache keys across a process boundary.
+#[derive(Debug, Clone)]
+pub struct GraphicsSnapshot {
+    pub kitty_images: Vec<(u32, rio_graphics::GraphicData)>,
+    pub kitty_placements: Vec<((u32, u32), KittyPlacement)>,
+    pub kitty_virtual_placements: Vec<((u32, u32), VirtualPlacement)>,
+    pub atlas_placements: Vec<rio_vt::ansi::graphics::AtlasPlacement>,
+}
+
+/// The parser hands atlas pixels to its event listener because the terminal
+/// drops them after `UpdateGraphics` is emitted. Keep those pixels at the
+/// surface boundary until a renderer consumes them. This is keyed, bounded
+/// storage rather than an event mailbox: retransmitting one image replaces
+/// its old bytes and removals release them.
+const MAX_RETAINED_GRAPHICS_BYTES: usize = 320 * 1024 * 1024;
+const MAX_RETAINED_GRAPHICS_ITEMS: usize = 4096;
+
+#[derive(Default)]
+pub(crate) struct GraphicsUpdateStore {
+    atlas: HashMap<u64, rio_graphics::GraphicData>,
+    removed: HashSet<u64>,
+    bytes: usize,
+    over_budget: bool,
+    removals_over_budget: bool,
+}
+
+impl GraphicsUpdateStore {
+    fn merge(&mut self, queues: rio_vt::ansi::graphics::UpdateQueues) {
+        for graphic in queues.pending {
+            let key = rio_graphics::atlas_image_key(graphic.id.get());
+            let old_bytes = self.atlas.get(&key).map_or(0, |old| old.pixels.len());
+            if !self.atlas.contains_key(&key)
+                && self.atlas.len() >= MAX_RETAINED_GRAPHICS_ITEMS
+            {
+                self.over_budget = true;
+                continue;
+            }
+            let Some(bytes) = self
+                .bytes
+                .checked_sub(old_bytes)
+                .and_then(|bytes| bytes.checked_add(graphic.pixels.len()))
+            else {
+                self.over_budget = true;
+                continue;
+            };
+            if bytes > MAX_RETAINED_GRAPHICS_BYTES {
+                self.over_budget = true;
+                continue;
+            }
+            self.bytes = bytes;
+            self.atlas.insert(key, graphic);
+            self.removed.remove(&key);
+        }
+
+        // Kitty uploads remain authoritative in Crosswords::kitty_images and
+        // are copied by the atomic render snapshot. Dropping this duplicate
+        // queue avoids retaining every retransmission twice.
+        drop(queues.pending_images);
+
+        for key in queues.remove_queue {
+            if let Some(graphic) = self.atlas.remove(&key) {
+                self.bytes =
+                    self.bytes
+                        .checked_sub(graphic.pixels.len())
+                        .unwrap_or_else(|| {
+                            self.over_budget = true;
+                            0
+                        });
+            }
+            if !self.removed.contains(&key)
+                && self.removed.len() >= MAX_RETAINED_GRAPHICS_ITEMS
+            {
+                self.over_budget = true;
+                self.removals_over_budget = true;
+                continue;
+            }
+            self.removed.insert(key);
+        }
+    }
+
+    fn take(&mut self) -> Option<rio_vt::ansi::graphics::UpdateQueues> {
+        if self.atlas.is_empty() && self.removed.is_empty() {
+            return None;
+        }
+        self.bytes = 0;
+        let mut pending = self
+            .atlas
+            .drain()
+            .map(|(_, graphic)| graphic)
+            .collect::<Vec<_>>();
+        pending.sort_by_key(|graphic| graphic.id.get());
+        let mut remove_queue = self.removed.drain().collect::<Vec<_>>();
+        remove_queue.sort_unstable();
+        Some(rio_vt::ansi::graphics::UpdateQueues {
+            pending,
+            pending_images: Vec::new(),
+            remove_queue,
+        })
+    }
+
+    fn take_with_over_budget(
+        &mut self,
+    ) -> (Option<rio_vt::ansi::graphics::UpdateQueues>, bool, bool) {
+        let over_budget = self.over_budget;
+        let removals_over_budget = self.removals_over_budget;
+        let updates = self.take();
+        self.over_budget = false;
+        self.removals_over_budget = false;
+        (updates, over_budget, removals_over_budget)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphicsSnapshotError {
+    pub required_bytes: usize,
+    pub limit_bytes: usize,
+}
+
+impl std::fmt::Display for GraphicsSnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "terminal graphics require {} bytes, exceeding the {} byte snapshot budget",
+            self.required_bytes, self.limit_bytes
+        )
+    }
+}
+
+impl Error for GraphicsSnapshotError {}
+
+fn active_graphics_bytes_locked(
+    terminal: &Crosswords<Listener>,
+    limit_bytes: usize,
+) -> Result<usize, GraphicsSnapshotError> {
+    let mut required_bytes = 0usize;
+    for image in terminal.graphics.kitty_images.values() {
+        required_bytes = required_bytes.checked_add(image.data.pixels.len()).ok_or(
+            GraphicsSnapshotError {
+                required_bytes: usize::MAX,
+                limit_bytes,
+            },
+        )?;
+        if required_bytes > limit_bytes {
+            return Err(GraphicsSnapshotError {
+                required_bytes,
+                limit_bytes,
+            });
+        }
+    }
+    Ok(required_bytes)
+}
+
+fn graphics_snapshot_locked(terminal: &Crosswords<Listener>) -> GraphicsSnapshot {
+    GraphicsSnapshot {
+        kitty_images: terminal
+            .graphics
+            .kitty_images
+            .iter()
+            .map(|(id, image)| (*id, image.data.clone()))
+            .collect(),
+        kitty_placements: terminal
+            .graphics
+            .kitty_placements
+            .iter()
+            .map(|(key, placement)| (*key, placement.clone()))
+            .collect(),
+        kitty_virtual_placements: terminal
+            .graphics
+            .kitty_virtual_placements
+            .iter()
+            .map(|(key, placement)| (*key, placement.clone()))
+            .collect(),
+        atlas_placements: terminal.graphics.atlas_placements.clone(),
+    }
+}
+
+fn atlas_keys_locked(terminal: &Crosswords<Listener>) -> Vec<u64> {
+    terminal
+        .graphics
+        .atlas_key_refs
+        .keys()
+        .chain(
+            terminal
+                .graphics
+                .kitty_inactive_screen
+                .atlas_key_refs
+                .keys(),
+        )
+        .copied()
+        .collect()
+}
+
 /// `Send + Sync` everywhere threads exist. On wasm there is one thread and
 /// delegates hold JS callbacks (which are `!Send`), so the bound relaxes to
 /// nothing rather than forcing unsafe impls on the embedder.
@@ -146,7 +360,44 @@ pub trait SurfaceDelegate: MaybeSendSync + 'static {
     fn wakeup(&self, surface: SurfaceId);
     fn action(&self, _surface: SurfaceId, _action: Action) {}
     fn clipboard_write(&self, _surface: SurfaceId, _kind: ClipboardType, _text: String) {}
+    /// A terminal requested clipboard/selection contents. The formatter is
+    /// deliberately kept in-process; session transports turn this callback
+    /// into a bounded request ID before it crosses a wire.
+    fn clipboard_load(
+        &self,
+        _surface: SurfaceId,
+        _route: SurfaceId,
+        _kind: ClipboardType,
+        _format: Arc<dyn Fn(&str) -> String + Send + Sync>,
+    ) {
+    }
+    fn color_request(
+        &self,
+        _surface: SurfaceId,
+        _route: SurfaceId,
+        _index: usize,
+        _format: Arc<dyn Fn(ColorRgb) -> String + Send + Sync>,
+    ) {
+    }
+    fn text_area_size_request(
+        &self,
+        _surface: SurfaceId,
+        _route: SurfaceId,
+        _format: Arc<dyn Fn(rio_vt::event::WindowSize) -> String + Send + Sync>,
+    ) {
+    }
+    fn glyph_protocol_query(&self, _surface: SurfaceId, _route: SurfaceId, _cp: u32) {}
+    fn desktop_notification(&self, _surface: SurfaceId, _title: String, _body: String) {}
+    fn color_change(
+        &self,
+        _surface: SurfaceId,
+        _route: SurfaceId,
+        _index: usize,
+        _color: Option<ColorRgb>,
+    ) {
+    }
     fn close_surface(&self, _surface: SurfaceId) {}
+    fn child_exited(&self, _surface: SurfaceId, _status: Option<i32>) {}
     /// Bytes the terminal wants delivered to the child process. Only called
     /// on non-`pty` builds, where the host owns the transport (a WebSocket
     /// to a real shell, an in-page demo interpreter, ...); with a PTY the
@@ -158,8 +409,13 @@ pub trait SurfaceDelegate: MaybeSendSync + 'static {
 pub(crate) struct Listener {
     surface_id: SurfaceId,
     delegate: Arc<dyn SurfaceDelegate>,
+    graphics_updates: Arc<Mutex<GraphicsUpdateStore>>,
     #[cfg(feature = "pty")]
     pty_writer: Arc<Mutex<Option<corcovado::channel::Sender<Msg>>>>,
+    #[cfg(feature = "pty")]
+    input_budget: Option<InputBudget>,
+    #[cfg(feature = "pty")]
+    input_error: Arc<AtomicU8>,
 }
 
 impl Listener {
@@ -189,16 +445,86 @@ impl Listener {
             RioEvent::ClipboardStore(kind, text) => {
                 self.delegate.clipboard_write(self.surface_id, kind, text);
             }
-            RioEvent::PtyWrite(_, text) => {
+            RioEvent::PtyWrite(route_id, text) => {
+                if route_id != self.surface_id {
+                    tracing::error!(
+                        surface = self.surface_id,
+                        route = route_id,
+                        "discarding PTY reply addressed to another surface"
+                    );
+                    self.delegate.wakeup(self.surface_id);
+                    return;
+                }
                 #[cfg(feature = "pty")]
                 if let Some(channel) = self.pty_writer.lock().unwrap().as_ref() {
-                    let _ = channel.send(Msg::Input(Cow::Owned(text.into_bytes())));
+                    let input: Cow<'static, [u8]> = Cow::Owned(text.into_bytes());
+                    let result = if let Some(budget) = &self.input_budget {
+                        match budget.try_reserve(input.len()) {
+                            Ok(reservation) => channel
+                                .send(Msg::InputBounded { input, reservation })
+                                .map_err(|_| InputError::Disconnected),
+                            Err(InputBudgetError::WouldBlock) => {
+                                Err(InputError::WouldBlock)
+                            }
+                        }
+                    } else {
+                        channel
+                            .send(Msg::Input(input))
+                            .map_err(|_| InputError::Disconnected)
+                    };
+                    if let Err(error) = result {
+                        let code = match error {
+                            InputError::WouldBlock => 1,
+                            InputError::Disconnected => 2,
+                        };
+                        let _ = self.input_error.compare_exchange(
+                            0,
+                            code,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
+                        self.delegate.wakeup(self.surface_id);
+                    }
                 }
                 #[cfg(not(feature = "pty"))]
                 self.delegate.output(self.surface_id, text.as_bytes());
             }
+            RioEvent::ClipboardLoad(route_id, kind, format) => {
+                self.delegate
+                    .clipboard_load(self.surface_id, route_id, kind, format);
+            }
+            RioEvent::ColorRequest(route_id, index, format) => {
+                self.delegate
+                    .color_request(self.surface_id, route_id, index, format);
+            }
+            RioEvent::TextAreaSizeRequest(route_id, format) => {
+                self.delegate
+                    .text_area_size_request(self.surface_id, route_id, format);
+            }
+            RioEvent::GlyphProtocolQuery { route_id, cp } => {
+                self.delegate
+                    .glyph_protocol_query(self.surface_id, route_id, cp);
+            }
+            RioEvent::DesktopNotification { title, body } => {
+                self.delegate
+                    .desktop_notification(self.surface_id, title, body);
+            }
+            RioEvent::ColorChange(route_id, index, color) => {
+                self.delegate
+                    .color_change(self.surface_id, route_id, index, color);
+                // Color changes alter the passive frame/palette even when the
+                // parser did not emit a separate terminal-damage event.
+                self.delegate.wakeup(self.surface_id);
+            }
             RioEvent::CloseTerminal(_) | RioEvent::Exit => {
                 self.delegate.close_surface(self.surface_id);
+            }
+            RioEvent::ChildExited(_, status) => {
+                self.delegate.child_exited(self.surface_id, status);
+            }
+            RioEvent::UpdateGraphics { queues, .. } => {
+                self.graphics_updates.lock().unwrap().merge(queues);
+                self.delegate.wakeup(self.surface_id);
             }
             RioEvent::ProgressReport(report) => {
                 use rio_vt::event::ProgressState;
@@ -242,6 +568,13 @@ pub struct SurfaceDesc {
     pub pixel_width: u16,
     pub pixel_height: u16,
     pub scrollback: usize,
+    /// Optional child environment. With `clear_environment`, this replaces
+    /// the worker environment instead of overlaying it.
+    pub environment: Option<Vec<(String, String)>>,
+    pub clear_environment: bool,
+    /// Optional bound for bytes queued between the host and the PTY. `None`
+    /// preserves the historical unbounded embedder behavior.
+    pub input_queue_limit: Option<usize>,
 }
 
 impl Default for SurfaceDesc {
@@ -255,6 +588,9 @@ impl Default for SurfaceDesc {
             pixel_width: 720,
             pixel_height: 432,
             scrollback: 10_000,
+            environment: None,
+            clear_environment: false,
+            input_queue_limit: None,
         }
     }
 }
@@ -329,6 +665,7 @@ pub struct Surface {
     id: SurfaceId,
     alt_is_meta: std::sync::atomic::AtomicBool,
     terminal: Arc<FairMutex<Crosswords<Listener>>>,
+    graphics_updates: Arc<Mutex<GraphicsUpdateStore>>,
     /// Compiled URL detector, built on first hover. Hit-testing runs per
     /// pointer event, so the four lazy DFAs must not be rebuilt each time.
     url_regex: std::sync::Mutex<Option<rio_vt::crosswords::search::RegexSearch>>,
@@ -350,10 +687,18 @@ pub struct Surface {
     #[cfg(all(feature = "pty", not(target_os = "windows")))]
     child_terminator: teletypewriter::ChildTerminator,
     #[cfg(feature = "pty")]
-    _io_thread: std::thread::JoinHandle<(
-        Machine<teletypewriter::Pty, Listener>,
-        rio_vt::performer::State,
-    )>,
+    reap_child_on_drop: bool,
+    #[cfg(feature = "pty")]
+    input_budget: Option<InputBudget>,
+    #[cfg(feature = "pty")]
+    input_error: Arc<AtomicU8>,
+    #[cfg(feature = "pty")]
+    _io_thread: Option<
+        std::thread::JoinHandle<(
+            Machine<teletypewriter::Pty, Listener>,
+            rio_vt::performer::State,
+        )>,
+    >,
 }
 
 /// Encode one mouse report. SGR (`CSI < b ; x ; y M`) when the program
@@ -406,13 +751,19 @@ impl Surface {
         desc: &SurfaceDesc,
     ) -> Result<Surface, Box<dyn Error + Send + Sync>> {
         let id = engine.next_surface_id.fetch_add(1, Ordering::SeqCst);
+        let graphics_updates = Arc::new(Mutex::new(GraphicsUpdateStore::default()));
         #[cfg(feature = "pty")]
         let pty_writer = Arc::new(Mutex::new(None));
         let listener = Listener {
             surface_id: id,
             delegate: engine.delegate.clone(),
+            graphics_updates: Arc::clone(&graphics_updates),
             #[cfg(feature = "pty")]
             pty_writer: pty_writer.clone(),
+            #[cfg(feature = "pty")]
+            input_budget: desc.input_queue_limit.map(InputBudget::new),
+            #[cfg(feature = "pty")]
+            input_error: Arc::new(AtomicU8::new(0)),
         };
 
         let terminal = Crosswords::new(
@@ -441,6 +792,7 @@ impl Surface {
                 // Terminals default alt to meta; the host may override it.
                 alt_is_meta: std::sync::atomic::AtomicBool::new(true),
                 terminal,
+                graphics_updates,
                 url_regex: std::sync::Mutex::new(None),
                 processor: std::sync::Mutex::new(None),
                 delegate: engine.delegate.clone(),
@@ -461,8 +813,16 @@ impl Surface {
             #[cfg(not(target_os = "windows"))]
             let env = {
                 let terminfo = match (
-                    teletypewriter::terminfo_exists("xterm-rio"),
-                    teletypewriter::terminfo_exists("rio"),
+                    teletypewriter::terminfo_exists_with_environment(
+                        "xterm-rio",
+                        desc.environment.as_deref(),
+                        desc.clear_environment,
+                    ),
+                    teletypewriter::terminfo_exists_with_environment(
+                        "rio",
+                        desc.environment.as_deref(),
+                        desc.clear_environment,
+                    ),
                 ) {
                     (true, _) => "xterm-rio",
                     (false, true) => "rio",
@@ -475,29 +835,50 @@ impl Surface {
             };
 
             #[cfg(not(target_os = "windows"))]
-            let pty = create_pty_with_spawn(
-                shell,
-                desc.args.clone(),
-                &desc.working_dir,
-                env,
-                desc.cols,
-                desc.rows,
-                desc.pixel_width,
-                desc.pixel_height,
-            )
-            .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?;
+            let pty = {
+                let mut env = env;
+                if let Some(extra) = desc.environment.clone() {
+                    env.get_or_insert_with(Vec::new).extend(extra);
+                }
+                let result = if desc.clear_environment {
+                    create_pty_with_spawn_clear_env(
+                        shell,
+                        desc.args.clone(),
+                        &desc.working_dir,
+                        env.unwrap_or_default(),
+                        desc.cols,
+                        desc.rows,
+                        desc.pixel_width,
+                        desc.pixel_height,
+                    )
+                } else {
+                    create_pty_with_spawn(
+                        shell,
+                        desc.args.clone(),
+                        &desc.working_dir,
+                        env,
+                        desc.cols,
+                        desc.rows,
+                        desc.pixel_width,
+                        desc.pixel_height,
+                    )
+                };
+                result.map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?
+            };
 
             #[cfg(target_os = "windows")]
             let pty = create_pty(
                 shell,
                 desc.args.clone(),
                 &desc.working_dir,
-                None,
+                desc.environment.clone(),
                 desc.cols,
                 desc.rows,
             )
             .map_err(|err| Box::new(err) as Box<dyn Error + Send + Sync>)?;
 
+            let input_budget = listener.input_budget.clone();
+            let input_error = Arc::clone(&listener.input_error);
             #[cfg(not(target_os = "windows"))]
             let shell_pid = pty.child.pid as u32;
             #[cfg(target_os = "windows")]
@@ -522,15 +903,17 @@ impl Surface {
                 // Terminals default alt to meta; the host may override it.
                 alt_is_meta: std::sync::atomic::AtomicBool::new(true),
                 terminal,
+                graphics_updates,
                 url_regex: std::sync::Mutex::new(None),
                 processor: std::sync::Mutex::new(None),
                 channel,
                 shell_pid,
                 #[cfg(not(target_os = "windows"))]
                 main_fd,
-                #[cfg(not(target_os = "windows"))]
-                child_terminator,
-                _io_thread: io_thread,
+                reap_child_on_drop: desc.clear_environment,
+                input_budget,
+                input_error,
+                _io_thread: Some(io_thread),
             })
         }
     }
@@ -539,7 +922,49 @@ impl Surface {
         self.id
     }
 
-    pub fn write<B: Into<Cow<'static, [u8]>>>(&self, bytes: B) {
+    /// Reports and clears an input enqueue failure from a parser-generated
+    /// terminal response. Worker hosts use this to surface a bounded-queue
+    /// failure instead of silently dropping the response.
+    #[cfg(feature = "pty")]
+    pub fn take_input_error(&self) -> Option<InputError> {
+        match self
+            .input_error
+            .swap(0, std::sync::atomic::Ordering::AcqRel)
+        {
+            0 => None,
+            1 => Some(InputError::WouldBlock),
+            2 => Some(InputError::Disconnected),
+            code => panic!("invalid PTY input error code: {code}"),
+        }
+    }
+
+    #[cfg(feature = "pty")]
+    fn enqueue_input(&self, bytes: Cow<'static, [u8]>) -> Result<(), InputError> {
+        let message = if let Some(budget) = &self.input_budget {
+            let reservation = budget
+                .try_reserve(bytes.len())
+                .map_err(|InputBudgetError::WouldBlock| InputError::WouldBlock)?;
+            Msg::InputBounded {
+                input: bytes,
+                reservation,
+            }
+        } else {
+            Msg::Input(bytes)
+        };
+        self.channel
+            .send(message)
+            .map_err(|_| InputError::Disconnected)
+    }
+
+    /// Fallible PTY input enqueue. A worker configures an input queue budget;
+    /// default embedders keep the historical unbounded behavior through
+    /// [`Surface::write`].
+    pub fn try_write<B: Into<Cow<'static, [u8]>>>(
+        &self,
+        bytes: B,
+    ) -> Result<(), InputError> {
+        self.try_write_response(bytes)?;
+
         // Input snaps the view back to the live screen and drops any
         // selection, the scroll-to-bottom / clear-on-typing convention
         // (only reached when a key actually produced PTY bytes).
@@ -553,10 +978,26 @@ impl Surface {
                 term.selection = None;
             }
         }
+        Ok(())
+    }
+
+    /// Enqueue a terminal-generated reply through the input budget without
+    /// changing the user's viewport or selection.
+    pub fn try_write_response<B: Into<Cow<'static, [u8]>>>(
+        &self,
+        bytes: B,
+    ) -> Result<(), InputError> {
+        let bytes = bytes.into();
         #[cfg(feature = "pty")]
-        let _ = self.channel.send(Msg::Input(bytes.into()));
+        self.enqueue_input(bytes)?;
         #[cfg(not(feature = "pty"))]
-        self.delegate.output(self.id, &bytes.into());
+        self.delegate.output(self.id, &bytes);
+
+        Ok(())
+    }
+
+    pub fn write<B: Into<Cow<'static, [u8]>>>(&self, bytes: B) {
+        let _ = self.try_write(bytes);
     }
 
     pub fn text(&self, text: &str) {
@@ -569,12 +1010,16 @@ impl Surface {
     /// the payload can never close the bracket early and inject
     /// keystrokes; otherwise newlines are normalized to CR, what the
     /// Enter key produces.
-    pub fn paste(&self, text: &str) {
+    pub fn try_paste(&self, text: &str) -> Result<(), InputError> {
         if text.is_empty() {
-            return;
+            return Ok(());
         }
         let bracketed = self.terminal.lock().mode().contains(Mode::BRACKETED_PASTE);
-        self.write(encode_paste(text, bracketed));
+        self.try_write(encode_paste(text, bracketed))
+    }
+
+    pub fn paste(&self, text: &str) {
+        let _ = self.try_paste(text);
     }
 
     /// A stable, C-friendly view of the terminal modes an embedder needs
@@ -609,6 +1054,17 @@ impl Surface {
         self.alt_is_meta.load(Ordering::Relaxed)
     }
 
+    /// Apply host cursor defaults without exposing the authoritative terminal
+    /// to the embedder. Parser-issued cursor modes can still override these
+    /// values afterward.
+    pub fn set_cursor_style(&self, shape: CursorShape, blinking: bool) {
+        let mut terminal = self.terminal.lock();
+        terminal.cursor_shape = shape;
+        terminal.default_cursor_shape = shape;
+        terminal.blinking_cursor = blinking;
+        terminal.mark_fully_damaged();
+    }
+
     /// Configure the default for grapheme cluster processing (DEC
     /// private mode 2027). On by default; embedders whose renderers
     /// assume legacy wcwidth cell layout can turn it off. Applied
@@ -618,7 +1074,7 @@ impl Surface {
         self.terminal.lock().set_grapheme_clustering(enabled);
     }
 
-    pub fn key(&self, event: &KeyEvent) -> bool {
+    pub fn try_key(&self, event: &KeyEvent) -> Result<bool, InputError> {
         // The encoding depends on terminal state the embedder does not track,
         // which is the reason this lives here and not in the host.
         let ctx = {
@@ -632,11 +1088,198 @@ impl Surface {
         };
         match key::encode(event, &ctx) {
             Some(bytes) => {
-                self.write(bytes);
-                true
+                self.try_write(bytes)?;
+                Ok(true)
             }
-            None => false,
+            None => Ok(false),
         }
+    }
+
+    pub fn key(&self, event: &KeyEvent) -> bool {
+        self.try_key(event).unwrap_or(false)
+    }
+
+    /// Report a host focus transition only when the application enabled DEC
+    /// mode 1004. The bytes use the same bounded input path as key reports.
+    pub fn try_focus(&self, focused: bool) -> Result<bool, InputError> {
+        if !self.terminal.lock().mode().contains(Mode::FOCUS_IN_OUT) {
+            return Ok(false);
+        }
+        self.try_write_response(if focused { b"\x1b[I" } else { b"\x1b[O" }.to_vec())?;
+        Ok(true)
+    }
+
+    pub fn vi_mode(&self) -> bool {
+        self.terminal.lock().mode().contains(Mode::VI)
+    }
+
+    pub fn set_vi_mode(&self, enabled: bool) -> bool {
+        let mut terminal = self.terminal.lock();
+        let current = terminal.mode().contains(Mode::VI);
+        if current != enabled {
+            terminal.toggle_vi_mode();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn toggle_vi_mode(&self) -> bool {
+        self.terminal.lock().toggle_vi_mode();
+        true
+    }
+
+    pub fn vi_motion(&self, motion: rio_vt::crosswords::vi_mode::ViMotion) -> bool {
+        let mut terminal = self.terminal.lock();
+        if !terminal.mode().contains(Mode::VI) {
+            return false;
+        }
+        terminal.vi_motion(motion);
+        true
+    }
+
+    pub fn vi_scroll(&self, delta_lines: i32) -> bool {
+        let mut terminal = self.terminal.lock();
+        if !terminal.mode().contains(Mode::VI) {
+            return false;
+        }
+        terminal.vi_scroll(delta_lines);
+        true
+    }
+
+    pub fn vi_goto(&self, line: i32, column: usize) -> bool {
+        let mut terminal = self.terminal.lock();
+        if !terminal.mode().contains(Mode::VI) {
+            return false;
+        }
+        terminal.vi_goto_pos(Pos::new(Line(line), PosColumn(column)));
+        true
+    }
+
+    pub fn scroll_to_prompt(&self, forward: bool) {
+        self.terminal.lock().scroll_to_prompt(forward);
+    }
+
+    pub fn scroll_to_top(&self) {
+        use rio_vt::crosswords::grid::Scroll;
+        self.terminal.lock().scroll_display(Scroll::Top);
+    }
+
+    pub fn scroll_to_bottom(&self) {
+        use rio_vt::crosswords::grid::Scroll;
+        self.terminal.lock().scroll_display(Scroll::Bottom);
+    }
+
+    pub fn clear_saved_history(&self) {
+        self.terminal.lock().clear_saved_history();
+    }
+
+    /// Select the entire retained grid, including scrollback. This is an
+    /// authoritative terminal operation so selection text and rendering see
+    /// the same range.
+    pub fn select_all(&self) {
+        use rio_vt::crosswords::grid::Dimensions;
+        let mut terminal = self.terminal.lock();
+        let start = Pos::new(terminal.grid.topmost_line(), PosColumn(0));
+        let end = Pos::new(terminal.grid.bottommost_line(), terminal.grid.last_column());
+        let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
+        selection.update(end, Side::Right);
+        selection.include_all();
+        terminal.selection = Some(selection);
+        terminal.mark_fully_damaged();
+    }
+
+    /// Move the viewport and update a dragging selection endpoint while the
+    /// terminal lock is held. The pointer coordinates are relative to the
+    /// resulting viewport, matching the GUI selection-scroll tick.
+    pub fn selection_autoscroll(
+        &self,
+        delta_lines: i32,
+        viewport_line: i32,
+        col: usize,
+        side: Side,
+    ) -> bool {
+        use rio_vt::crosswords::grid::{Dimensions, Scroll};
+        let mut terminal = self.terminal.lock();
+        if terminal.selection.is_none() {
+            return false;
+        }
+        terminal.scroll_display(Scroll::Delta(delta_lines));
+        let history = terminal.history_size() as i32;
+        let bottom = terminal.grid.bottommost_line().0;
+        let line =
+            (viewport_line - terminal.display_offset() as i32).clamp(-history, bottom);
+        let column = col.min(terminal.grid.last_column().0);
+        if let Some(selection) = &mut terminal.selection {
+            selection.update(Pos::new(Line(line), PosColumn(column)), side);
+            terminal.mark_fully_damaged();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn display_offset(&self) -> usize {
+        self.terminal.lock().display_offset()
+    }
+
+    pub fn columns(&self) -> usize {
+        self.terminal.lock().columns()
+    }
+
+    pub fn screen_lines(&self) -> usize {
+        self.terminal.lock().screen_lines()
+    }
+
+    pub fn restore_display_offset(&self, target: usize) {
+        use rio_vt::crosswords::grid::Scroll;
+        let mut terminal = self.terminal.lock();
+        let current = terminal.display_offset();
+        let delta = target as i64 - current as i64;
+        if delta != 0 {
+            terminal.scroll_display(Scroll::Delta(delta as i32));
+        }
+    }
+
+    pub fn scroll_to_pos(&self, line: i32, column: usize) -> bool {
+        let mut terminal = self.terminal.lock();
+        let before = terminal.display_offset();
+        terminal.scroll_to_pos(Pos::new(Line(line), PosColumn(column)));
+        before != terminal.display_offset()
+    }
+
+    pub fn search_next(
+        &self,
+        regex: &mut rio_vt::crosswords::search::RegexSearch,
+        origin: Pos,
+        direction: rio_vt::crosswords::pos::Direction,
+        side: Side,
+        max_lines: Option<usize>,
+    ) -> Option<(Pos, Pos)> {
+        let terminal = self.terminal.lock();
+        terminal
+            .search_next(regex, origin, direction, side, max_lines)
+            .map(|matched| (*matched.start(), *matched.end()))
+    }
+
+    pub fn cursor_position(&self) -> (i32, u16) {
+        let cursor = self.terminal.lock().cursor();
+        (cursor.pos.row.0, cursor.pos.col.0 as u16)
+    }
+
+    /// Return the authoritative vi cursor position without applying the
+    /// viewport offset used by the rendered cursor.
+    pub fn vi_cursor_position(&self) -> (i32, u16) {
+        let terminal = self.terminal.lock();
+        let cursor = terminal.vi_cursor_pos();
+        (cursor.row.0, cursor.col.0 as u16)
+    }
+
+    pub fn color(&self, index: usize) -> Option<ColorRgb> {
+        if index >= rio_vt::config::colors::term::COUNT {
+            return None;
+        }
+        self.terminal.lock().colors()[index].map(ColorRgb::from_color_arr)
     }
 
     pub fn resize(&self, cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) {
@@ -669,9 +1312,15 @@ impl Surface {
     /// `row` are the cell under the pointer, needed by mouse reports.
     /// Returns true when the program consumed it, false when the
     /// scrollback moved instead.
-    pub fn scroll_wheel(&self, lines: i32, col: u16, row: u16, mods: Modifiers) -> bool {
+    pub fn try_scroll_wheel(
+        &self,
+        lines: i32,
+        col: u16,
+        row: u16,
+        mods: Modifiers,
+    ) -> Result<bool, InputError> {
         if lines == 0 {
-            return false;
+            return Ok(false);
         }
         let (mouse_mode, alt_screen, alt_scroll, app_cursor, sgr, utf8) = {
             let terminal = self.terminal.lock();
@@ -704,8 +1353,8 @@ impl Surface {
             for _ in 0..lines.abs() {
                 out.extend_from_slice(&mouse_report(button, col, row, true, sgr, utf8));
             }
-            self.write(out);
-            return true;
+            self.try_write(out)?;
+            return Ok(true);
         }
 
         if alt_screen && alt_scroll && !shift {
@@ -720,12 +1369,17 @@ impl Surface {
             for _ in 0..lines.abs() {
                 out.extend_from_slice(seq);
             }
-            self.write(out);
-            return true;
+            self.try_write(out)?;
+            return Ok(true);
         }
 
         self.scroll(lines);
-        false
+        Ok(false)
+    }
+
+    pub fn scroll_wheel(&self, lines: i32, col: u16, row: u16, mods: Modifiers) -> bool {
+        self.try_scroll_wheel(lines, col, row, mods)
+            .unwrap_or(false)
     }
 
     /// Report a mouse button press/release to the program when it asked for
@@ -734,14 +1388,14 @@ impl Surface {
     /// should not start a local selection. Returns false when no program
     /// is grabbing the mouse, or shift is held to force a local selection
     /// (shift-to-bypass).
-    pub fn mouse_button(
+    pub fn try_mouse_button(
         &self,
         col: u16,
         row: u16,
         button: u8,
         pressed: bool,
         mods: Modifiers,
-    ) -> bool {
+    ) -> Result<bool, InputError> {
         let (mouse_mode, x10, sgr, utf8) = {
             let mode = self.terminal.lock().mode();
             (
@@ -752,12 +1406,12 @@ impl Surface {
             )
         };
         if !mouse_mode || mods.contains(Modifiers::SHIFT) {
-            return false;
+            return Ok(false);
         }
         // X10 (mode 9) reports only presses of the three main buttons, with
         // no modifiers and no release.
         if x10 && (!pressed || button > 2) {
-            return false;
+            return Ok(false);
         }
         let mut encoded = button;
         if !x10 {
@@ -768,15 +1422,33 @@ impl Surface {
                 encoded += 16;
             }
         }
-        self.write(mouse_report(encoded, col, row, pressed, sgr, utf8));
-        true
+        self.try_write(mouse_report(encoded, col, row, pressed, sgr, utf8))?;
+        Ok(true)
+    }
+
+    pub fn mouse_button(
+        &self,
+        col: u16,
+        row: u16,
+        button: u8,
+        pressed: bool,
+        mods: Modifiers,
+    ) -> bool {
+        self.try_mouse_button(col, row, button, pressed, mods)
+            .unwrap_or(false)
     }
 
     /// Report pointer motion for button-event (1002, a button held) and
     /// any-event (1003, bare motion) modes. `button` is 0/1/2 for the button
     /// held during a drag, or 3 when none is held. Returns true when a report
     /// was written.
-    pub fn mouse_motion(&self, col: u16, row: u16, button: u8, mods: Modifiers) -> bool {
+    pub fn try_mouse_motion(
+        &self,
+        col: u16,
+        row: u16,
+        button: u8,
+        mods: Modifiers,
+    ) -> Result<bool, InputError> {
         let (drag, motion, sgr, utf8) = {
             let mode = self.terminal.lock().mode();
             (
@@ -787,12 +1459,12 @@ impl Surface {
             )
         };
         if mods.contains(Modifiers::SHIFT) {
-            return false;
+            return Ok(false);
         }
         // 1002 reports motion only while a button is down; 1003 reports all.
         let wanted = if button >= 3 { motion } else { drag || motion };
         if !wanted {
-            return false;
+            return Ok(false);
         }
         // The motion bit (32) rides on top of the button.
         let mut encoded = button.saturating_add(32);
@@ -802,8 +1474,13 @@ impl Surface {
         if mods.contains(Modifiers::CTRL) {
             encoded += 16;
         }
-        self.write(mouse_report(encoded, col, row, true, sgr, utf8));
-        true
+        self.try_write(mouse_report(encoded, col, row, true, sgr, utf8))?;
+        Ok(true)
+    }
+
+    pub fn mouse_motion(&self, col: u16, row: u16, button: u8, mods: Modifiers) -> bool {
+        self.try_mouse_motion(col, row, button, mods)
+            .unwrap_or(false)
     }
 
     pub fn scroll(&self, delta_lines: i32) {
@@ -850,6 +1527,13 @@ impl Surface {
 
     pub fn selection_text(&self) -> Option<String> {
         self.terminal.lock().selection_to_string()
+    }
+
+    pub fn selection_text_bounded(
+        &self,
+        max_bytes: usize,
+    ) -> Result<Option<String>, rio_vt::crosswords::SelectionTextError> {
+        self.terminal.lock().selection_to_string_bounded(max_bytes)
     }
 
     /// The shell's current working directory: OSC 7 when the shell reports
@@ -1194,6 +1878,16 @@ impl Surface {
 impl Drop for Surface {
     fn drop(&mut self) {
         let _ = self.channel.send(Msg::Shutdown);
+        if self.reap_child_on_drop {
+            // Session workers opt into deterministic PTY ownership teardown;
+            // the legacy/default embedder path leaves its JoinHandle detached
+            // and remains non-blocking.
+            if let Some(io_thread) = self._io_thread.take() {
+                let _ = io_thread.join();
+            }
+            #[cfg(not(target_os = "windows"))]
+            let _ = teletypewriter::reap_child(self.shell_pid as _);
+        }
     }
 }
 

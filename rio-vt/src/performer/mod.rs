@@ -12,7 +12,7 @@ use crate::event::sync::FairMutex;
 #[cfg(feature = "pty")]
 use crate::event::RioEvent;
 #[cfg(feature = "pty")]
-use crate::event::{EventListener, Msg, WindowId};
+use crate::event::{EventListener, InputReservation, Msg, WindowId};
 #[cfg(feature = "pty")]
 use corcovado::channel;
 #[cfg(all(unix, feature = "pty"))]
@@ -133,7 +133,7 @@ pub struct Machine<T: teletypewriter::EventedPty, U: EventListener> {
 #[cfg(feature = "pty")]
 #[derive(Default)]
 pub struct State {
-    write_list: VecDeque<Cow<'static, [u8]>>,
+    write_list: VecDeque<Writing>,
     writing: Option<Writing>,
     parser: handler::Processor,
 }
@@ -149,7 +149,7 @@ impl State {
 
     #[inline]
     fn goto_next(&mut self) {
-        self.writing = self.write_list.pop_front().map(Writing::new);
+        self.writing = self.write_list.pop_front();
     }
 
     #[inline]
@@ -172,21 +172,26 @@ impl State {
 struct Writing {
     source: Cow<'static, [u8]>,
     written: usize,
+    reservation: Option<InputReservation>,
 }
 
 #[cfg(feature = "pty")]
 impl Writing {
     #[inline]
-    fn new(c: Cow<'static, [u8]>) -> Writing {
+    fn new(c: Cow<'static, [u8]>, reservation: Option<InputReservation>) -> Writing {
         Writing {
             source: c,
             written: 0,
+            reservation,
         }
     }
 
     #[inline]
     fn advance(&mut self, n: usize) {
         self.written += n;
+        if let Some(reservation) = &mut self.reservation {
+            reservation.consume(n);
+        }
     }
 
     #[inline]
@@ -321,7 +326,12 @@ where
     fn drain_recv_channel(&mut self, state: &mut State) -> bool {
         while let Some(msg) = self.receiver.recv() {
             match msg {
-                Msg::Input(input) => state.write_list.push_back(input),
+                Msg::Input(input) => {
+                    state.write_list.push_back(Writing::new(input, None))
+                }
+                Msg::InputBounded { input, reservation } => state
+                    .write_list
+                    .push_back(Writing::new(input, Some(reservation))),
                 Msg::Resize(window_size) => {
                     let _ = self.pty.set_winsize(window_size.into());
                 }
