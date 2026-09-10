@@ -3,8 +3,9 @@
 // CPU backend for the grid renderer.
 //
 // Mirrors the GPU backends (`metal`, `vulkan`, `webgpu`) in scope and
-// data layout, but rasterises directly into the softbuffer u32 pixel
-// buffer instead of recording draw calls. Storage matches the Metal
+// data layout, but rasterises directly into a caller-owned u32 pixel
+// buffer instead of recording draw calls. Pixels use logical 0xAARRGGBB
+// values (little-endian BGRA8 premultiplied bytes). Storage matches the Metal
 // renderer cell-for-cell: one flat `Vec<CellBg>` indexed by
 // `row * cols + col`, plus per-row `Vec<CellText>` slots (slot 0 =
 // block-cursor cells, 1..=rows = content rows, last = non-block
@@ -361,7 +362,8 @@ impl CpuGridRenderer {
     }
 
     /// Paint the grid (bg cells + cursor + fg glyphs) into the
-    /// caller's `0x00RRGGBB` u32 buffer. Mirrors the bg + text passes
+    /// caller's `0xAARRGGBB` u32 buffer. On little-endian systems the bytes
+    /// are BGRA8 premultiplied. Mirrors the bg + text passes
     /// of `grid.metal`'s shaders, in the same draw order so glyphs
     /// composite correctly over their cell backgrounds.
     /// Paint the cell-bg pass into `buf`. Pair with `render_text`,
@@ -371,6 +373,17 @@ impl CpuGridRenderer {
         buf: &mut [u32],
         buf_w: u32,
         buf_h: u32,
+        uniforms: &GridUniforms,
+    ) {
+        self.render_bg_strided(buf, buf_w, buf_h, buf_w, uniforms);
+    }
+
+    pub fn render_bg_strided(
+        &self,
+        buf: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        stride_pixels: u32,
         uniforms: &GridUniforms,
     ) {
         let cell_w = uniforms.cell_size[0];
@@ -411,7 +424,17 @@ impl CpuGridRenderer {
                 let y0 = (pad_top + (row as f32) * cell_h).round() as i32;
                 let x1 = (pad_left + ((col + 1) as f32) * cell_w).round() as i32;
                 let y1 = (pad_top + ((row + 1) as f32) * cell_h).round() as i32;
-                fill_rect(buf, buf_w_i, buf_h_i, x0, y0, x1, y1, rgba);
+                fill_rect(
+                    buf,
+                    buf_w_i,
+                    buf_h_i,
+                    stride_pixels as usize,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    rgba,
+                );
             }
         }
     }
@@ -424,6 +447,17 @@ impl CpuGridRenderer {
         buf: &mut [u32],
         buf_w: u32,
         buf_h: u32,
+        uniforms: &GridUniforms,
+    ) {
+        self.render_text_strided(buf, buf_w, buf_h, buf_w, uniforms);
+    }
+
+    pub fn render_text_strided(
+        &self,
+        buf: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        stride_pixels: u32,
         uniforms: &GridUniforms,
     ) {
         let cell_w = uniforms.cell_size[0];
@@ -481,6 +515,7 @@ impl CpuGridRenderer {
                         buf,
                         buf_w_i,
                         buf_h_i,
+                        stride_pixels as usize,
                         glyph_x,
                         glyph_y,
                         gw,
@@ -492,8 +527,19 @@ impl CpuGridRenderer {
                     );
                 } else {
                     blit_mask(
-                        buf, buf_w_i, buf_h_i, glyph_x, glyph_y, gw, gh, mask, mask_side,
-                        ax, ay, color,
+                        buf,
+                        buf_w_i,
+                        buf_h_i,
+                        stride_pixels as usize,
+                        glyph_x,
+                        glyph_y,
+                        gw,
+                        gh,
+                        mask,
+                        mask_side,
+                        ax,
+                        ay,
+                        color,
                     );
                 }
             }
@@ -547,6 +593,7 @@ fn fill_rect(
     buf: &mut [u32],
     buf_w: i32,
     buf_h: i32,
+    stride: usize,
     x0: i32,
     y0: i32,
     x1: i32,
@@ -561,7 +608,6 @@ fn fill_rect(
         return;
     }
     let pre = premul(rgba);
-    let stride = buf_w as usize;
     if pre[3] == 255 {
         let opaque = pack_opaque(pre[0], pre[1], pre[2]);
         for y in y0..y1 {
@@ -585,6 +631,7 @@ fn blit_mask(
     buf: &mut [u32],
     buf_w: i32,
     buf_h: i32,
+    stride: usize,
     glyph_x: i32,
     glyph_y: i32,
     gw: i32,
@@ -598,7 +645,6 @@ fn blit_mask(
     if color[3] == 0 {
         return;
     }
-    let stride = buf_w as usize;
     // Clip glyph rect to buffer + atlas bounds in one step.
     let x_start = glyph_x.max(0);
     let y_start = glyph_y.max(0);
@@ -648,6 +694,7 @@ fn blit_color(
     buf: &mut [u32],
     buf_w: i32,
     buf_h: i32,
+    stride: usize,
     glyph_x: i32,
     glyph_y: i32,
     gw: i32,
@@ -657,7 +704,6 @@ fn blit_color(
     ax: usize,
     ay: usize,
 ) {
-    let stride = buf_w as usize;
     let x_start = glyph_x.max(0);
     let y_start = glyph_y.max(0);
     let x_end = (glyph_x + gw).min(buf_w);

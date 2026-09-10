@@ -123,7 +123,7 @@ ash = "0.38.0"
 # higher-level `windows` crate isn't in Debian at all.
 
 [dev-dependencies]
-rio-window = { workspace = true }
+rio-window = { workspace = true, features = ["x11"] }
 png = "0.17.16"
 deflate = "1.0.0"
 criterion = { workspace = true }
