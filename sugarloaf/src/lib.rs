@@ -40,8 +40,7 @@ pub use crate::sugarloaf::{
     graphics::{
         atlas_image_key, image_key_route, kitty_image_key, route_image_key, ColorType,
         Graphic, GraphicData, GraphicDataEntry, GraphicId, GraphicKey, GraphicOverlay,
-        ResizeCommand,
-        ResizeParameter, MAX_GRAPHIC_DIMENSIONS,
+        ResizeCommand, ResizeParameter, MAX_GRAPHIC_DIMENSIONS,
     },
     primitives::{
         is_private_user_area, Corners, CursorKind, ImageProperties, Quad, Rect,

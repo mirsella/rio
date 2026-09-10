@@ -2285,7 +2285,7 @@ fn premultiply_color_bitmap(image: &mut swash::scale::image::Image) {
 }
 
 #[cfg(all(test, not(target_os = "macos")))]
-mod color_bitmap_tests {
+mod color_bitmap_premultiply_tests {
     use super::premultiply_color_bitmap;
     use swash::scale::{image::Image, Source, StrikeWith};
 

@@ -13,7 +13,7 @@ readme = "README.md"
 path = "src/lib.rs"
 
 [dependencies]
-rio-backend = { workspace = true }
+rio-backend = { path = "../rio-backend", default-features = false, features = ["renderer", "graphics"] }
 rustc-hash = { workspace = true }
 smallvec = { workspace = true }
 rapidhash = { version = "4.4.1", default-features = false }

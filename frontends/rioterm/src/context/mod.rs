@@ -1,33 +1,44 @@
 pub mod renderable;
+pub mod session;
 pub mod title;
 
-use crate::ansi::CursorShape;
 use crate::context::title::{
     create_title_extra_from_context, update_title, ContextTitle,
 };
 use crate::event::sync::FairMutex;
-use crate::event::{Msg, RioEvent};
+use crate::event::RioEvent;
 use crate::ime::Ime;
 pub use crate::layout::{ContextDimension, ContextGrid, TabId};
-use crate::messenger::Messenger;
-use crate::performer::{self, Machine};
 use renderable::Cursor;
 use renderable::RenderableContent;
 use rio_backend::config::layout::Margin;
 use rio_backend::config::Shell;
+use session::{PreparedSession, RemoteView, SessionHandle};
 use smallvec::{smallvec, SmallVec};
 
-use rio_backend::crosswords::{Crosswords, MIN_COLUMNS, MIN_LINES};
 use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
 use rio_backend::event::EventListener;
 use rio_backend::event::{WindowId, WindowTarget};
 use rio_backend::selection::SelectionRange;
 use rio_backend::sugarloaf::{font::SugarloafFont, Rect, Sugarloaf, SugarloafErrors};
 use std::error::Error;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+fn transfer_layout_routes(
+    node: &crate::router::window_control::LayoutNodeOffer,
+    routes: &mut Vec<u64>,
+) {
+    if node.children.is_empty() {
+        routes.push(node.route_id);
+    } else {
+        for child in &node.children {
+            transfer_layout_routes(child, routes);
+        }
+    }
+}
 
 // Global atomic counter for generating unique route IDs
 static ROUTE_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -40,30 +51,30 @@ pub fn next_rich_text_id() -> usize {
     RICH_TEXT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-#[cfg(target_os = "windows")]
-use teletypewriter::create_pty;
-#[cfg(not(target_os = "windows"))]
-use teletypewriter::{create_pty_with_fork, create_pty_with_spawn};
-
 pub struct Context<T: EventListener> {
     pub route_id: usize,
     pub window_target: WindowTarget,
-    pub terminal: Arc<FairMutex<Crosswords<T>>>,
+    /// Passive frame cache. The worker, not this cache, owns terminal state.
+    pub terminal: Arc<FairMutex<RemoteView>>,
+    /// A prepared cross-process attachment remains here until the destination
+    /// window has prepared and drawn its initial frame. Dropping it only closes the
+    /// pending socket; it never closes or replaces the source session.
+    pub pending_session: Option<PreparedSession>,
     pub renderable_content: RenderableContent,
-    pub messenger: Messenger,
-    #[cfg(not(target_os = "windows"))]
-    pty: Option<(i32, u32)>,
     pub rich_text_id: usize,
     pub dimension: ContextDimension,
     pub title: ContextTitle,
     pub ime: Ime,
-    _io_thread: Option<JoinHandle<(Machine<teletypewriter::Pty, T>, performer::State)>>,
+    _listener: PhantomData<fn() -> T>,
 }
 
 impl<T: rio_backend::event::EventListener> Drop for Context<T> {
     fn drop(&mut self) {
-        // The performer owns the PTY and terminates its child when it shuts down.
-        let _ = self.messenger.channel.send(Msg::Shutdown);
+        // Closing a context is explicit. The session worker owns/reaps the
+        // PTY; dropping the GUI cache must not create a replacement shell.
+        if let Some(session) = self.terminal.lock().session() {
+            session.close();
+        }
     }
 }
 
@@ -71,27 +82,19 @@ impl<T: EventListener> Context<T> {
     /// Reassign this context and all of its queued producer events to a window.
     pub fn rebind_window(&mut self, window_id: WindowId) {
         self.window_target.rebind(window_id);
-        self.terminal.lock().window_id = window_id;
+        let mut terminal = self.terminal.lock();
+        terminal.window_id = window_id;
+        if let Some(session) = terminal.session() {
+            session.rebind_window(window_id);
+        }
     }
 
     fn foreground_process_name(&self) -> Option<String> {
-        #[cfg(not(target_os = "windows"))]
-        return self.pty.as_ref().map(|(main_fd, shell_pid)| {
-            teletypewriter::foreground_process_name(*main_fd, *shell_pid)
-        });
-
-        #[cfg(target_os = "windows")]
         None
     }
 
     pub(crate) fn foreground_process_path(&self) -> Option<std::path::PathBuf> {
-        #[cfg(not(target_os = "windows"))]
-        return self.pty.as_ref().and_then(|(main_fd, shell_pid)| {
-            teletypewriter::foreground_process_path(*main_fd, *shell_pid).ok()
-        });
-
-        #[cfg(target_os = "windows")]
-        None
+        self.terminal.lock().current_directory.as_ref().cloned()
     }
 
     #[inline]
@@ -118,6 +121,37 @@ impl<T: EventListener> Context<T> {
             is_ime_enabled: false,
         }
     }
+
+    pub fn commit_pending_session(
+        &mut self,
+        event_proxy: T,
+    ) -> Result<(), rio_session::SessionError>
+    where
+        T: Clone + Send + 'static,
+    {
+        let Some(prepared) = self.pending_session.take() else {
+            return Ok(());
+        };
+        let initial_sequence = self.terminal.lock().frame_sequence();
+        let client = prepared.commit()?;
+        let session = SessionHandle::from_client(
+            client,
+            initial_sequence,
+            event_proxy,
+            self.route_id,
+            self.window_target.window_id(),
+        );
+        // Prepared layout changes could not reach the worker before takeover.
+        let size = crate::renderer::utils::terminal_dimensions(&self.dimension);
+        let mut terminal = self.terminal.lock();
+        terminal.install_session(session);
+        terminal.resize_to(size);
+        Ok(())
+    }
+
+    pub fn disarm_for_transfer(&mut self) {
+        self.terminal.lock().detach_session();
+    }
 }
 
 #[derive(Clone, Default)]
@@ -129,10 +163,7 @@ pub struct ContextManagerConfig {
     #[cfg(test)]
     pub dead_pty: bool,
     pub shell: Shell,
-    #[cfg(not(target_os = "windows"))]
-    pub use_fork: bool,
     pub working_dir: Option<String>,
-    pub spawn_performer: bool,
     pub cwd: bool,
     pub is_native: bool,
     pub should_update_title_extra: bool,
@@ -155,6 +186,7 @@ pub struct ContextManager<T: EventListener> {
     window_id: WindowId,
     pub config: ContextManagerConfig,
     last_title_update: Option<Instant>,
+    pub bootstrap_transfer: Option<([u8; 16], usize)>,
 }
 
 /// Ownership bundle for moving a complete grid and all of its split routes.
@@ -181,7 +213,7 @@ impl<T: EventListener> GridTransfer<T> {
 }
 
 pub fn create_dead_context<T>(
-    event_proxy: T,
+    _event_proxy: T,
     window_id: WindowId,
     route_id: usize,
     rich_text_id: usize,
@@ -191,32 +223,87 @@ where
     T: rio_backend::event::EventListener + Clone,
 {
     let window_target = WindowTarget::dynamic(window_id);
-    let event_proxy = event_proxy.with_window_target(window_target.clone());
-    let terminal = Crosswords::new(
-        dimension,
-        CursorShape::Block,
-        event_proxy,
+    let terminal = Arc::new(FairMutex::new(RemoteView::new(
+        None,
         window_id,
-        route_id,
-        // Dead context never sees new input — no scrollback needed.
-        0,
-    );
-    let terminal: Arc<FairMutex<Crosswords<T>>> = Arc::new(FairMutex::new(terminal));
-    let (sender, _receiver) = corcovado::channel::channel();
-
+        dimension.columns.max(1),
+        dimension.lines.max(1),
+    )));
     Context {
         route_id,
         window_target,
-        #[cfg(not(target_os = "windows"))]
-        pty: None,
-        messenger: Messenger::new(sender),
+        pending_session: None,
         renderable_content: RenderableContent::new(Cursor::default()),
         terminal,
         rich_text_id,
         dimension,
         title: ContextTitle::default(),
         ime: Ime::new(),
-        _io_thread: None,
+        _listener: PhantomData,
+    }
+}
+
+fn create_error_context<T>(
+    event_proxy: T,
+    window_id: WindowId,
+    route_id: usize,
+    rich_text_id: usize,
+    dimension: ContextDimension,
+    error: Box<dyn Error>,
+) -> Context<T>
+where
+    T: rio_backend::event::EventListener + Clone,
+{
+    let window_target = WindowTarget::dynamic(window_id);
+    let _ = event_proxy;
+    let session = SessionHandle::disconnected_with_error(
+        rio_session::SessionError::Invalid(error.to_string()),
+    );
+    let terminal = Arc::new(FairMutex::new(RemoteView::new(
+        Some(session),
+        window_id,
+        dimension.columns.max(1),
+        dimension.lines.max(1),
+    )));
+
+    Context {
+        route_id,
+        window_target,
+        pending_session: None,
+        terminal,
+        rich_text_id,
+        renderable_content: RenderableContent::new(Cursor::default()),
+        dimension,
+        title: ContextTitle::default(),
+        ime: Ime::new(),
+        _listener: PhantomData,
+    }
+}
+
+fn create_prepared_context<T>(
+    prepared: PreparedSession,
+    window_id: WindowId,
+    route_id: usize,
+    rich_text_id: usize,
+    dimension: ContextDimension,
+) -> Context<T>
+where
+    T: rio_backend::event::EventListener,
+{
+    let mut prepared = prepared;
+    let frame = prepared.take_initial_frame();
+    let terminal = Arc::new(FairMutex::new(RemoteView::from_frame(frame, window_id)));
+    Context {
+        route_id,
+        window_target: WindowTarget::dynamic(window_id),
+        pending_session: Some(prepared),
+        renderable_content: RenderableContent::new(Cursor::default()),
+        terminal,
+        rich_text_id,
+        dimension,
+        title: ContextTitle::default(),
+        ime: Ime::new(),
+        _listener: PhantomData,
     }
 }
 
@@ -249,6 +336,7 @@ pub fn create_mock_context<
 /// removal shifts the focused index left only when the removed tab
 /// sat before it. Pure, so the arithmetic the tmux SIGHUP crash
 /// hinged on stays testable without a GPU.
+#[cfg(test)]
 #[inline]
 fn current_index_after_tab_removal(current: usize, removed: usize) -> usize {
     if removed <= current {
@@ -305,118 +393,50 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
 
         let window_target = WindowTarget::dynamic(window_id);
-        let event_proxy = event_proxy.with_window_target(window_target.clone());
+        let winsize = crate::renderer::utils::terminal_dimensions(&dimension);
+        let mut spec = rio_session::SessionSpec::from_current_environment()?;
+        spec.shell = config.shell.program.clone();
+        spec.args = config.shell.args.clone();
+        spec.working_dir = config.working_dir.clone();
+        spec.columns = dimension.columns.try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "terminal columns exceed session limit",
+            )
+        })?;
+        spec.lines = dimension.lines.try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "terminal lines exceed session limit",
+            )
+        })?;
+        spec.pixel_width = winsize.width;
+        spec.pixel_height = winsize.height;
+        spec.scrollback = config.scrollback_history_limit;
+        spec.grapheme_clustering = config.grapheme_clustering;
 
-        let cols: u16 = dimension.columns.try_into().unwrap_or(MIN_COLUMNS as u16);
-        let rows: u16 = dimension.lines.try_into().unwrap_or(MIN_LINES as u16);
-        #[cfg(not(target_os = "windows"))]
-        let initial_winsize = crate::renderer::utils::terminal_dimensions(&dimension);
-
-        let mut terminal = Crosswords::new(
-            dimension,
-            CursorShape::from_char(cursor_state.0.content),
-            event_proxy.clone(),
+        let session =
+            SessionHandle::spawn(spec, event_proxy.clone(), route_id, window_id)?;
+        let terminal = Arc::new(FairMutex::new(RemoteView::new(
+            Some(session),
             window_id,
-            route_id,
-            config.scrollback_history_limit,
-        );
-        terminal.set_grapheme_clustering(config.grapheme_clustering);
-        terminal.blinking_cursor = cursor_state.1;
-        let terminal: Arc<FairMutex<Crosswords<T>>> = Arc::new(FairMutex::new(terminal));
-
-        let pty;
-        #[cfg(not(target_os = "windows"))]
-        {
-            if config.use_fork {
-                tracing::info!("rio -> teletypewriter: create_pty_with_fork");
-                pty = match create_pty_with_fork(
-                    config.shell.program.as_deref(),
-                    &config.shell.args,
-                    &config.working_dir,
-                    cols,
-                    rows,
-                    initial_winsize.width,
-                    initial_winsize.height,
-                ) {
-                    Ok(created_pty) => created_pty,
-                    Err(err) => {
-                        tracing::error!("{err:?}");
-                        return Err(Box::new(err));
-                    }
-                }
-            } else {
-                tracing::info!("rio -> teletypewriter: create_pty_with_spawn");
-                pty = match create_pty_with_spawn(
-                    config.shell.program.as_deref(),
-                    config.shell.args.clone(),
-                    &config.working_dir,
-                    None,
-                    cols,
-                    rows,
-                    initial_winsize.width,
-                    initial_winsize.height,
-                ) {
-                    Ok(created_pty) => created_pty,
-                    Err(err) => {
-                        tracing::error!("{err:?}");
-                        return Err(Box::new(err));
-                    }
-                }
-            };
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        let main_fd = pty.child.id;
-        #[cfg(not(target_os = "windows"))]
-        let shell_pid = pty.child.pid as u32;
-
-        #[cfg(target_os = "windows")]
-        {
-            pty = match create_pty(
-                config.shell.program.as_deref(),
-                config.shell.args.clone(),
-                &config.working_dir,
-                None,
-                cols,
-                rows,
-            ) {
-                Ok(created_pty) => created_pty,
-                Err(err) => {
-                    tracing::error!("{err:?}");
-                    return Err(Box::new(err));
-                }
-            }
-        }
-
-        let machine = Machine::new(
-            Arc::clone(&terminal),
-            pty,
-            event_proxy.clone(),
-            window_id,
-            route_id,
-        )?;
-        let channel = machine.channel();
-        let io_thread = if config.spawn_performer {
-            Some(machine.spawn())
-        } else {
-            None
-        };
-
-        let messenger = Messenger::new(channel);
-
+            dimension.columns,
+            dimension.lines,
+        )));
+        terminal
+            .lock()
+            .set_cursor_style(cursor_state.0.state.content, cursor_state.1);
         Ok(Context {
             route_id,
             window_target,
-            #[cfg(not(target_os = "windows"))]
-            pty: Some((main_fd, shell_pid)),
-            messenger,
+            pending_session: None,
             terminal,
             rich_text_id,
             renderable_content: RenderableContent::new(cursor_state.0.clone()),
             dimension,
             title: ContextTitle::default(),
             ime: Ime::new(),
-            _io_thread: io_thread,
+            _listener: PhantomData,
         })
     }
 
@@ -433,36 +453,52 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         sugarloaf_errors: Option<SugarloafErrors>,
     ) -> Result<Self, Box<dyn Error>> {
         let route_id = Self::next_route_id();
-        let initial_context = match ContextManager::create_context_with_route_id(
-            cursor_state,
-            event_proxy.clone(),
-            window_id,
-            rich_text_id,
-            size,
-            &ctx_config,
-            route_id,
-        ) {
-            Ok(context) => context,
-            Err(err_message) => {
-                tracing::error!("{:?}", err_message);
+        let bootstrap_transfer = crate::WINDOW_BOOTSTRAP
+            .lock()
+            .unwrap()
+            .take()
+            .map(|id| (id, route_id));
+        let initial_context = if bootstrap_transfer.is_some() {
+            create_dead_context(
+                event_proxy.clone(),
+                window_id,
+                route_id,
+                rich_text_id,
+                size,
+            )
+        } else {
+            match ContextManager::create_context_with_route_id(
+                cursor_state,
+                event_proxy.clone(),
+                window_id,
+                rich_text_id,
+                size,
+                &ctx_config,
+                route_id,
+            ) {
+                Ok(context) => context,
+                Err(err_message) => {
+                    tracing::error!("{:?}", err_message);
 
-                event_proxy.send_event(
-                    RioEvent::ReportToAssistant(RioError {
-                        report: RioErrorType::InitializationError(
-                            err_message.to_string(),
-                        ),
-                        level: RioErrorLevel::Error,
-                    }),
-                    window_id,
-                );
+                    event_proxy.send_event(
+                        RioEvent::ReportToAssistant(RioError {
+                            report: RioErrorType::InitializationError(
+                                err_message.to_string(),
+                            ),
+                            level: RioErrorLevel::Error,
+                        }),
+                        window_id,
+                    );
 
-                create_dead_context(
-                    event_proxy.clone(),
-                    window_id,
-                    route_id,
-                    rich_text_id,
-                    ContextDimension::default(),
-                )
+                    create_error_context(
+                        event_proxy.clone(),
+                        window_id,
+                        route_id,
+                        rich_text_id,
+                        ContextDimension::default(),
+                        err_message,
+                    )
+                }
             }
         };
 
@@ -495,6 +531,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             window_id,
             config: ctx_config,
             last_title_update: None,
+            bootstrap_transfer,
         })
     }
 
@@ -532,6 +569,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             window_id,
             config,
             last_title_update: None,
+            bootstrap_transfer: None,
         })
     }
 
@@ -553,6 +591,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             window_id,
             config,
             last_title_update: None,
+            bootstrap_transfer: None,
         }
     }
 
@@ -581,7 +620,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return false;
         }
 
-        self.contexts[index_to_remove].remove_all_rich_text(sugarloaf);
+        self.contexts[index_to_remove].remove_from_sugarloaf(sugarloaf);
         self.contexts.remove(index_to_remove);
         self.update_selection_after_grid_removal(index_to_remove);
         if !self.contexts.is_empty() {
@@ -901,6 +940,19 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             .find_map(|grid| grid.get_by_route_id(route_id).map(|item| &mut item.val))
     }
 
+    pub fn session_handles(&self) -> Vec<SessionHandle> {
+        self.contexts
+            .iter()
+            .flat_map(ContextGrid::session_handles)
+            .collect()
+    }
+
+    pub fn owns_session_id(&self, session_id: rio_session::protocol::SessionId) -> bool {
+        self.contexts
+            .iter()
+            .any(|grid| grid.owns_session_id(session_id))
+    }
+
     fn grid_index_for_route(&self, route_id: usize) -> Option<usize> {
         self.contexts
             .iter()
@@ -991,6 +1043,247 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             .iter()
             .flat_map(ContextGrid::route_ids)
             .collect()
+    }
+
+    pub fn transfer_offer(
+        &self,
+        index: usize,
+        transfer_id: [u8; 16],
+    ) -> Result<crate::router::window_control::TransferOffer, String> {
+        let grid = self
+            .contexts
+            .get(index)
+            .ok_or_else(|| "transfer tab no longer exists".to_string())?;
+        let (panes, tab) = grid.transfer_parts()?;
+        let active_pane = grid
+            .get_ordered_keys()
+            .iter()
+            .position(|node| *node == grid.current)
+            .unwrap_or(0);
+        Ok(crate::router::window_control::TransferOffer {
+            transfer_id,
+            panes,
+            tabs: vec![tab],
+            active_pane: active_pane as u32,
+        })
+    }
+
+    pub fn transfer_window_offer(
+        &self,
+        transfer_id: [u8; 16],
+    ) -> Result<crate::router::window_control::TransferOffer, String> {
+        let mut panes = Vec::new();
+        let mut tabs = Vec::new();
+        let mut active_pane = 0;
+        let active_route = self.current_route();
+        for grid in &self.contexts {
+            let (grid_panes, tab) = grid.transfer_parts()?;
+            if grid.current().route_id == active_route {
+                active_pane = panes.len()
+                    + grid_panes
+                        .iter()
+                        .position(|pane| pane.route_id as usize == active_route)
+                        .unwrap_or(0);
+            }
+            tabs.push(tab);
+            panes.extend(grid_panes);
+        }
+        if panes.is_empty() {
+            return Err("transfer window has no panes".into());
+        }
+        Ok(crate::router::window_control::TransferOffer {
+            transfer_id,
+            panes,
+            tabs,
+            active_pane: active_pane as u32,
+        })
+    }
+
+    pub fn insert_prepared_pane(
+        &mut self,
+        prepared: PreparedSession,
+        rich_text_id: usize,
+        dimension: ContextDimension,
+    ) -> Result<usize, PreparedSession> {
+        if self.contexts.len() >= self.capacity {
+            return Err(prepared);
+        }
+        let route_id = Self::next_route_id();
+        let context = create_prepared_context::<T>(
+            prepared,
+            self.window_id,
+            route_id,
+            rich_text_id,
+            dimension,
+        );
+        let grid = ContextGrid::new(
+            context,
+            self.get_current_grid_scaled_margin(),
+            self.config.split_color,
+            self.config.split_active_color,
+            self.config.panel,
+        );
+        self.contexts.push(grid);
+        self.current_index = self.contexts.len() - 1;
+        Ok(route_id)
+    }
+
+    pub fn insert_prepared_tabs(
+        &mut self,
+        prepared: Vec<(crate::router::window_control::PaneOffer, PreparedSession)>,
+        tabs: Vec<crate::router::window_control::TabOffer>,
+        active_pane: usize,
+        insertion_index: Option<usize>,
+        dimension: ContextDimension,
+    ) -> Result<
+        Vec<usize>,
+        Vec<(crate::router::window_control::PaneOffer, PreparedSession)>,
+    > {
+        if prepared.is_empty()
+            || active_pane >= prepared.len()
+            || tabs.is_empty()
+            || self.contexts.len() + tabs.len() > self.capacity
+        {
+            return Err(prepared);
+        }
+
+        let active_source = prepared[active_pane].0.route_id;
+        let source_order: Vec<_> = prepared
+            .iter()
+            .map(|(pane, _)| (pane.route_id, pane.tab_id))
+            .collect();
+        let mut panes = prepared
+            .into_iter()
+            .map(|(pane, prepared)| (pane.route_id, (pane, prepared)))
+            .collect::<rustc_hash::FxHashMap<
+                u64,
+                (crate::router::window_control::PaneOffer, PreparedSession),
+            >>();
+        if panes.len() != source_order.len()
+            || tabs.iter().any(|tab| {
+                let mut routes = Vec::new();
+                transfer_layout_routes(&tab.layout, &mut routes);
+                routes.iter().any(|route| {
+                    panes
+                        .get(route)
+                        .is_none_or(|(pane, _)| pane.tab_id != tab.tab_id)
+                })
+            })
+        {
+            return Err(panes.into_values().collect());
+        }
+
+        let mut tab_routes = rustc_hash::FxHashMap::default();
+        let mut new_grids = Vec::with_capacity(tabs.len());
+        let mut active_grid = None;
+        for (index, tab) in tabs.iter().enumerate() {
+            let mut routes = Vec::new();
+            transfer_layout_routes(&tab.layout, &mut routes);
+            if routes.is_empty()
+                || tab.active_route == 0
+                || !routes.contains(&tab.active_route)
+                || routes.iter().any(|route| !panes.contains_key(route))
+            {
+                return Err(panes.into_values().collect());
+            }
+            if routes.iter().any(|route| {
+                panes
+                    .get(route)
+                    .is_some_and(|(pane, _)| pane.tab_id != tab.tab_id)
+            }) {
+                return Err(panes.into_values().collect());
+            }
+            let pane_rects = routes
+                .iter()
+                .filter_map(|route| {
+                    panes.get(route).map(|(pane, _)| (*route, pane.layout_rect))
+                })
+                .collect();
+            let contexts = routes
+                .iter()
+                .map(|route| {
+                    let (_, prepared) = panes
+                        .remove(route)
+                        .expect("validated transfer route disappeared");
+                    let target_route = Self::next_route_id();
+                    tab_routes.insert(*route, target_route);
+                    create_prepared_context::<T>(
+                        prepared,
+                        self.window_id,
+                        target_route,
+                        next_rich_text_id(),
+                        dimension,
+                    )
+                })
+                .collect();
+            let grid = ContextGrid::from_layout_offer(
+                contexts,
+                &tab.layout,
+                tab.active_route,
+                &tab_routes,
+                &pane_rects,
+                self.get_current_grid_scaled_margin(),
+                self.config.split_color,
+                self.config.split_active_color,
+                self.config.panel,
+            )
+            .unwrap_or_else(|(_, error)| {
+                panic!("validated transfer layout could not be rebuilt: {error}")
+            });
+            if tab_routes
+                .get(&active_source)
+                .is_some_and(|_| active_grid.is_none())
+            {
+                active_grid = Some(index);
+            }
+            new_grids.push(grid);
+        }
+        if !panes.is_empty() {
+            return Err(panes.into_values().collect());
+        }
+        let insert_at = insertion_index
+            .unwrap_or(self.contexts.len())
+            .min(self.contexts.len());
+        for (offset, grid) in new_grids.into_iter().enumerate() {
+            self.contexts.insert(insert_at + offset, grid);
+        }
+        self.current_index = insert_at + active_grid.unwrap_or(0);
+        Ok(source_order
+            .into_iter()
+            .map(|(source, _)| {
+                *tab_routes
+                    .get(&source)
+                    .expect("validated transfer source route disappeared")
+            })
+            .collect())
+    }
+
+    pub fn disarm_routes_for_transfer(&mut self, route_ids: &[usize]) {
+        for route_id in route_ids {
+            if let Some(context) = self.get_by_route_id(*route_id) {
+                context.disarm_for_transfer();
+            }
+        }
+    }
+
+    pub fn remove_transferred_routes(
+        &mut self,
+        route_ids: &[usize],
+        sugarloaf: &mut Sugarloaf,
+    ) {
+        self.disarm_routes_for_transfer(route_ids);
+        for route_id in route_ids {
+            let Some(index) = self.grid_index_for_route(*route_id) else {
+                continue;
+            };
+            if self.contexts[index].len() == 1 {
+                self.contexts.remove(index);
+                self.update_selection_after_grid_removal(index);
+            } else {
+                self.contexts[index].remove_by_route(*route_id, sugarloaf);
+            }
+        }
+        self.mark_all_full_damage();
     }
 
     #[inline]
@@ -1229,9 +1522,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             cwd: config.navigation.current_working_directory,
             shell,
             working_dir,
-            spawn_performer: true,
-            #[cfg(not(target_os = "windows"))]
-            use_fork: config.use_fork,
             is_native: config.navigation.is_native(),
             // When navigation is collapsed and does not contain any color rule
             // does not make sense fetch for foreground process names
@@ -1340,7 +1630,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     pub fn keep_only_active_context_visible(&self, sugarloaf: &mut Sugarloaf) {
         for (idx, context) in self.contexts.iter().enumerate() {
             if idx != self.current_index {
-                context.remove_all_rich_text(sugarloaf);
+                context.clear_image_overlays(sugarloaf);
             }
         }
     }
@@ -1349,7 +1639,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn clear_context_overlays(&self, sugarloaf: &mut Sugarloaf, old_index: usize) {
         if let Some(old_context) = self.contexts.get(old_index) {
-            old_context.remove_all_rich_text(sugarloaf);
+            old_context.clear_image_overlays(sugarloaf);
         }
     }
 }
@@ -1415,6 +1705,40 @@ pub mod test {
         assert_eq!(context_manager.capacity, 8);
     }
 
+    #[test]
+    fn palette_selection_marks_full_terminal_damage() {
+        let mut context_manager =
+            ContextManager::start_with_capacity(1, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        let selection = SelectionRange::new(
+            rio_backend::crosswords::pos::Pos::new(
+                rio_backend::crosswords::pos::Line(0),
+                rio_backend::crosswords::pos::Column(0),
+            ),
+            rio_backend::crosswords::pos::Pos::new(
+                rio_backend::crosswords::pos::Line(0),
+                rio_backend::crosswords::pos::Column(1),
+            ),
+            false,
+        );
+
+        context_manager
+            .current_mut()
+            .renderable_content
+            .pending_update
+            .take_terminal_damage();
+        context_manager.current_mut().set_selection(Some(selection));
+
+        assert_eq!(
+            context_manager
+                .current_mut()
+                .renderable_content
+                .pending_update
+                .take_terminal_damage(),
+            Some(rio_backend::event::TerminalDamage::Full)
+        );
+    }
+
     /// Regression: backend events (PTY-reply targets, color requests,
     /// damage notifications) carry a `route_id` that identifies the
     /// originating panel, not the visible one. `get_by_route_id` used to
@@ -1440,7 +1764,6 @@ pub mod test {
             .get_by_route_id(hidden_route_id)
             .expect("hidden tab's route_id must still resolve via get_by_route_id");
         assert_eq!(found.route_id, hidden_route_id);
-        assert_eq!(context_manager.close_unfocused_tabs(), [hidden_route_id]);
     }
 
     #[test]

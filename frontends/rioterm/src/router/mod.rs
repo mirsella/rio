@@ -1,5 +1,6 @@
 pub mod routes;
 mod window;
+pub mod window_control;
 use crate::event::EventProxy;
 use crate::router::window::{
     configure_window, create_window_builder, DEFAULT_MINIMUM_WINDOW_HEIGHT,
@@ -219,90 +220,20 @@ impl Route<'_> {
                             self.request_overlay_redraw();
                         }
                         Key::Named(NamedKey::Enter) => {
-                            // Snapshot what the palette wants to do FIRST,
-                            // before taking a mut-borrow on it, so we can
-                            // freely call other `self.window.screen.*`
-                            // methods in the match arms without tripping
-                            // the borrow checker on nested disjoint borrows.
-                            let selected_font = self
-                                .window
-                                .screen
-                                .renderer
-                                .command_palette
-                                .get_selected_font();
-                            let selected_action = self
-                                .window
-                                .screen
-                                .renderer
-                                .command_palette
-                                .get_selected_action();
-                            use crate::renderer::command_palette::PaletteAction;
-
-                            // Fonts-mode Enter: copy the family name to
-                            // the system clipboard and close. The copy
-                            // icon on each row advertises this.
-                            if let Some(font) = selected_font {
-                                clipboard.set(
-                                    rio_backend::clipboard::ClipboardType::Clipboard,
-                                    font,
-                                );
-                                self.window
-                                    .screen
-                                    .renderer
-                                    .command_palette
-                                    .set_enabled(false);
-                                self.request_overlay_redraw();
-                                return true;
-                            }
-
-                            match selected_action {
-                                // `ListFonts` stays inside the palette —
-                                // swap the palette's contents from the
-                                // command list to the registered font
-                                // family names and keep it open.
-                                Some(PaletteAction::ListFonts) => {
-                                    let fonts =
-                                        self.window.screen.sugarloaf.font_family_names();
-                                    self.window
-                                        .screen
-                                        .renderer
-                                        .command_palette
-                                        .enter_fonts_mode(fonts);
-                                }
-                                // Any other command is a one-shot: close
-                                // the palette first, then dispatch.
-                                Some(action) => {
-                                    self.window
-                                        .screen
-                                        .renderer
-                                        .command_palette
-                                        .set_enabled(false);
-                                    self.window
-                                        .screen
-                                        .execute_palette_action(action, clipboard);
-                                }
-                                // No match at all — Enter just closes.
-                                None => {
-                                    self.window
-                                        .screen
-                                        .renderer
-                                        .command_palette
-                                        .set_enabled(false);
-                                }
-                            }
+                            self.window.screen.execute_palette_selection(clipboard);
                             self.request_overlay_redraw();
                         }
                         Key::Named(NamedKey::Backspace) => {
-                            let current_query =
-                                self.window.screen.renderer.command_palette.query.clone();
-                            if !current_query.is_empty() {
-                                let mut chars = current_query.chars().collect::<Vec<_>>();
-                                chars.pop();
+                            let query =
+                                &mut self.window.screen.renderer.command_palette.query;
+                            if !query.is_empty() {
+                                let mut query = std::mem::take(query);
+                                query.pop();
                                 self.window
                                     .screen
                                     .renderer
                                     .command_palette
-                                    .set_query(chars.into_iter().collect());
+                                    .set_query(query);
                                 self.request_overlay_redraw();
                             }
                         }
@@ -313,21 +244,19 @@ impl Route<'_> {
                                 if !text_str.is_empty()
                                     && text_str.chars().all(|c| !c.is_control())
                                 {
-                                    let current_query = self
+                                    let query = &mut self
                                         .window
                                         .screen
                                         .renderer
                                         .command_palette
-                                        .query
-                                        .clone();
+                                        .query;
+                                    let mut query = std::mem::take(query);
+                                    query.push_str(text_str);
                                     self.window
                                         .screen
                                         .renderer
                                         .command_palette
-                                        .set_query(format!(
-                                            "{}{}",
-                                            current_query, text_str
-                                        ));
+                                        .set_query(query);
                                     self.request_overlay_redraw();
                                 }
                             }

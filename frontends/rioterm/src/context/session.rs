@@ -1,0 +1,2855 @@
+//! Passive session ownership for a terminal pane.
+//!
+//! The GUI never owns a parser or a grid.  A small background pump owns the
+//! authenticated `SessionClient`, serializes commands onto the worker, and
+//! publishes validated frames for the renderer.  `RemoteView` contains only a
+//! cache of that published data; methods which look like terminal operations
+//! enqueue a worker command and never mutate an authoritative terminal.
+
+use super::renderable::{PendingUpdate, RenderableContent};
+use rio_backend::ansi::CursorShape;
+use rio_backend::clipboard::ClipboardType;
+use rio_backend::config::colors::{AnsiColor, ColorRgb, NamedColor};
+use rio_backend::crosswords::grid::row::Row;
+use rio_backend::crosswords::grid::{Dimensions, Scroll};
+use rio_backend::crosswords::pos::{Column, CursorState, Line, Pos};
+use rio_backend::crosswords::square::{CellFlags, Extras, Hyperlink, Square, Wide};
+use rio_backend::crosswords::style::{Style, StyleFlags};
+use rio_backend::crosswords::Mode;
+use rio_backend::event::{EventListener, RioEvent, WindowId, WindowTarget};
+use rio_backend::selection::SelectionRange;
+use rio_session::protocol::{
+    CellContentFrame, CellFrame, ColorFrame, FrameUpdate, FullFrame, RowFrame,
+    SearchDirection as WireSearchDirection, SearchMatch, SearchNavigation,
+    SelectionFrame, SelectionKind as WireSelectionKind,
+    SelectionSide as WireSelectionSide, SessionCommand, SessionDescriptor, SessionEvent,
+    SessionReply, StyleFrame, ViMotion as WireViMotion,
+};
+use rio_session::{PreparedSessionAttachment, SessionClient, SessionError, SessionSpec};
+use rustc_hash::FxHashMap;
+use std::collections::VecDeque;
+use std::ops::{Index, IndexMut};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+const COMMAND_QUEUE_SIZE: usize = 256;
+const EVENT_QUEUE_SIZE: usize = 64;
+const FRAME_UPDATE_QUEUE_SIZE: usize = 64;
+
+type SelectionTextResult = (ClipboardType, Option<String>, bool);
+
+#[derive(Debug)]
+enum PumpCommand {
+    Terminal(SessionCommand),
+    SelectionText {
+        target: ClipboardType,
+        copy_to_clipboard: bool,
+    },
+}
+
+#[derive(Debug, Default)]
+struct SelectionTextQueue {
+    // Includes queued/in-flight requests and unread replies.
+    outstanding: usize,
+    replies: VecDeque<SelectionTextResult>,
+}
+
+#[derive(Debug, Default)]
+struct FrameMailbox {
+    pending_full: Option<FullFrame>,
+    updates: VecDeque<FrameUpdate>,
+}
+
+#[derive(Debug)]
+struct SessionState {
+    frames: Mutex<FrameMailbox>,
+    events: Mutex<VecDeque<SessionEvent>>,
+    error: Mutex<Option<String>>,
+    descriptor: Mutex<Option<SessionDescriptor>>,
+    selection_text: Mutex<SelectionTextQueue>,
+    search_navigation: Mutex<Option<SearchNavigation>>,
+    search_matches: Mutex<Option<Vec<SearchMatch>>>,
+    closed: AtomicBool,
+    pump_done: AtomicBool,
+    frame_resync_logged: AtomicBool,
+}
+
+impl SessionState {
+    fn new() -> Self {
+        Self {
+            frames: Mutex::new(FrameMailbox::default()),
+            events: Mutex::new(VecDeque::new()),
+            error: Mutex::new(None),
+            descriptor: Mutex::new(None),
+            selection_text: Mutex::new(SelectionTextQueue::default()),
+            search_navigation: Mutex::new(None),
+            search_matches: Mutex::new(None),
+            closed: AtomicBool::new(false),
+            pump_done: AtomicBool::new(false),
+            frame_resync_logged: AtomicBool::new(false),
+        }
+    }
+
+    fn fail(&self, error: SessionError) {
+        if let Ok(mut slot) = self.error.lock() {
+            *slot = Some(error.to_string());
+        }
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn record_error(&self, error: SessionError) {
+        if let Ok(mut slot) = self.error.lock() {
+            *slot = Some(error.to_string());
+        }
+    }
+
+    fn publish_frame(&self, frame: FullFrame) {
+        if let Ok(mut mailbox) = self.frames.lock() {
+            mailbox.updates.clear();
+            mailbox.pending_full = Some(frame);
+        }
+        self.frame_resync_logged.store(false, Ordering::Release);
+        // A successfully published frame proves that a recoverable command
+        // error is no longer the current state of the pane.
+        if !self.closed.load(Ordering::Acquire) {
+            if let Ok(mut error) = self.error.lock() {
+                *error = None;
+            }
+        }
+    }
+
+    fn publish_frame_update(&self, update: FrameUpdate) -> bool {
+        let Ok(mut mailbox) = self.frames.lock() else {
+            return false;
+        };
+        match update {
+            FrameUpdate::Full(frame) => {
+                mailbox.updates.clear();
+                mailbox.pending_full = Some(frame);
+                self.frame_resync_logged.store(false, Ordering::Release);
+                true
+            }
+            update => {
+                if mailbox.updates.len() >= FRAME_UPDATE_QUEUE_SIZE {
+                    return false;
+                }
+                mailbox.updates.push_back(update);
+                true
+            }
+        }
+    }
+
+    fn take_frame_updates(&self) -> (Option<FullFrame>, Vec<FrameUpdate>) {
+        self.frames
+            .lock()
+            .map(|mut mailbox| {
+                (
+                    mailbox.pending_full.take(),
+                    mailbox.updates.drain(..).collect(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn log_frame_resync_once(&self, base_sequence: u64, error: &SessionError) {
+        if self
+            .frame_resync_logged
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            tracing::warn!(
+                base_sequence,
+                error = %error,
+                "session frame delta recovery requested"
+            );
+        }
+    }
+
+    fn publish_descriptor(&self, descriptor: SessionDescriptor) {
+        if let Ok(mut current) = self.descriptor.lock() {
+            *current = Some(descriptor);
+        }
+    }
+
+    fn publish_event(&self, event: SessionEvent) {
+        if let SessionEvent::Closed = event {
+            self.closed.store(true, Ordering::Release);
+        }
+        if let Ok(mut events) = self.events.lock() {
+            match &event {
+                SessionEvent::Title { .. } => {
+                    events.retain(|queued| !matches!(queued, SessionEvent::Title { .. }));
+                }
+                SessionEvent::Progress { .. } => {
+                    events.retain(|queued| {
+                        !matches!(queued, SessionEvent::Progress { .. })
+                    });
+                }
+                SessionEvent::ColorChange {
+                    route_id, index, ..
+                } => {
+                    events.retain(|queued| {
+                        !matches!(
+                            queued,
+                            SessionEvent::ColorChange {
+                                route_id: queued_route,
+                                index: queued_index,
+                                ..
+                            } if queued_route == route_id && queued_index == index
+                        )
+                    });
+                }
+                _ => {}
+            }
+            if events.len() >= EVENT_QUEUE_SIZE {
+                // SessionClient already applies the protocol's bounded queue
+                // policy.  This second queue is only a GUI wakeup handoff;
+                // preserve terminal requests/close by evicting the oldest
+                // ordinary event and record pressure for the pane.
+                if let Some(index) = events.iter().position(|queued| {
+                    !matches!(
+                        queued,
+                        SessionEvent::ClipboardLoad { .. }
+                            | SessionEvent::ColorRequest { .. }
+                            | SessionEvent::TextAreaSizeRequest { .. }
+                            | SessionEvent::GlyphProtocolQuery { .. }
+                            | SessionEvent::DesktopNotification { .. }
+                            | SessionEvent::ChildExited { .. }
+                            | SessionEvent::ClipboardOverflow { .. }
+                            | SessionEvent::RequestRefused { .. }
+                            | SessionEvent::RequestExpired { .. }
+                            | SessionEvent::ColorChange { .. }
+                            | SessionEvent::Closed
+                    )
+                }) {
+                    events.remove(index);
+                } else {
+                    drop(events);
+                    self.fail(SessionError::Protocol(
+                        "session event handoff is full".to_string(),
+                    ));
+                    return;
+                }
+            }
+            events.push_back(event);
+        }
+    }
+}
+
+/// A cloneable command/event handle retained by a GUI context.
+#[derive(Clone)]
+pub struct SessionHandle {
+    commands: mpsc::SyncSender<PumpCommand>,
+    state: Arc<SessionState>,
+    window_id: Arc<Mutex<WindowId>>,
+    // Serializes command admission and the pump's empty-queue/close decision.
+    closed: Arc<Mutex<bool>>,
+}
+
+impl std::fmt::Debug for SessionHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionHandle")
+            .field(
+                "closed",
+                &*self.closed.lock().expect("session admission lock poisoned"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionHandle {
+    pub fn spawn<T>(
+        spec: SessionSpec,
+        event_proxy: T,
+        route_id: usize,
+        window_id: WindowId,
+    ) -> Result<Self, SessionError>
+    where
+        T: EventListener + Clone + Send + 'static,
+    {
+        let state = Arc::new(SessionState::new());
+        let (commands, receiver) = mpsc::sync_channel(COMMAND_QUEUE_SIZE);
+        let state_for_thread = Arc::clone(&state);
+        let window_for_thread = Arc::new(Mutex::new(window_id));
+        let window_for_thread_clone = Arc::clone(&window_for_thread);
+        let closed = Arc::new(Mutex::new(false));
+        let closed_for_thread = Arc::clone(&closed);
+        let listener = event_proxy.with_window_target(WindowTarget::dynamic(window_id));
+
+        thread::Builder::new()
+            .name(format!("rio-session-{route_id}"))
+            .spawn(move || {
+                let worker = match std::env::current_exe() {
+                    Ok(worker) => worker,
+                    Err(error) => {
+                        state_for_thread.fail(SessionError::from(error));
+                        state_for_thread.pump_done.store(true, Ordering::Release);
+                        let window_id = window_for_thread_clone
+                            .lock()
+                            .map(|window_id| *window_id)
+                            .unwrap_or_else(|_| WindowId::from(0));
+                        listener.send_event(RioEvent::RenderRoute(route_id), window_id);
+                        return;
+                    }
+                };
+                let client = match SessionClient::spawn_with_worker_path(spec, worker) {
+                    Ok(client) => Arc::new(client),
+                    Err(error) => {
+                        state_for_thread.fail(error);
+                        state_for_thread.pump_done.store(true, Ordering::Release);
+                        let window_id = window_for_thread_clone
+                            .lock()
+                            .map(|window_id| *window_id)
+                            .unwrap_or_else(|_| WindowId::from(0));
+                        listener.send_event(RioEvent::RenderRoute(route_id), window_id);
+                        return;
+                    }
+                };
+                state_for_thread.publish_descriptor(client.descriptor().clone());
+                let pump = SessionPump {
+                    client,
+                    receiver,
+                    state: state_for_thread,
+                    event_proxy: listener,
+                    route_id,
+                    window_id: window_for_thread_clone,
+                    closed: closed_for_thread,
+                };
+                pump.run(None);
+            })
+            .map_err(SessionError::from)?;
+
+        Ok(Self {
+            commands,
+            state,
+            window_id: window_for_thread,
+            closed,
+        })
+    }
+
+    /// Build a passive, disconnected view used only by existing unit tests
+    /// that explicitly request a dead context. Production context creation
+    /// never calls this path.
+    pub fn disconnected_with_error(error: SessionError) -> Self {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let state = Arc::new(SessionState::new());
+        state.fail(error);
+        state.pump_done.store(true, Ordering::Release);
+        Self {
+            commands,
+            state,
+            window_id: Arc::new(Mutex::new(WindowId::from(0))),
+            closed: Arc::new(Mutex::new(true)),
+        }
+    }
+
+    pub fn enqueue(&self, command: SessionCommand) -> Result<(), SessionError> {
+        if matches!(command, SessionCommand::Close) {
+            self.close();
+            return Ok(());
+        }
+        if matches!(command, SessionCommand::SelectionText) {
+            let error = SessionError::Invalid(
+                "selection text needs a clipboard destination".into(),
+            );
+            self.state
+                .record_error(SessionError::Invalid(error.to_string()));
+            return Err(error);
+        }
+        self.enqueue_command(PumpCommand::Terminal(command))
+    }
+
+    fn enqueue_command(&self, command: PumpCommand) -> Result<(), SessionError> {
+        let closed = self.closed.lock().expect("session admission lock poisoned");
+        if *closed {
+            return Err(SessionError::Detached);
+        }
+        let result = self
+            .commands
+            .try_send(command)
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => {
+                    SessionError::Invalid("session command queue is full".to_string())
+                }
+                mpsc::TrySendError::Disconnected(_) => SessionError::Detached,
+            });
+        if let Err(error) = &result {
+            self.state
+                .record_error(SessionError::Invalid(error.to_string()));
+        }
+        result
+    }
+
+    pub fn record_command_error(&self, error: SessionError) {
+        self.state.record_error(error);
+    }
+
+    pub fn close(&self) {
+        // Close cannot be rejected by a full data queue. The pump drains all
+        // admitted commands before issuing it, even if every sender is gone.
+        *self.closed.lock().expect("session admission lock poisoned") = true;
+    }
+
+    pub fn pump_done(&self) -> bool {
+        self.state.pump_done.load(Ordering::Acquire)
+    }
+
+    pub fn rebind_window(&self, window_id: WindowId) {
+        if let Ok(mut current) = self.window_id.lock() {
+            *current = window_id;
+        }
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.state.error.lock().ok().and_then(|error| error.clone())
+    }
+
+    pub fn descriptor(&self) -> Option<SessionDescriptor> {
+        self.state
+            .descriptor
+            .lock()
+            .ok()
+            .and_then(|descriptor| descriptor.clone())
+    }
+
+    /// Install an already committed attachment into the same bounded pump
+    /// used by locally spawned sessions. `initial_frame` was prepared before
+    /// ownership changed, so the target can build its view without a second
+    /// snapshot or a parser/grid replica.
+    pub fn from_client<T>(
+        client: SessionClient,
+        initial_sequence: u64,
+        event_proxy: T,
+        route_id: usize,
+        window_id: WindowId,
+    ) -> Self
+    where
+        T: EventListener + Clone + Send + 'static,
+    {
+        let state = Arc::new(SessionState::new());
+        state.publish_descriptor(client.descriptor().clone());
+        let (commands, receiver) = mpsc::sync_channel(COMMAND_QUEUE_SIZE);
+        let window_for_thread = Arc::new(Mutex::new(window_id));
+        let window_for_thread_clone = Arc::clone(&window_for_thread);
+        let closed = Arc::new(Mutex::new(false));
+        let closed_for_thread = Arc::clone(&closed);
+        let listener = event_proxy.with_window_target(WindowTarget::dynamic(window_id));
+        let state_for_thread = Arc::clone(&state);
+        let client = Arc::new(client);
+        let pump_client = Arc::clone(&client);
+        thread::Builder::new()
+            .name(format!("rio-session-{route_id}"))
+            .spawn(move || {
+                SessionPump {
+                    client: pump_client,
+                    receiver,
+                    state: state_for_thread,
+                    event_proxy: listener,
+                    route_id,
+                    window_id: window_for_thread_clone,
+                    closed: closed_for_thread,
+                }
+                .run(Some(initial_sequence));
+            })
+            .expect("failed to start imported session pump");
+        Self {
+            commands,
+            state,
+            window_id: window_for_thread,
+            closed,
+        }
+    }
+
+    /// Prepare an attachment without committing it. The returned frame can be
+    /// decoded while the source remains the owner; call `commit_prepared` only
+    /// after the destination renderer is ready.
+    pub fn prepare_attach(attachment: PreparedSessionAttachment) -> PreparedSession {
+        PreparedSession {
+            initial_frame: Some(attachment.initial_frame().clone()),
+            had_active_owner: attachment.had_active_owner(),
+            attachment: Some(attachment),
+        }
+    }
+
+    pub fn take_events(&self) -> Vec<SessionEvent> {
+        self.state
+            .events
+            .lock()
+            .map(|mut events| events.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    fn take_frame_updates(&self) -> (Option<FullFrame>, Vec<FrameUpdate>) {
+        self.state.take_frame_updates()
+    }
+
+    fn request_selection_text(
+        &self,
+        target: ClipboardType,
+        copy_to_clipboard: bool,
+    ) -> Result<(), SessionError> {
+        let mut queue = self
+            .state
+            .selection_text
+            .lock()
+            .expect("selection reply lock poisoned");
+        if queue.outstanding == EVENT_QUEUE_SIZE {
+            let error = SessionError::Invalid("selection reply handoff is full".into());
+            self.state
+                .record_error(SessionError::Invalid(error.to_string()));
+            return Err(error);
+        }
+        self.enqueue_command(PumpCommand::SelectionText {
+            target,
+            copy_to_clipboard,
+        })?;
+        queue.outstanding += 1;
+        Ok(())
+    }
+
+    pub fn take_selection_text(&self) -> Option<SelectionTextResult> {
+        let mut queue = self
+            .state
+            .selection_text
+            .lock()
+            .expect("selection reply lock poisoned");
+        let reply = queue.replies.pop_front()?;
+        queue.outstanding -= 1;
+        Some(reply)
+    }
+
+    fn take_search_navigation(&self) -> Option<SearchNavigation> {
+        self.state
+            .search_navigation
+            .lock()
+            .ok()
+            .and_then(|mut navigation| navigation.take())
+    }
+
+    fn take_search_matches(&self) -> Option<Vec<SearchMatch>> {
+        self.state
+            .search_matches
+            .lock()
+            .ok()
+            .and_then(|mut matches| matches.take())
+    }
+}
+
+struct SessionPump<T: EventListener + Clone + Send + 'static> {
+    client: Arc<SessionClient>,
+    receiver: mpsc::Receiver<PumpCommand>,
+    state: Arc<SessionState>,
+    event_proxy: T,
+    route_id: usize,
+    window_id: Arc<Mutex<WindowId>>,
+    closed: Arc<Mutex<bool>>,
+}
+
+impl<T: EventListener + Clone + Send + 'static> SessionPump<T> {
+    fn run(self, initial_sequence: Option<u64>) {
+        let mut frame_sequence = match initial_sequence {
+            Some(sequence) => sequence,
+            None => match self.client.snapshot() {
+                Ok(frame) => {
+                    let sequence = frame.sequence;
+                    self.state.publish_frame(frame);
+                    sequence
+                }
+                Err(error) => {
+                    if self.handle_error(error) {
+                        return;
+                    }
+                    0
+                }
+            },
+        };
+        self.notify();
+
+        loop {
+            loop {
+                let command = {
+                    let closed =
+                        self.closed.lock().expect("session admission lock poisoned");
+                    match self.receiver.try_recv() {
+                        Ok(command) => command,
+                        Err(_) if *closed => PumpCommand::Terminal(SessionCommand::Close),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        // Last GUI owner dropped the handle: detach, never Close.
+                        Err(mpsc::TryRecvError::Disconnected) => return,
+                    }
+                };
+                let (command, selection) = match command {
+                    PumpCommand::Terminal(command) => (command, None),
+                    PumpCommand::SelectionText {
+                        target,
+                        copy_to_clipboard,
+                    } => (
+                        SessionCommand::SelectionText,
+                        Some((target, copy_to_clipboard)),
+                    ),
+                };
+                let close = matches!(command, SessionCommand::Close);
+                match self.client.command(command) {
+                    Ok(reply) => {
+                        self.handle_reply(reply, selection, &mut frame_sequence);
+                        self.notify();
+                    }
+                    Err(error) => {
+                        if selection.is_some() {
+                            self.state
+                                .selection_text
+                                .lock()
+                                .expect("selection reply lock poisoned")
+                                .outstanding -= 1;
+                        }
+                        // Never retry Close, including an uncertain result.
+                        if self.handle_error(error) || close {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                if close {
+                    self.notify();
+                    return;
+                }
+            }
+
+            match self.client.poll_event() {
+                Ok(Some(SessionEvent::FrameReady)) => {
+                    if let Err(error) =
+                        self.publish_incremental_frame(&mut frame_sequence)
+                    {
+                        if self.handle_error(error) {
+                            return;
+                        }
+                    }
+                    self.notify();
+                }
+                Ok(Some(event)) => {
+                    self.state.publish_event(event);
+                    self.notify();
+                }
+                Ok(None) => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => {
+                    self.state.fail(error);
+                    self.notify();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn publish_incremental_frame(
+        &self,
+        base_sequence: &mut u64,
+    ) -> Result<(), SessionError> {
+        let update = match self.client.snapshot_since(*base_sequence) {
+            Ok(update) => update,
+            Err(error) => {
+                self.state.log_frame_resync_once(*base_sequence, &error);
+                FrameUpdate::Full(self.client.snapshot()?)
+            }
+        };
+
+        match update {
+            FrameUpdate::Full(frame) => {
+                *base_sequence = frame.sequence;
+                self.state.publish_frame(frame);
+            }
+            FrameUpdate::Delta(delta) => {
+                *base_sequence = delta.sequence;
+                if !self.state.publish_frame_update(FrameUpdate::Delta(delta)) {
+                    tracing::warn!(
+                        route_id = self.route_id,
+                        "session frame update queue full; requesting full snapshot"
+                    );
+                    let frame = self.client.snapshot()?;
+                    *base_sequence = frame.sequence;
+                    self.state.publish_frame(frame);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_reply(
+        &self,
+        reply: SessionReply,
+        selection: Option<(ClipboardType, bool)>,
+        base_sequence: &mut u64,
+    ) {
+        match reply {
+            SessionReply::Frame(frame) => {
+                *base_sequence = frame.sequence;
+                self.state.publish_frame(frame);
+            }
+            SessionReply::SelectionText(text) => {
+                let (target, copy_to_clipboard) =
+                    selection.expect("selection request needs its destination");
+                self.state
+                    .selection_text
+                    .lock()
+                    .expect("selection reply lock poisoned")
+                    .replies
+                    .push_back((target, text, copy_to_clipboard));
+            }
+            SessionReply::SearchNavigation(navigation) => {
+                if let Ok(mut slot) = self.state.search_navigation.lock() {
+                    *slot = Some(navigation);
+                }
+            }
+            SessionReply::SearchMatches(matches) => {
+                if let Ok(mut slot) = self.state.search_matches.lock() {
+                    *slot = Some(matches);
+                }
+            }
+            SessionReply::Closed
+            | SessionReply::Accepted
+            | SessionReply::NoChange
+            | SessionReply::ChildPid(_) => {}
+            SessionReply::FrameUpdate(update) => {
+                let next_sequence = match &update {
+                    FrameUpdate::Full(frame) => frame.sequence,
+                    FrameUpdate::Delta(delta) => delta.sequence,
+                };
+                if self.state.publish_frame_update(update) {
+                    *base_sequence = next_sequence;
+                } else {
+                    match self.client.snapshot() {
+                        Ok(frame) => {
+                            *base_sequence = frame.sequence;
+                            self.state.publish_frame(frame);
+                        }
+                        Err(error) => self.state.record_error(error),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Snapshot budget refusals are recoverable just like command rejections:
+    /// keep the attachment so input can clear the offending terminal state.
+    fn handle_error(&self, error: SessionError) -> bool {
+        let fatal = !recoverable_command_rejection(&error, self.client.is_poisoned());
+        if fatal {
+            self.state.fail(error);
+        } else {
+            self.state.record_error(error);
+        }
+        self.notify();
+        fatal
+    }
+
+    fn notify(&self) {
+        let window_id = self
+            .window_id
+            .lock()
+            .map(|window_id| *window_id)
+            .unwrap_or_else(|_| WindowId::from(0));
+        self.event_proxy
+            .send_event(RioEvent::RenderRoute(self.route_id), window_id);
+    }
+}
+
+impl<T: EventListener + Clone + Send + 'static> Drop for SessionPump<T> {
+    fn drop(&mut self) {
+        self.state.pump_done.store(true, Ordering::Release);
+    }
+}
+
+fn recoverable_command_rejection(error: &SessionError, poisoned: bool) -> bool {
+    !poisoned
+        && matches!(
+            error,
+            SessionError::Invalid(_) | SessionError::Unsupported(_)
+        )
+}
+
+pub struct PreparedSession {
+    attachment: Option<PreparedSessionAttachment>,
+    initial_frame: Option<FullFrame>,
+    had_active_owner: bool,
+}
+
+impl PreparedSession {
+    pub fn initial_frame(&self) -> &FullFrame {
+        self.initial_frame
+            .as_ref()
+            .expect("prepared session frame was already taken")
+    }
+
+    pub(crate) fn take_initial_frame(&mut self) -> FullFrame {
+        self.initial_frame
+            .take()
+            .expect("prepared session frame was already taken")
+    }
+
+    pub fn had_active_owner(&self) -> bool {
+        self.had_active_owner
+    }
+
+    pub fn commit(mut self) -> Result<SessionClient, SessionError> {
+        self.attachment
+            .take()
+            .expect("prepared session was already committed")
+            .commit()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PassiveCursor {
+    pub pos: Pos,
+}
+
+impl Default for PassiveCursor {
+    fn default() -> Self {
+        Self {
+            pos: Pos::default(),
+        }
+    }
+}
+
+/// A renderer-facing row cache. Only viewport rows are available in a
+/// `FullFrame`; indexing history lines deliberately clamps to the nearest
+/// cached row rather than pretending that the GUI has a history replica.
+#[derive(Clone, Debug)]
+pub struct PassiveGrid {
+    pub rows: Vec<Row<Square>>,
+    pub row_styles: Vec<Vec<Style>>,
+    pub cursor: PassiveCursor,
+    pub columns: usize,
+    pub lines: usize,
+    pub history: usize,
+    pub display_offset: usize,
+    extras: FxHashMap<u16, Extras>,
+    extras_by_value: FxHashMap<Extras, u16>,
+    styles_by_value: FxHashMap<Style, u16>,
+    next_extra_id: usize,
+}
+
+impl PassiveGrid {
+    fn new(columns: usize, lines: usize) -> Self {
+        let lines = lines.max(1);
+        let mut styles_by_value = FxHashMap::default();
+        styles_by_value.insert(Style::default(), 0);
+        Self {
+            rows: (0..lines).map(|_| Row::new(columns.max(1))).collect(),
+            row_styles: (0..lines)
+                .map(|_| vec![Style::default(); columns.max(1)])
+                .collect(),
+            cursor: PassiveCursor::default(),
+            columns: columns.max(1),
+            lines,
+            history: 0,
+            display_offset: 0,
+            extras: FxHashMap::default(),
+            extras_by_value: FxHashMap::default(),
+            styles_by_value,
+            next_extra_id: 1,
+        }
+    }
+
+    fn row_index(&self, line: Line) -> usize {
+        let index = line.0.saturating_add(self.display_offset as i32);
+        usize::try_from(index)
+            .ok()
+            .filter(|index| *index < self.rows.len())
+            .unwrap_or_else(|| {
+                if index.is_negative() {
+                    0
+                } else {
+                    self.rows.len() - 1
+                }
+            })
+    }
+
+    pub fn cell_text(&self, pos: Pos) -> std::vec::IntoIter<char> {
+        let row = self.row_index(pos.row);
+        let Some(square) = self.rows.get(row).and_then(|row| row.inner.get(pos.col.0))
+        else {
+            return Vec::new().into_iter();
+        };
+        let mut text = vec![square.c()];
+        if let Some(id) = square.extras_id_checked() {
+            if let Some(extras) = self.extras.get(&id) {
+                text.extend(extras.zerowidth.iter().copied());
+            }
+        }
+        text.into_iter()
+    }
+
+    fn hyperlink(&self, pos: Pos) -> Option<Hyperlink> {
+        let row = self.row_index(pos.row);
+        let square = self.rows.get(row)?.inner.get(pos.col.0)?;
+        square
+            .extras_id_checked()
+            .and_then(|id| self.extras.get(&id))
+            .and_then(|extras| extras.hyperlink.clone())
+    }
+
+    pub(crate) fn take_render_buffers(
+        &mut self,
+    ) -> (Vec<Row<Square>>, Vec<Vec<Style>>, FxHashMap<u16, Extras>) {
+        (
+            std::mem::take(&mut self.rows),
+            std::mem::take(&mut self.row_styles),
+            std::mem::take(&mut self.extras),
+        )
+    }
+
+    pub(crate) fn restore_render_buffers(
+        &mut self,
+        rows: Vec<Row<Square>>,
+        row_styles: Vec<Vec<Style>>,
+        extras: FxHashMap<u16, Extras>,
+    ) {
+        self.rows = rows;
+        self.row_styles = row_styles;
+        self.extras = extras;
+    }
+}
+
+impl Dimensions for PassiveGrid {
+    fn total_lines(&self) -> usize {
+        self.history + self.lines
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.lines
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn history_size(&self) -> usize {
+        self.history
+    }
+}
+
+impl Index<Line> for PassiveGrid {
+    type Output = Row<Square>;
+
+    fn index(&self, line: Line) -> &Self::Output {
+        &self.rows[self.row_index(line)]
+    }
+}
+
+impl IndexMut<Line> for PassiveGrid {
+    fn index_mut(&mut self, line: Line) -> &mut Self::Output {
+        let index = self.row_index(line);
+        &mut self.rows[index]
+    }
+}
+
+/// Passive terminal view used by existing renderer and interaction code.
+/// Every mutating method below sends a command to the worker; the fields are
+/// only the most recently published frame and are never authoritative.
+pub struct RemoteView {
+    pub grid: PassiveGrid,
+    pub cursor_shape: CursorShape,
+    pub default_cursor_shape: CursorShape,
+    pub blinking_cursor: bool,
+    pub selection_range: Option<SelectionRange>,
+    pub vi_mode_cursor: PassiveCursor,
+    pub window_id: WindowId,
+    pub title: String,
+    pub current_directory: Option<std::path::PathBuf>,
+    pub colors: rio_backend::config::colors::term::TermColors,
+    mode_bits: Mode,
+    session: Option<SessionHandle>,
+    frame: Option<FullFrame>,
+    graphics_dirty: bool,
+    pending_frame_damage: rio_backend::event::TerminalDamage,
+    delta_resync_logged: bool,
+    search_active: bool,
+    search_navigation: Option<SearchNavigation>,
+    search_matches: Option<Vec<SearchMatch>>,
+    decode_error: Option<String>,
+}
+
+impl std::fmt::Debug for RemoteView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteView")
+            .field(
+                "sequence",
+                &self.frame.as_ref().map_or(0, |frame| frame.sequence),
+            )
+            .field("columns", &self.grid.columns)
+            .field("lines", &self.grid.lines)
+            .finish()
+    }
+}
+
+impl RemoteView {
+    pub fn from_frame(frame: FullFrame, window_id: WindowId) -> Self {
+        let mut view = Self::new(
+            None,
+            window_id,
+            frame.columns as usize,
+            frame.lines as usize,
+        );
+        if let Err(error) = view.apply_frame(frame) {
+            view.decode_error = Some(error);
+        }
+        view
+    }
+
+    pub fn install_session(&mut self, session: SessionHandle) {
+        self.session = Some(session);
+    }
+
+    pub fn detach_session(&mut self) {
+        self.session = None;
+    }
+
+    pub(crate) fn frame_sequence(&self) -> u64 {
+        self.frame
+            .as_ref()
+            .expect("remote view has no cached frame")
+            .sequence
+    }
+
+    pub(crate) fn take_render_graphics(
+        &mut self,
+    ) -> rio_session::protocol::GraphicsFrame {
+        self.frame
+            .as_mut()
+            .map(|frame| std::mem::take(&mut frame.graphics))
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn restore_render_graphics(
+        &mut self,
+        graphics: rio_session::protocol::GraphicsFrame,
+    ) {
+        if let Some(frame) = &mut self.frame {
+            frame.graphics = graphics;
+        }
+    }
+
+    pub(crate) fn graphics_dirty(&self) -> bool {
+        self.graphics_dirty
+    }
+
+    pub(crate) fn mark_graphics_clean(&mut self) {
+        self.graphics_dirty = false;
+    }
+
+    pub fn decoder_error(&self) -> Option<&str> {
+        self.decode_error.as_deref()
+    }
+
+    pub fn new(
+        session: Option<SessionHandle>,
+        window_id: WindowId,
+        columns: usize,
+        lines: usize,
+    ) -> Self {
+        Self {
+            grid: PassiveGrid::new(columns, lines),
+            cursor_shape: CursorShape::Block,
+            default_cursor_shape: CursorShape::Block,
+            blinking_cursor: false,
+            selection_range: None,
+            vi_mode_cursor: PassiveCursor::default(),
+            window_id,
+            title: String::new(),
+            current_directory: None,
+            colors: Default::default(),
+            mode_bits: Mode::empty(),
+            session,
+            frame: None,
+            graphics_dirty: false,
+            pending_frame_damage: rio_backend::event::TerminalDamage::Noop,
+            delta_resync_logged: false,
+            search_active: false,
+            search_navigation: None,
+            search_matches: None,
+            decode_error: None,
+        }
+    }
+
+    pub fn refresh(&mut self) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        if let Some(navigation) = session.take_search_navigation() {
+            self.search_navigation = Some(navigation);
+        }
+        if let Some(matches) = session.take_search_matches() {
+            self.search_matches = Some(matches);
+        }
+        let (frame, updates) = session.take_frame_updates();
+        if let Some(frame) = frame {
+            let current_sequence =
+                self.frame.as_ref().map_or(0, |current| current.sequence);
+            if frame.sequence != current_sequence {
+                if let Err(error) = self.apply_frame(frame) {
+                    self.decode_error = Some(error.clone());
+                    session.record_command_error(SessionError::Invalid(error));
+                } else {
+                    self.decode_error = None;
+                    self.delta_resync_logged = false;
+                }
+            }
+        }
+        for update in updates {
+            match self.apply_frame_update(update) {
+                Ok(()) => {
+                    self.decode_error = None;
+                    self.delta_resync_logged = false;
+                }
+                Err(error) => {
+                    self.decode_error = Some(error.clone());
+                    if !self.delta_resync_logged {
+                        tracing::warn!(
+                            error = %error,
+                            "cached session frame delta did not match; requesting full snapshot"
+                        );
+                        self.delta_resync_logged = true;
+                    }
+                    if let Err(error) = session.enqueue(SessionCommand::Snapshot) {
+                        session.record_command_error(error);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn refresh_renderable(&mut self, content: &mut RenderableContent) {
+        self.refresh();
+        content.term_colors = self.colors;
+        content.display_offset = self.grid.display_offset;
+        content.columns = self.grid.columns;
+        content.screen_lines = self.grid.lines;
+        content.history_size = self.grid.history;
+        content.blinking_cursor = self.blinking_cursor;
+        content.cursor.state = self.cursor();
+        content.selection_range = self.selection_range;
+        content.session_error = self
+            .decode_error
+            .clone()
+            .or_else(|| self.session.as_ref().and_then(SessionHandle::error));
+        let frame_damage = std::mem::replace(
+            &mut self.pending_frame_damage,
+            rio_backend::event::TerminalDamage::Noop,
+        );
+        content.frame_damage =
+            PendingUpdate::merge_terminal_damages(content.frame_damage, frame_damage);
+    }
+
+    fn apply_frame(&mut self, frame: FullFrame) -> Result<(), String> {
+        let graphics_changed = self
+            .frame
+            .as_ref()
+            .is_none_or(|current| current.graphics != frame.graphics);
+        let columns = frame.columns as usize;
+        let lines = frame.lines as usize;
+        let mut grid = PassiveGrid::new(columns, lines);
+        grid.history = frame.history_size as usize;
+        grid.display_offset = frame.display_offset as usize;
+        for (row_index, source) in frame.rows.iter().enumerate() {
+            let (row, styles) = Self::decode_row(&mut grid, source)?;
+            grid.rows[row_index] = row;
+            grid.row_styles[row_index] = styles;
+        }
+        self.grid = grid;
+        self.update_frame_metadata(&frame);
+        self.frame = Some(frame);
+        self.graphics_dirty |= graphics_changed;
+        self.pending_frame_damage = PendingUpdate::merge_terminal_damages(
+            self.pending_frame_damage,
+            rio_backend::event::TerminalDamage::Full,
+        );
+        Ok(())
+    }
+
+    fn decode_row(
+        grid: &mut PassiveGrid,
+        source: &RowFrame,
+    ) -> Result<(Row<Square>, Vec<Style>), String> {
+        let columns = grid.columns;
+        if source.cells.len() != columns
+            || source.styles.len() != columns
+            || source.extras.len() != columns
+        {
+            return Err("passive frame row dimensions do not match".into());
+        }
+        let mut row = Row::new(columns);
+        let mut row_styles = Vec::with_capacity(columns);
+        for (column, cell) in source.cells.iter().enumerate() {
+            let mut square = decode_cell(cell);
+            let is_codepoint = matches!(&cell.content, CellContentFrame::Codepoint(_));
+            if is_codepoint {
+                if let Some(extra) = source.extras.get(column).and_then(Option::as_ref) {
+                    let extras = decode_extras(extra);
+                    let id = if let Some(id) = grid.extras_by_value.get(&extras) {
+                        *id
+                    } else {
+                        if grid.next_extra_id > usize::from(u16::MAX) {
+                            return Err(
+                                "passive frame extras table exceeds u16 capacity".into(),
+                            );
+                        }
+                        let id = u16::try_from(grid.next_extra_id).map_err(|_| {
+                            "passive frame extras ID overflow".to_string()
+                        })?;
+                        grid.next_extra_id += 1;
+                        grid.extras_by_value.insert(extras.clone(), id);
+                        grid.extras.insert(id, extras);
+                        id
+                    };
+                    square.set_extras_id(Some(id));
+                    row.has_extras = true;
+                }
+            }
+            let style = source
+                .styles
+                .get(column)
+                .map(decode_style)
+                .unwrap_or_default();
+            row_styles.push(style.clone());
+            let style_id = if let Some(id) = grid.styles_by_value.get(&style) {
+                *id
+            } else {
+                let next_id = grid.styles_by_value.len();
+                if next_id > usize::from(u16::MAX) {
+                    return Err("passive frame style ID overflow".into());
+                }
+                let id = u16::try_from(next_id)
+                    .map_err(|_| "passive frame style ID overflow".to_string())?;
+                grid.styles_by_value.insert(style.clone(), id);
+                id
+            };
+            if is_codepoint {
+                square.set_style_id(style_id);
+            }
+            if style != Style::default() {
+                row.has_styles = true;
+            }
+            row.inner[column] = square;
+        }
+        row.kitty_virtual_placeholder = source.kitty_virtual_placeholder;
+        row.dirty = true;
+        Ok((row, row_styles))
+    }
+
+    fn update_frame_metadata(&mut self, frame: &FullFrame) {
+        self.grid.cursor.pos = Pos::new(
+            Line(i32::from(frame.cursor.line)),
+            Column(frame.cursor.column as usize),
+        );
+        self.vi_mode_cursor.pos = Pos::new(
+            Line(i32::from(frame.cursor.line) - frame.display_offset as i32),
+            Column(frame.cursor.column as usize),
+        );
+        self.blinking_cursor = frame.cursor.blinking;
+        self.cursor_shape = cursor_shape(frame.cursor.shape);
+        self.default_cursor_shape = self.cursor_shape;
+        self.mode_bits = Mode::from_bits_truncate(frame.modes);
+        self.title = frame.title.clone();
+        self.current_directory =
+            frame.working_dir.as_deref().map(std::path::PathBuf::from);
+        self.colors = decode_colors(&frame.colors);
+        self.selection_range = selection_range(frame.selection.as_ref());
+        self.grid.history = frame.history_size as usize;
+        self.grid.display_offset = frame.display_offset as usize;
+    }
+
+    fn apply_frame_update(&mut self, update: FrameUpdate) -> Result<(), String> {
+        match update {
+            FrameUpdate::Full(frame) => self.apply_frame(frame),
+            FrameUpdate::Delta(delta) => {
+                let Some(current) = self.frame.take() else {
+                    return Err("received a frame delta without a cached frame".into());
+                };
+                let cached_sequence = current.sequence;
+                if current.sequence != delta.base_sequence {
+                    self.frame = Some(current);
+                    return Err(format!(
+                        "frame delta base {} does not match cached {}",
+                        delta.base_sequence, cached_sequence
+                    ));
+                }
+                if current.columns != delta.columns || current.lines != delta.lines {
+                    self.frame = Some(current);
+                    return Err("frame delta dimensions require a full snapshot".into());
+                }
+                let old_selection = self.selection_range;
+                let old_display_offset = self.grid.display_offset;
+                let old_history = self.grid.history;
+                let old_colors = self.colors;
+                let old_alternate_screen = current.alternate_screen;
+                let changed_row_count = delta.rows.len();
+                let mut next = current;
+                let mut staged_grid = self.grid.clone();
+                let mut decoded_rows = Vec::with_capacity(delta.rows.len());
+                for changed in &delta.rows {
+                    let row_index = usize::from(changed.line);
+                    if row_index >= staged_grid.rows.len() {
+                        self.frame = Some(next);
+                        return Err("frame delta row is outside the cached grid".into());
+                    }
+                    let (row, styles) =
+                        match Self::decode_row(&mut staged_grid, &changed.row) {
+                            Ok(decoded) => decoded,
+                            Err(error) => {
+                                self.frame = Some(next);
+                                return Err(error);
+                            }
+                        };
+                    decoded_rows.push((row_index, row, styles));
+                }
+                if let Err(error) = FrameUpdate::Delta(delta).apply_to(&mut next) {
+                    self.frame = Some(next);
+                    return Err(error.to_string());
+                }
+                let alternate_changed = old_alternate_screen != next.alternate_screen;
+                self.grid = staged_grid;
+                for (row_index, row, styles) in decoded_rows {
+                    self.grid.rows[row_index] = row;
+                    self.grid.row_styles[row_index] = styles;
+                }
+                self.update_frame_metadata(&next);
+                self.frame = Some(next);
+                let selection_changed = old_selection != self.selection_range;
+                let viewport_changed = old_display_offset != self.grid.display_offset
+                    || old_history != self.grid.history;
+                let colors_changed = old_colors != self.colors;
+                let needs_row_rebuild = selection_changed
+                    || viewport_changed
+                    || colors_changed
+                    || alternate_changed;
+                if needs_row_rebuild {
+                    for row in &mut self.grid.rows {
+                        row.dirty = true;
+                    }
+                }
+                let damage = if needs_row_rebuild || changed_row_count != 0 {
+                    rio_backend::event::TerminalDamage::Partial
+                } else {
+                    rio_backend::event::TerminalDamage::CursorOnly
+                };
+                self.pending_frame_damage = PendingUpdate::merge_terminal_damages(
+                    self.pending_frame_damage,
+                    damage,
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn enqueue(&self, command: SessionCommand) {
+        if let Some(session) = &self.session {
+            if let Err(error) = session.enqueue(command) {
+                // The owning context exposes this error through the passive
+                // render cache; never fall back to a local terminal.
+                session.record_command_error(error);
+            }
+        }
+    }
+
+    pub fn session(&self) -> Option<&SessionHandle> {
+        self.session.as_ref()
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode_bits
+    }
+
+    pub fn display_offset(&self) -> usize {
+        self.grid.display_offset
+    }
+
+    pub fn history_size(&self) -> usize {
+        self.grid.history
+    }
+
+    pub fn columns(&self) -> usize {
+        self.grid.columns
+    }
+
+    pub fn screen_lines(&self) -> usize {
+        self.grid.lines
+    }
+
+    pub fn total_lines(&self) -> usize {
+        self.grid.total_lines()
+    }
+
+    pub fn bottommost_line(&self) -> Line {
+        self.grid.bottommost_line()
+    }
+
+    pub fn topmost_line(&self) -> Line {
+        self.grid.topmost_line()
+    }
+
+    pub fn last_column(&self) -> Column {
+        self.grid.last_column()
+    }
+
+    pub fn cursor(&self) -> CursorState {
+        CursorState {
+            pos: self.grid.cursor.pos,
+            content: self.cursor_shape,
+        }
+    }
+
+    pub fn vi_cursor_position(&self) -> Pos {
+        self.vi_mode_cursor.pos
+    }
+
+    pub fn resize_to(&mut self, size: rio_backend::event::WindowSize) {
+        self.enqueue(SessionCommand::Resize {
+            columns: size.cols,
+            lines: size.rows,
+            pixel_width: size.width,
+            pixel_height: size.height,
+        });
+    }
+
+    pub fn set_cursor_style(&mut self, shape: CursorShape, blinking: bool) {
+        let shape = match shape {
+            CursorShape::Block => 0,
+            CursorShape::Underline => 1,
+            CursorShape::Beam => 2,
+            CursorShape::Hidden => 3,
+        };
+        self.enqueue(SessionCommand::SetCursorStyle { shape, blinking });
+    }
+
+    pub fn scroll_display(&mut self, scroll: Scroll) {
+        match scroll {
+            Scroll::Delta(delta_lines) => {
+                self.enqueue(SessionCommand::Scroll { delta_lines })
+            }
+            Scroll::PageUp => self.enqueue(SessionCommand::Scroll {
+                delta_lines: self.screen_lines() as i32,
+            }),
+            Scroll::PageDown => self.enqueue(SessionCommand::Scroll {
+                delta_lines: -(self.screen_lines() as i32),
+            }),
+            Scroll::Top => self.enqueue(SessionCommand::ScrollTop),
+            Scroll::Bottom => self.enqueue(SessionCommand::ScrollBottom),
+        }
+    }
+
+    pub fn paste(&mut self, text: String) {
+        self.enqueue(SessionCommand::Paste(text));
+    }
+
+    pub fn focus(&mut self, focused: bool) {
+        self.enqueue(SessionCommand::Focus { focused });
+    }
+
+    pub fn mouse_wheel(&mut self, lines: i32, point: Pos, modifiers: u8) {
+        let (Ok(column), Ok(line)) =
+            (u16::try_from(point.col.0), u16::try_from(point.row.0))
+        else {
+            return;
+        };
+        self.enqueue(SessionCommand::MouseWheel {
+            lines,
+            column,
+            line,
+            modifiers,
+        });
+    }
+
+    pub fn mouse_button(&mut self, point: Pos, button: u8, pressed: bool, modifiers: u8) {
+        let (Ok(column), Ok(line)) =
+            (u16::try_from(point.col.0), u16::try_from(point.row.0))
+        else {
+            return;
+        };
+        self.enqueue(SessionCommand::MouseButton {
+            column,
+            line,
+            button,
+            pressed,
+            modifiers,
+        });
+    }
+
+    pub fn mouse_motion(&mut self, point: Pos, button: u8, modifiers: u8) {
+        let (Ok(column), Ok(line)) =
+            (u16::try_from(point.col.0), u16::try_from(point.row.0))
+        else {
+            return;
+        };
+        self.enqueue(SessionCommand::MouseMotion {
+            column,
+            line,
+            button,
+            modifiers,
+        });
+    }
+
+    pub fn selection_begin(
+        &mut self,
+        ty: rio_backend::selection::SelectionType,
+        point: Pos,
+        side: rio_backend::crosswords::pos::Side,
+    ) {
+        let kind = match ty {
+            rio_backend::selection::SelectionType::Simple => WireSelectionKind::Simple,
+            rio_backend::selection::SelectionType::Block => WireSelectionKind::Block,
+            rio_backend::selection::SelectionType::Semantic => WireSelectionKind::Word,
+            rio_backend::selection::SelectionType::Lines => WireSelectionKind::Line,
+        };
+        let side = match side {
+            rio_backend::crosswords::pos::Side::Left => WireSelectionSide::Left,
+            rio_backend::crosswords::pos::Side::Right => WireSelectionSide::Right,
+        };
+        self.enqueue(SessionCommand::SelectionBegin {
+            line: point.row.0,
+            column: point.col.0,
+            kind,
+            side,
+        });
+    }
+
+    pub fn selection_update(
+        &mut self,
+        point: Pos,
+        side: rio_backend::crosswords::pos::Side,
+    ) {
+        let side = match side {
+            rio_backend::crosswords::pos::Side::Left => WireSelectionSide::Left,
+            rio_backend::crosswords::pos::Side::Right => WireSelectionSide::Right,
+        };
+        self.enqueue(SessionCommand::SelectionUpdate {
+            line: point.row.0,
+            column: point.col.0,
+            side,
+        });
+    }
+
+    pub fn selection_autoscroll(
+        &mut self,
+        delta_lines: i32,
+        point: Pos,
+        side: rio_backend::crosswords::pos::Side,
+    ) {
+        let side = match side {
+            rio_backend::crosswords::pos::Side::Left => WireSelectionSide::Left,
+            rio_backend::crosswords::pos::Side::Right => WireSelectionSide::Right,
+        };
+        self.enqueue(SessionCommand::SelectionAutoScroll {
+            delta_lines,
+            line: point.row.0,
+            column: point.col.0,
+            side,
+        });
+    }
+
+    pub fn select_all(&mut self) {
+        self.enqueue(SessionCommand::SelectAll);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.enqueue(SessionCommand::SelectionClear);
+    }
+
+    pub fn vi_scroll(&mut self, delta_lines: i32) {
+        self.enqueue(SessionCommand::ViScroll { delta_lines });
+    }
+
+    pub fn vi_motion(&mut self, motion: rio_backend::crosswords::vi_mode::ViMotion) {
+        if let Some(motion) = wire_vi_motion(motion) {
+            self.enqueue(SessionCommand::ViMotion(motion));
+        }
+    }
+
+    pub fn vi_goto_pos(&mut self, pos: Pos) {
+        self.enqueue(SessionCommand::ViGoto {
+            line: pos.row.0,
+            column: pos.col.0 as u16,
+        });
+    }
+
+    pub fn scroll_to_pos(&mut self, pos: Pos) {
+        self.enqueue(SessionCommand::ViGoto {
+            line: pos.row.0,
+            column: pos.col.0 as u16,
+        });
+    }
+
+    pub fn scroll_to_prompt(&mut self, forward: bool) {
+        self.enqueue(SessionCommand::ScrollToPrompt { forward });
+    }
+
+    pub fn clear_saved_history(&mut self) {
+        self.enqueue(SessionCommand::ClearSavedHistory);
+    }
+
+    pub fn set_vi_mode(&mut self, enabled: bool) {
+        self.enqueue(SessionCommand::SetViMode(enabled));
+    }
+
+    pub fn request_selection_text(
+        &mut self,
+        target: rio_backend::clipboard::ClipboardType,
+    ) {
+        self.request_selection_text_with_copy(target, false);
+    }
+
+    pub fn request_selection_text_with_copy(
+        &mut self,
+        target: rio_backend::clipboard::ClipboardType,
+        copy_to_clipboard: bool,
+    ) {
+        if let Some(session) = self.session.as_ref() {
+            if let Err(error) = session.request_selection_text(target, copy_to_clipboard)
+            {
+                session.record_command_error(error);
+            }
+        }
+    }
+
+    pub fn take_selection_text(
+        &mut self,
+    ) -> Option<(rio_backend::clipboard::ClipboardType, Option<String>, bool)> {
+        self.session.as_ref()?.take_selection_text()
+    }
+
+    pub fn passive_selection_range(&self) -> Option<SelectionRange> {
+        self.selection_range
+    }
+
+    pub fn begin_search(
+        &mut self,
+        pattern: String,
+        origin: Pos,
+        direction: rio_backend::crosswords::pos::Direction,
+        side: rio_backend::crosswords::pos::Side,
+        max_lines: Option<usize>,
+    ) {
+        if self.search_active {
+            self.enqueue(SessionCommand::SearchNext);
+            return;
+        }
+        let Ok(origin_display_offset) = u32::try_from(self.display_offset()) else {
+            return;
+        };
+        let origin_line = origin.row.0;
+        let Ok(origin_column) = origin.col.0.try_into() else {
+            return;
+        };
+        self.search_active = true;
+        self.search_navigation = None;
+        self.enqueue(SessionCommand::SearchBegin {
+            pattern,
+            origin_line,
+            origin_column,
+            origin_display_offset,
+            direction: match direction {
+                rio_backend::crosswords::pos::Direction::Right => {
+                    WireSearchDirection::Forward
+                }
+                rio_backend::crosswords::pos::Direction::Left => {
+                    WireSearchDirection::Backward
+                }
+            },
+            side: match side {
+                rio_backend::crosswords::pos::Side::Left => WireSelectionSide::Left,
+                rio_backend::crosswords::pos::Side::Right => WireSelectionSide::Right,
+            },
+            max_lines: max_lines.and_then(|lines| u32::try_from(lines).ok()),
+        });
+    }
+
+    pub fn next_search(&mut self) {
+        if self.search_active {
+            self.enqueue(SessionCommand::SearchNext);
+        }
+    }
+
+    pub fn search_matches(&mut self, pattern: &str, max_matches: usize) {
+        self.search_matches = None;
+        self.enqueue(SessionCommand::Search {
+            pattern: pattern.to_owned(),
+            max_matches,
+        });
+    }
+
+    pub fn take_search_matches(&mut self) -> Option<Vec<std::ops::RangeInclusive<Pos>>> {
+        self.refresh();
+        self.search_matches.take().map(|matches| {
+            matches
+                .into_iter()
+                .map(|matched| {
+                    let history = self.grid.history as i32;
+                    let start_line = matched.start_line as i32 - history;
+                    let end_line = matched.end_line as i32 - history;
+                    Pos::new(Line(start_line), Column(matched.start_column as usize))
+                        ..=Pos::new(Line(end_line), Column(matched.end_column as usize))
+                })
+                .collect()
+        })
+    }
+
+    pub fn is_search_active(&self) -> bool {
+        self.search_active
+    }
+
+    pub fn cancel_search(&mut self) {
+        if self.search_active {
+            self.search_active = false;
+            self.search_navigation = None;
+            self.enqueue(SessionCommand::SearchCancel);
+        }
+    }
+
+    pub fn take_search_navigation(&mut self) -> Option<SearchNavigation> {
+        self.refresh();
+        self.search_navigation.take()
+    }
+
+    pub fn cell_hyperlink(&self, point: Pos) -> Option<Hyperlink> {
+        self.grid.hyperlink(point)
+    }
+}
+
+impl Dimensions for RemoteView {
+    fn total_lines(&self) -> usize {
+        self.grid.total_lines()
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.grid.lines
+    }
+
+    fn columns(&self) -> usize {
+        self.grid.columns
+    }
+
+    fn history_size(&self) -> usize {
+        self.grid.history
+    }
+}
+
+fn cursor_shape(value: u8) -> CursorShape {
+    match value {
+        1 => CursorShape::Underline,
+        2 => CursorShape::Beam,
+        3 => CursorShape::Hidden,
+        _ => CursorShape::Block,
+    }
+}
+
+fn selection_range(selection: Option<&SelectionFrame>) -> Option<SelectionRange> {
+    selection.map(|selection| SelectionRange {
+        start: Pos::new(
+            Line(selection.start_line as i32),
+            Column(selection.start_column as usize),
+        ),
+        end: Pos::new(
+            Line(selection.end_line as i32),
+            Column(selection.end_column as usize),
+        ),
+        is_block: selection.block,
+    })
+}
+
+fn decode_cell(cell: &CellFrame) -> Square {
+    let mut square = match cell.content {
+        CellContentFrame::Codepoint(codepoint) => {
+            Square::from_char(char::from_u32(codepoint).unwrap_or(' '))
+        }
+        CellContentFrame::Palette(index) => {
+            let mut square = Square::default();
+            square.set_bg_palette(index);
+            square
+        }
+        CellContentFrame::Rgb { r, g, b } => {
+            let mut square = Square::default();
+            square.set_bg_rgb(r, g, b);
+            square
+        }
+    };
+    square.set_wide(match cell.wide {
+        1 => Wide::Wide,
+        2 => Wide::Spacer,
+        3 => Wide::LeadingSpacer,
+        _ => Wide::Narrow,
+    });
+    square.set_cell_flags(CellFlags::from_bits_truncate(cell.flags));
+    square
+}
+
+fn decode_extras(extra: &rio_session::protocol::ExtrasFrame) -> Extras {
+    Extras {
+        zerowidth: extra
+            .zero_width
+            .iter()
+            .filter_map(|codepoint| char::from_u32(*codepoint))
+            .collect(),
+        hyperlink: extra
+            .hyperlink
+            .as_ref()
+            .map(|uri| Hyperlink::new(None::<String>, uri.clone())),
+    }
+}
+
+fn decode_style(style: &StyleFrame) -> Style {
+    Style {
+        fg: decode_color(&style.foreground),
+        bg: decode_color(&style.background),
+        underline_color: style.underline.as_ref().map(decode_color),
+        flags: StyleFlags::from_bits_truncate(style.flags),
+    }
+}
+
+fn decode_color(color: &ColorFrame) -> AnsiColor {
+    match color {
+        ColorFrame::Indexed(index) => AnsiColor::Indexed(*index),
+        ColorFrame::Rgb { r, g, b } => AnsiColor::Spec(ColorRgb {
+            r: *r,
+            g: *g,
+            b: *b,
+        }),
+        ColorFrame::Named(name) => AnsiColor::Named(named_color(*name)),
+    }
+}
+
+fn named_color(value: u16) -> NamedColor {
+    match value {
+        0 => NamedColor::Black,
+        1 => NamedColor::Red,
+        2 => NamedColor::Green,
+        3 => NamedColor::Yellow,
+        4 => NamedColor::Blue,
+        5 => NamedColor::Magenta,
+        6 => NamedColor::Cyan,
+        7 => NamedColor::White,
+        8 => NamedColor::LightBlack,
+        9 => NamedColor::LightRed,
+        10 => NamedColor::LightGreen,
+        11 => NamedColor::LightYellow,
+        12 => NamedColor::LightBlue,
+        13 => NamedColor::LightMagenta,
+        14 => NamedColor::LightCyan,
+        15 => NamedColor::LightWhite,
+        256 => NamedColor::Foreground,
+        257 => NamedColor::Background,
+        258 => NamedColor::Cursor,
+        259 => NamedColor::DimBlack,
+        260 => NamedColor::DimRed,
+        261 => NamedColor::DimGreen,
+        262 => NamedColor::DimYellow,
+        263 => NamedColor::DimBlue,
+        264 => NamedColor::DimMagenta,
+        265 => NamedColor::DimCyan,
+        266 => NamedColor::DimWhite,
+        267 => NamedColor::LightForeground,
+        268 => NamedColor::DimForeground,
+        _ => NamedColor::Foreground,
+    }
+}
+
+fn decode_colors(
+    colors: &[Option<[f32; 4]>],
+) -> rio_backend::config::colors::term::TermColors {
+    let mut result = rio_backend::config::colors::term::TermColors::default();
+    for (index, color) in colors.iter().enumerate().take(269) {
+        result[index] = *color;
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rio_backend::crosswords::square::ContentTag;
+    use rio_session::protocol::{
+        CellContentFrame, CellFrame, ColorFrame, CursorFrame, FrameDelta, GraphicsFrame,
+        RowFrame, RowUpdate, SelectionFrame, StyleFrame,
+    };
+
+    #[cfg(unix)]
+    fn review_home() -> String {
+        let root = std::env::var_os("RIO_ACCEPT_ARTIFACT_ROOT")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .map(|home| home.join("dev/rio-agent-artifacts"))
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("rio-agent-artifacts"));
+        let path = root.join(format!("session-review-home-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::set_permissions(
+            &path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn frame(columns: u16, lines: u16, rows: Vec<RowFrame>) -> FullFrame {
+        FullFrame {
+            sequence: 1,
+            columns,
+            lines,
+            rows,
+            display_offset: 0,
+            history_size: 0,
+            lines_evicted: 0,
+            alternate_screen: false,
+            modes: 0,
+            cursor: CursorFrame {
+                line: 0,
+                column: 0,
+                visible: true,
+                blinking: false,
+                shape: 0,
+            },
+            selection: None,
+            colors: vec![None; 269],
+            graphics: GraphicsFrame::default(),
+            title: String::new(),
+            working_dir: None,
+        }
+    }
+
+    fn delta(
+        columns: u16,
+        lines: u16,
+        sequence: u64,
+        rows: Vec<RowUpdate>,
+    ) -> FrameDelta {
+        FrameDelta {
+            base_sequence: sequence - 1,
+            sequence,
+            columns,
+            lines,
+            rows,
+            display_offset: 0,
+            history_size: 0,
+            lines_evicted: 0,
+            alternate_screen: false,
+            modes: 0,
+            cursor: CursorFrame {
+                line: 0,
+                column: 0,
+                visible: true,
+                blinking: false,
+                shape: 0,
+            },
+            selection: None,
+            colors: vec![None; 269],
+            title: String::new(),
+            working_dir: None,
+        }
+    }
+
+    #[test]
+    fn frame_delta_cursor_only_does_not_rebuild_rows() {
+        let mut view = RemoteView::from_frame(
+            frame(
+                2,
+                1,
+                vec![RowFrame {
+                    cells: vec![
+                        CellFrame {
+                            content: CellContentFrame::Codepoint('a' as u32),
+                            wide: 0,
+                            flags: 0,
+                        },
+                        CellFrame {
+                            content: CellContentFrame::Codepoint('b' as u32),
+                            wide: 0,
+                            flags: 0,
+                        },
+                    ],
+                    styles: vec![default_style(), default_style()],
+                    extras: vec![None, None],
+                    kitty_virtual_placeholder: false,
+                    text: "ab".into(),
+                }],
+            ),
+            WindowId::from(0),
+        );
+        let original_row = view.grid.rows[0].clone();
+        for row in &mut view.grid.rows {
+            row.dirty = false;
+        }
+        view.pending_frame_damage = rio_backend::event::TerminalDamage::Noop;
+        let mut update = delta(2, 1, 2, Vec::new());
+        update.cursor.column = 1;
+        update.cursor.visible = false;
+        assert!(view.apply_frame_update(FrameUpdate::Delta(update)).is_ok());
+        assert_eq!(
+            view.pending_frame_damage,
+            rio_backend::event::TerminalDamage::CursorOnly
+        );
+        assert_eq!(view.grid.rows[0], original_row);
+    }
+
+    #[test]
+    fn frame_delta_updates_only_changed_rows_and_preserves_interned_data() {
+        let base_row = RowFrame {
+            cells: vec![CellFrame {
+                content: CellContentFrame::Codepoint('a' as u32),
+                wide: 0,
+                flags: 0,
+            }],
+            styles: vec![default_style()],
+            extras: vec![Some(rio_session::protocol::ExtrasFrame {
+                zero_width: vec![0x301],
+                hyperlink: Some("https://example.com".into()),
+            })],
+            kitty_virtual_placeholder: false,
+            text: "a\u{301}".into(),
+        };
+        let other_row = RowFrame {
+            cells: vec![CellFrame {
+                content: CellContentFrame::Codepoint('b' as u32),
+                wide: 0,
+                flags: 0,
+            }],
+            styles: vec![default_style()],
+            extras: vec![None],
+            kitty_virtual_placeholder: false,
+            text: "b".into(),
+        };
+        let mut view = RemoteView::from_frame(
+            frame(1, 2, vec![base_row.clone(), other_row]),
+            WindowId::from(0),
+        );
+        view.pending_frame_damage = rio_backend::event::TerminalDamage::Noop;
+        for row in &mut view.grid.rows {
+            row.dirty = false;
+        }
+        let original_extra_id = view.grid.rows[0].inner[0].extras_id_checked();
+        let original_other_row = view.grid.rows[1].clone();
+        let changed_row = RowFrame {
+            cells: vec![CellFrame {
+                content: CellContentFrame::Codepoint('c' as u32),
+                wide: 0,
+                flags: 0,
+            }],
+            styles: vec![StyleFrame {
+                flags: StyleFlags::BOLD.bits(),
+                ..default_style()
+            }],
+            extras: vec![None],
+            kitty_virtual_placeholder: false,
+            text: "c".into(),
+        };
+        let update = delta(
+            1,
+            2,
+            2,
+            vec![RowUpdate {
+                line: 1,
+                row: changed_row,
+            }],
+        );
+        assert!(view.apply_frame_update(FrameUpdate::Delta(update)).is_ok());
+        assert_eq!(
+            view.grid.rows[0].inner[0].extras_id_checked(),
+            original_extra_id
+        );
+        assert_eq!(view.grid.rows[1].inner[0].c(), 'c');
+        assert_eq!(view.grid.rows[1].inner[0].style_id(), 1);
+        assert_eq!(
+            view.grid.rows[1].inner[0].wide(),
+            original_other_row.inner[0].wide()
+        );
+        assert_eq!(
+            view.grid
+                .extras
+                .get(&original_extra_id.unwrap())
+                .unwrap()
+                .hyperlink
+                .as_ref()
+                .unwrap()
+                .uri(),
+            "https://example.com"
+        );
+        assert_eq!(
+            view.pending_frame_damage,
+            rio_backend::event::TerminalDamage::Partial
+        );
+        assert!(!view.grid.rows[0].dirty);
+        assert!(view.grid.rows[1].dirty);
+    }
+
+    #[test]
+    fn frame_delta_selection_invalidates_all_rows() {
+        let mut view = RemoteView::from_frame(
+            frame(
+                1,
+                2,
+                vec![
+                    RowFrame {
+                        cells: vec![CellFrame {
+                            content: CellContentFrame::Codepoint('a' as u32),
+                            wide: 0,
+                            flags: 0,
+                        }],
+                        styles: vec![default_style()],
+                        extras: vec![None],
+                        kitty_virtual_placeholder: false,
+                        text: "a".into(),
+                    },
+                    RowFrame {
+                        cells: vec![CellFrame {
+                            content: CellContentFrame::Codepoint('b' as u32),
+                            wide: 0,
+                            flags: 0,
+                        }],
+                        styles: vec![default_style()],
+                        extras: vec![None],
+                        kitty_virtual_placeholder: false,
+                        text: "b".into(),
+                    },
+                ],
+            ),
+            WindowId::from(0),
+        );
+        for row in &mut view.grid.rows {
+            row.dirty = false;
+        }
+        view.pending_frame_damage = rio_backend::event::TerminalDamage::Noop;
+        let mut update = delta(1, 2, 2, Vec::new());
+        update.selection = Some(SelectionFrame {
+            start_line: 0,
+            start_column: 0,
+            end_line: 1,
+            end_column: 0,
+            block: false,
+        });
+
+        assert!(view.apply_frame_update(FrameUpdate::Delta(update)).is_ok());
+        assert_eq!(
+            view.pending_frame_damage,
+            rio_backend::event::TerminalDamage::Partial
+        );
+        assert!(view.grid.rows.iter().all(|row| row.dirty));
+    }
+
+    #[test]
+    fn frame_delta_base_mismatch_preserves_cached_frame_for_resync() {
+        let mut view = RemoteView::from_frame(
+            frame(
+                1,
+                1,
+                vec![RowFrame {
+                    cells: vec![CellFrame {
+                        content: CellContentFrame::Codepoint('a' as u32),
+                        wide: 0,
+                        flags: 0,
+                    }],
+                    styles: vec![default_style()],
+                    extras: vec![None],
+                    kitty_virtual_placeholder: false,
+                    text: "a".into(),
+                }],
+            ),
+            WindowId::from(0),
+        );
+        view.pending_frame_damage = rio_backend::event::TerminalDamage::Noop;
+        let mut update = delta(1, 1, 3, Vec::new());
+        update.base_sequence = 2;
+
+        assert!(view.apply_frame_update(FrameUpdate::Delta(update)).is_err());
+        assert_eq!(view.frame.as_ref().unwrap().sequence, 1);
+        assert_eq!(view.grid.rows[0].inner[0].c(), 'a');
+        assert_eq!(
+            view.pending_frame_damage,
+            rio_backend::event::TerminalDamage::Noop
+        );
+    }
+
+    #[test]
+    fn frame_delta_decode_failure_preserves_cached_frame() {
+        let mut view = RemoteView::from_frame(
+            frame(
+                1,
+                1,
+                vec![RowFrame {
+                    cells: vec![CellFrame {
+                        content: CellContentFrame::Codepoint('a' as u32),
+                        wide: 0,
+                        flags: 0,
+                    }],
+                    styles: vec![default_style()],
+                    extras: vec![None],
+                    kitty_virtual_placeholder: false,
+                    text: "a".into(),
+                }],
+            ),
+            WindowId::from(0),
+        );
+        view.pending_frame_damage = rio_backend::event::TerminalDamage::Noop;
+        let invalid = delta(
+            1,
+            1,
+            2,
+            vec![RowUpdate {
+                line: 0,
+                row: RowFrame {
+                    cells: vec![
+                        CellFrame {
+                            content: CellContentFrame::Codepoint('b' as u32),
+                            wide: 0,
+                            flags: 0,
+                        },
+                        CellFrame {
+                            content: CellContentFrame::Codepoint('c' as u32),
+                            wide: 0,
+                            flags: 0,
+                        },
+                    ],
+                    styles: vec![default_style(), default_style()],
+                    extras: vec![None, None],
+                    kitty_virtual_placeholder: false,
+                    text: "bc".into(),
+                },
+            }],
+        );
+
+        assert!(view
+            .apply_frame_update(FrameUpdate::Delta(invalid))
+            .is_err());
+        assert_eq!(view.frame.as_ref().unwrap().sequence, 1);
+        assert_eq!(view.grid.rows[0].inner[0].c(), 'a');
+        assert_eq!(
+            view.pending_frame_damage,
+            rio_backend::event::TerminalDamage::Noop
+        );
+    }
+
+    #[test]
+    fn frame_damage_merges_across_publications_until_render_consumes_it() {
+        let mut view = RemoteView::from_frame(
+            frame(
+                1,
+                1,
+                vec![RowFrame {
+                    cells: vec![CellFrame {
+                        content: CellContentFrame::Codepoint('a' as u32),
+                        wide: 0,
+                        flags: 0,
+                    }],
+                    styles: vec![default_style()],
+                    extras: vec![None],
+                    kitty_virtual_placeholder: false,
+                    text: "a".into(),
+                }],
+            ),
+            WindowId::from(0),
+        );
+        let mut content = RenderableContent::new(Default::default());
+        content.frame_damage = rio_backend::event::TerminalDamage::CursorOnly;
+        view.pending_frame_damage = rio_backend::event::TerminalDamage::Noop;
+        let mut cursor_update = delta(1, 1, 2, Vec::new());
+        cursor_update.cursor.visible = false;
+        view.apply_frame_update(FrameUpdate::Delta(cursor_update))
+            .unwrap();
+        view.refresh_renderable(&mut content);
+        assert_eq!(
+            content.frame_damage,
+            rio_backend::event::TerminalDamage::CursorOnly
+        );
+
+        let row = RowFrame {
+            cells: vec![CellFrame {
+                content: CellContentFrame::Codepoint('b' as u32),
+                wide: 0,
+                flags: 0,
+            }],
+            styles: vec![default_style()],
+            extras: vec![None],
+            kitty_virtual_placeholder: false,
+            text: "b".into(),
+        };
+        view.apply_frame_update(FrameUpdate::Delta(delta(
+            1,
+            1,
+            3,
+            vec![RowUpdate { line: 0, row }],
+        )))
+        .unwrap();
+        view.refresh_renderable(&mut content);
+        assert_eq!(
+            content.frame_damage,
+            rio_backend::event::TerminalDamage::Partial
+        );
+        assert_eq!(view.grid.rows[0].inner[0].c(), 'b');
+    }
+
+    #[test]
+    fn only_unpoisoned_command_rejections_keep_the_pump_alive() {
+        for error in [
+            SessionError::Invalid("bad input".into()),
+            SessionError::Unsupported("effect".into()),
+        ] {
+            assert!(recoverable_command_rejection(&error, false));
+            assert!(!recoverable_command_rejection(&error, true));
+        }
+        for error in [
+            SessionError::Detached,
+            SessionError::WorkerExited,
+            SessionError::Protocol("bad reply".into()),
+            SessionError::Codec("decode".into()),
+            SessionError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        ] {
+            assert!(!recoverable_command_rejection(&error, false));
+        }
+    }
+
+    #[test]
+    fn history_search_matches_keep_negative_terminal_coordinates() {
+        let mut view = RemoteView::new(None, WindowId::from(0), 80, 24);
+        view.grid.history = 20;
+        view.search_matches = Some(vec![SearchMatch {
+            start_line: 8,
+            start_column: 2,
+            end_line: 9,
+            end_column: 5,
+        }]);
+        let matches = view.take_search_matches().unwrap();
+        assert_eq!(
+            matches,
+            vec![Pos::new(Line(-12), Column(2))..=Pos::new(Line(-11), Column(5))]
+        );
+    }
+
+    fn selection_test_handle(
+        capacity: usize,
+    ) -> (SessionHandle, mpsc::Receiver<PumpCommand>) {
+        let (commands, receiver) = mpsc::sync_channel(capacity);
+        (
+            SessionHandle {
+                commands,
+                state: Arc::new(SessionState::new()),
+                window_id: Arc::new(Mutex::new(WindowId::from(1))),
+                closed: Arc::new(Mutex::new(false)),
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn selection_handoff_reserves_unread_replies_and_rejects_pressure() {
+        let (handle, receiver) = selection_test_handle(COMMAND_QUEUE_SIZE);
+        for _ in 0..EVENT_QUEUE_SIZE {
+            handle
+                .request_selection_text(ClipboardType::Selection, true)
+                .unwrap();
+            let PumpCommand::SelectionText {
+                target,
+                copy_to_clipboard,
+            } = receiver.try_recv().unwrap()
+            else {
+                panic!("missing selection command")
+            };
+            handle
+                .state
+                .selection_text
+                .lock()
+                .unwrap()
+                .replies
+                .push_back((target, Some("retained".into()), copy_to_clipboard));
+        }
+        assert!(matches!(
+            handle.request_selection_text(ClipboardType::Clipboard, false),
+            Err(SessionError::Invalid(_))
+        ));
+        assert!(handle
+            .error()
+            .unwrap()
+            .contains("selection reply handoff is full"));
+        assert_eq!(
+            handle.take_selection_text(),
+            Some((ClipboardType::Selection, Some("retained".into()), true))
+        );
+        handle
+            .request_selection_text(ClipboardType::Clipboard, false)
+            .unwrap();
+        for _ in 1..EVENT_QUEUE_SIZE {
+            assert_eq!(
+                handle.take_selection_text(),
+                Some((ClipboardType::Selection, Some("retained".into()), true))
+            );
+        }
+        assert!(handle.take_selection_text().is_none());
+        assert_eq!(handle.state.selection_text.lock().unwrap().outstanding, 1);
+    }
+
+    #[test]
+    fn rejected_selection_enqueue_does_not_reserve_reply_capacity() {
+        let (handle, receiver) = selection_test_handle(1);
+        handle.enqueue(SessionCommand::Snapshot).unwrap();
+        assert!(handle
+            .request_selection_text(ClipboardType::Clipboard, false)
+            .is_err());
+        assert_eq!(handle.state.selection_text.lock().unwrap().outstanding, 0);
+        receiver.try_recv().unwrap();
+        handle
+            .request_selection_text(ClipboardType::Selection, true)
+            .unwrap();
+        assert_eq!(handle.state.selection_text.lock().unwrap().outstanding, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires worker-only RIO_TEST_BINARY and private runtime directory"]
+    fn review_close_drains_full_queue_once_after_last_handle_drops() {
+        use rio_backend::event::VoidListener;
+        for _ in 0..4 {
+            let client = Arc::new(review_worker());
+            wait_for_review_condition(|| client.snapshot().unwrap().title == "ready");
+            let (handle, receiver) = selection_test_handle(1);
+            handle
+                .request_selection_text(ClipboardType::Selection, true)
+                .unwrap();
+            assert!(
+                handle.enqueue(SessionCommand::Snapshot).is_err(),
+                "queue must be full"
+            );
+            let other = handle.clone();
+            handle.close();
+            other.close();
+            other.enqueue(SessionCommand::Close).unwrap();
+            assert!(matches!(
+                handle.enqueue(SessionCommand::Snapshot),
+                Err(SessionError::Detached)
+            ));
+            let state = Arc::clone(&handle.state);
+            let pump = SessionPump {
+                client: Arc::clone(&client),
+                receiver,
+                state: Arc::clone(&state),
+                event_proxy: VoidListener,
+                route_id: 1,
+                window_id: Arc::clone(&handle.window_id),
+                closed: Arc::clone(&handle.closed),
+            };
+            // No sender or queue slot is needed to retain explicit close intent.
+            drop(other);
+            drop(handle);
+            let (done, finished) = mpsc::sync_channel(1);
+            let thread = thread::spawn(move || {
+                pump.run(None);
+                done.send(()).unwrap();
+            });
+            finished
+                .recv_timeout(Duration::from_secs(5))
+                .expect("close pump did not finish");
+            thread.join().unwrap();
+            let results = state.selection_text.lock().unwrap();
+            assert_eq!(results.outstanding, 1);
+            assert_eq!(
+                results.replies.front(),
+                Some(&(ClipboardType::Selection, None, true))
+            );
+            assert_eq!(
+                results.replies.len(),
+                1,
+                "accepted reply must precede Close"
+            );
+            drop(results);
+            wait_for_review_condition(|| !client.descriptor().endpoint.exists());
+            assert!(client.wait_worker().unwrap().unwrap().success());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires worker-only RIO_TEST_BINARY and private runtime directory"]
+    fn review_overlapping_selection_replies_keep_destinations_and_copy_flags() {
+        use rio_backend::event::VoidListener;
+        let client = Arc::new(review_worker());
+        wait_for_review_condition(|| client.snapshot().unwrap().title == "ready");
+        client.write(b"clipboard-request-text".to_vec()).unwrap();
+        wait_for_review_condition(|| {
+            client
+                .snapshot()
+                .unwrap()
+                .rows
+                .iter()
+                .any(|row| row.text.contains("clipboard-request-text"))
+        });
+        let (handle, receiver) = selection_test_handle(COMMAND_QUEUE_SIZE);
+        let mut view = RemoteView::new(Some(handle.clone()), WindowId::from(1), 80, 24);
+        handle.enqueue(SessionCommand::SelectAll).unwrap();
+        view.request_selection_text_with_copy(ClipboardType::Clipboard, false);
+        view.request_selection_text_with_copy(ClipboardType::Selection, true);
+        handle.enqueue(SessionCommand::SelectionClear).unwrap();
+        view.request_selection_text_with_copy(ClipboardType::Selection, false);
+        let pump = SessionPump {
+            client: Arc::clone(&client),
+            receiver,
+            state: Arc::clone(&handle.state),
+            event_proxy: VoidListener,
+            route_id: 1,
+            window_id: Arc::clone(&handle.window_id),
+            closed: Arc::clone(&handle.closed),
+        };
+        let thread = thread::spawn(move || pump.run(None));
+        // All replies must be retained before the GUI consumes any of them.
+        wait_for_review_condition(|| {
+            handle.state.selection_text.lock().unwrap().replies.len() == 3
+        });
+        let first = view.take_selection_text().unwrap();
+        assert_eq!(first.0, ClipboardType::Clipboard);
+        assert!(!first.2);
+        assert!(first.1.as_ref().unwrap().contains("clipboard-request-text"));
+        assert_eq!(
+            view.take_selection_text(),
+            Some((ClipboardType::Selection, first.1, true))
+        );
+        assert_eq!(
+            view.take_selection_text(),
+            Some((ClipboardType::Selection, None, false))
+        );
+        assert!(view.take_selection_text().is_none());
+        assert_eq!(handle.state.selection_text.lock().unwrap().outstanding, 0);
+        handle.close();
+        wait_for_review_condition(|| !client.descriptor().endpoint.exists());
+        thread.join().unwrap();
+        assert!(client.wait_worker().unwrap().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    fn review_worker() -> SessionClient {
+        SessionClient::spawn_with_worker_path(
+            SessionSpec {
+                shell: Some("/bin/sh".into()),
+                args: vec![
+                    "-c".into(),
+                    r"stty raw -echo; printf '\033]2;ready\007'; cat".into(),
+                ],
+                environment: vec![
+                    rio_session::protocol::EnvVar::new("HOME", review_home()),
+                    rio_session::protocol::EnvVar::new("PATH", "/usr/bin:/bin"),
+                    rio_session::protocol::EnvVar::new("TERM", "xterm-rio"),
+                ],
+                ..SessionSpec::default()
+            },
+            std::env::var_os("RIO_TEST_BINARY").expect("set worker-only RIO_TEST_BINARY"),
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[track_caller]
+    fn wait_for_review_condition(mut ready: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker condition timed out"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires worker-only RIO_TEST_BINARY and private runtime directory"]
+    fn review_snapshot_rejection_recovers_and_last_sender_detaches_pump() {
+        use rio_backend::event::VoidListener;
+        let client = Arc::new(review_worker());
+        wait_for_review_condition(|| client.snapshot().unwrap().title == "ready");
+        let pid = client.child_pid().unwrap();
+        // Retained RGBA pixels exceed the session's per-image snapshot budget.
+        client
+            .write(b"\x1bPq\"1;1;1536;1536#1;2;100;0;0~\x1b\\".to_vec())
+            .unwrap();
+        wait_for_review_condition(|| {
+            matches!(client.snapshot(), Err(SessionError::Unsupported(_)))
+        });
+        let state = Arc::new(SessionState::new());
+        let (commands, receiver) = mpsc::sync_channel(COMMAND_QUEUE_SIZE);
+        let pump = SessionPump {
+            client: Arc::clone(&client),
+            receiver,
+            state: Arc::clone(&state),
+            event_proxy: VoidListener,
+            route_id: 1,
+            window_id: Arc::new(Mutex::new(WindowId::from(1))),
+            closed: Arc::new(Mutex::new(false)),
+        };
+        let (done, finished) = mpsc::sync_channel(1);
+        let thread = thread::spawn(move || {
+            pump.run(None);
+            done.send(()).unwrap();
+        });
+        wait_for_review_condition(|| state.error.lock().unwrap().is_some());
+        assert!(!state.closed.load(Ordering::Acquire));
+        // Explicit child output resets all graphics, including offscreen spans.
+        commands
+            .send(PumpCommand::Terminal(SessionCommand::Write(
+                b"\x1bc".to_vec(),
+            )))
+            .unwrap();
+        wait_for_review_condition(|| state.frames.lock().unwrap().pending_full.is_some());
+        assert!(state.error.lock().unwrap().is_none());
+        assert_eq!(client.child_pid().unwrap(), pid);
+        drop(commands);
+        finished
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pump must stop when last sender drops");
+        thread.join().unwrap();
+        assert_eq!(
+            client.child_pid().unwrap(),
+            pid,
+            "pump drop must not close the worker"
+        );
+        client.close().unwrap();
+        assert!(client.wait_worker().unwrap().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires worker-only RIO_TEST_BINARY and private runtime directory"]
+    fn review_prepared_context_resizes_only_after_commit() {
+        use rio_backend::event::VoidListener;
+        let owner = review_worker();
+        let before = owner.snapshot().unwrap();
+        let prepared = SessionHandle::prepare_attach(
+            SessionClient::prepare_attach(owner.descriptor().clone()).unwrap(),
+        );
+        let dimension = crate::layout::ContextDimension {
+            columns: 40,
+            lines: 10,
+            width: 320.0,
+            height: 160.0,
+            ..Default::default()
+        };
+        let mut context = super::super::create_prepared_context::<VoidListener>(
+            prepared,
+            WindowId::from(1),
+            1,
+            1,
+            dimension,
+        );
+        assert_eq!(owner.snapshot().unwrap().columns, before.columns);
+        context.commit_pending_session(VoidListener).unwrap();
+        wait_for_review_condition(|| {
+            context
+                .terminal
+                .lock()
+                .session()
+                .unwrap()
+                .state
+                .frames
+                .lock()
+                .unwrap()
+                .pending_full
+                .as_ref()
+                .is_some_and(|frame| frame.columns == 40 && frame.lines == 10)
+        });
+        assert_eq!(
+            context
+                .terminal
+                .lock()
+                .session()
+                .unwrap()
+                .descriptor()
+                .unwrap()
+                .session_id,
+            owner.descriptor().session_id
+        );
+        drop(context);
+        wait_for_review_condition(|| !owner.descriptor().endpoint.exists());
+        assert!(owner.wait_worker().unwrap().unwrap().success());
+    }
+
+    fn default_style() -> StyleFrame {
+        StyleFrame {
+            foreground: ColorFrame::Named(256),
+            background: ColorFrame::Named(257),
+            underline: None,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn background_cells_keep_inline_background_and_styles_are_interned() {
+        let bold = StyleFrame {
+            flags: StyleFlags::BOLD.bits(),
+            ..default_style()
+        };
+        let cells = vec![
+            CellFrame {
+                content: CellContentFrame::Palette(7),
+                wide: 0,
+                flags: 0,
+            },
+            CellFrame {
+                content: CellContentFrame::Rgb { r: 1, g: 2, b: 3 },
+                wide: 0,
+                flags: 0,
+            },
+            CellFrame {
+                content: CellContentFrame::Codepoint('a' as u32),
+                wide: 0,
+                flags: 0,
+            },
+            CellFrame {
+                content: CellContentFrame::Codepoint('b' as u32),
+                wide: 0,
+                flags: 0,
+            },
+        ];
+        let styles = vec![default_style(), default_style(), default_style(), bold];
+        let row = RowFrame {
+            cells,
+            styles,
+            extras: vec![None, None, None, None],
+            kitty_virtual_placeholder: false,
+            text: "ab".into(),
+        };
+        let view = RemoteView::from_frame(frame(4, 1, vec![row]), WindowId::from(0));
+        let first = &view.grid.rows[0].inner;
+        assert_eq!(first[0].content_tag(), ContentTag::BgPalette);
+        assert_eq!(first[0].bg_palette_index(), 7);
+        assert_eq!(first[1].content_tag(), ContentTag::BgRgb);
+        assert_eq!(first[1].bg_rgb(), (1, 2, 3));
+        assert_eq!(first[2].style_id(), 0);
+        assert_eq!(first[3].style_id(), 1);
+    }
+
+    #[test]
+    fn passive_view_owns_the_published_frame_and_keeps_interaction_data() {
+        let snapshot = frame(
+            1,
+            1,
+            vec![RowFrame {
+                cells: vec![CellFrame {
+                    content: CellContentFrame::Codepoint('x' as u32),
+                    wide: 0,
+                    flags: 0,
+                }],
+                styles: vec![default_style()],
+                extras: vec![Some(rio_session::protocol::ExtrasFrame {
+                    zero_width: vec![0x301],
+                    hyperlink: Some("https://example.com".into()),
+                })],
+                kitty_virtual_placeholder: false,
+                text: "x\u{301}".into(),
+            }],
+        );
+        let mut view = RemoteView::new(None, WindowId::from(0), 1, 1);
+        view.apply_frame(snapshot).unwrap();
+        let mut content = RenderableContent::new(Default::default());
+        view.decode_error = Some("visible renderer error".into());
+        view.refresh_renderable(&mut content);
+
+        let pos = Pos::new(Line(0), Column(0));
+        assert_eq!(view.grid.cell_text(pos).collect::<String>(), "x\u{301}");
+        assert!(view.grid.hyperlink(pos).is_some());
+        assert_eq!(content.screen_lines, 1);
+        assert_eq!(
+            content.session_error.as_deref(),
+            Some("visible renderer error")
+        );
+        assert_eq!(view.frame.as_ref().unwrap().rows[0].text, "x\u{301}");
+    }
+
+    #[test]
+    fn excessive_distinct_extras_are_reported_without_aliasing() {
+        let columns = 1024usize;
+        let mut rows = Vec::with_capacity(64);
+        for row_index in 0..64 {
+            let mut cells = Vec::with_capacity(columns);
+            let mut styles = Vec::with_capacity(columns);
+            let mut extras = Vec::with_capacity(columns);
+            for column in 0..columns {
+                let index = row_index * columns + column;
+                cells.push(CellFrame {
+                    content: CellContentFrame::Codepoint('x' as u32),
+                    wide: 0,
+                    flags: 0,
+                });
+                styles.push(default_style());
+                extras.push(Some(rio_session::protocol::ExtrasFrame {
+                    zero_width: vec![],
+                    hyperlink: Some(format!("https://{index}.invalid")),
+                }));
+            }
+            rows.push(RowFrame {
+                cells,
+                styles,
+                extras,
+                kitty_virtual_placeholder: false,
+                text: String::new(),
+            });
+        }
+        let view =
+            RemoteView::from_frame(frame(columns as u16, 64, rows), WindowId::from(0));
+        assert!(view
+            .decode_error
+            .as_deref()
+            .is_some_and(|error| error.contains("extras")));
+    }
+
+    #[test]
+    fn published_frame_clears_recoverable_command_error() {
+        let state = SessionState::new();
+        state.record_error(SessionError::Invalid("temporary command failure".into()));
+        state.publish_frame(frame(
+            1,
+            1,
+            vec![RowFrame {
+                cells: vec![CellFrame {
+                    content: CellContentFrame::Codepoint('x' as u32),
+                    wide: 0,
+                    flags: 0,
+                }],
+                styles: vec![default_style()],
+                extras: vec![None],
+                kitty_virtual_placeholder: false,
+                text: "x".into(),
+            }],
+        ));
+        assert!(state.error.lock().unwrap().is_none());
+    }
+}
+
+fn wire_vi_motion(
+    motion: rio_backend::crosswords::vi_mode::ViMotion,
+) -> Option<WireViMotion> {
+    use rio_backend::crosswords::vi_mode::ViMotion as Local;
+    Some(match motion {
+        Local::Up => WireViMotion::Up,
+        Local::Down => WireViMotion::Down,
+        Local::Left => WireViMotion::Left,
+        Local::Right => WireViMotion::Right,
+        Local::First => WireViMotion::First,
+        Local::Last => WireViMotion::Last,
+        Local::FirstOccupied => WireViMotion::FirstOccupied,
+        Local::High => WireViMotion::High,
+        Local::Middle => WireViMotion::Middle,
+        Local::Low => WireViMotion::Low,
+        Local::SemanticLeft => WireViMotion::SemanticLeft,
+        Local::SemanticRight => WireViMotion::SemanticRight,
+        Local::SemanticLeftEnd => WireViMotion::SemanticLeftEnd,
+        Local::SemanticRightEnd => WireViMotion::SemanticRightEnd,
+        Local::WordLeft => WireViMotion::WordLeft,
+        Local::WordRight => WireViMotion::WordRight,
+        Local::WordLeftEnd => WireViMotion::WordLeftEnd,
+        Local::WordRightEnd => WireViMotion::WordRightEnd,
+        Local::Bracket => WireViMotion::Bracket,
+        Local::ParagraphUp => WireViMotion::ParagraphUp,
+        Local::ParagraphDown => WireViMotion::ParagraphDown,
+    })
+}

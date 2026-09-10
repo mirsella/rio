@@ -82,6 +82,7 @@ pub enum PaletteAction {
     WindowCreateNew,
     MoveCurrentTabToNewWindow,
     MergeWindow,
+    RecoverSession,
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
@@ -187,9 +188,14 @@ const COMMANDS: &[Command] = &[
         action: PaletteAction::MoveCurrentTabToNewWindow,
     },
     Command {
-        title: "Merge Window Into Another Window",
+        title: "Merge Tab",
         shortcut: "",
         action: PaletteAction::MergeWindow,
+    },
+    Command {
+        title: "Recover Saved Session",
+        shortcut: "",
+        action: PaletteAction::RecoverSession,
     },
     Command {
         title: "Increase Font Size",
@@ -271,6 +277,7 @@ const COMMANDS: &[Command] = &[
 enum PaletteMode {
     Commands,
     Fonts(Vec<String>),
+    RecoveryTargets(Vec<String>),
 }
 
 /// One row in the filtered result list. Variants carry exactly the
@@ -285,6 +292,10 @@ enum PaletteRow<'a> {
     Font {
         family: &'a str,
     },
+    RecoveryTarget {
+        title: &'a str,
+        index: usize,
+    },
 }
 
 impl<'a> PaletteRow<'a> {
@@ -292,6 +303,7 @@ impl<'a> PaletteRow<'a> {
         match *self {
             PaletteRow::Command { title, .. } => title,
             PaletteRow::Font { family } => family,
+            PaletteRow::RecoveryTarget { title, .. } => title,
         }
     }
 
@@ -299,13 +311,14 @@ impl<'a> PaletteRow<'a> {
         match *self {
             PaletteRow::Command { shortcut, .. } => shortcut,
             PaletteRow::Font { .. } => "",
+            PaletteRow::RecoveryTarget { .. } => "",
         }
     }
 
     fn action(&self) -> Option<PaletteAction> {
         match *self {
             PaletteRow::Command { action, .. } => Some(action),
-            PaletteRow::Font { .. } => None,
+            PaletteRow::Font { .. } | PaletteRow::RecoveryTarget { .. } => None,
         }
     }
 }
@@ -503,12 +516,7 @@ impl CommandPalette {
         self.enabled = enabled;
         if enabled {
             self.query.clear();
-            self.selected_index = 0;
-            self.scroll_offset = 0;
-            self.caret_blink_start = Instant::now();
-            // Clear scrollbar history so reopening the palette never
-            // flashes a leftover scrollbar from the previous session.
-            self.last_scroll_time = None;
+            self.reset_view_state();
             // Always re-open into Commands mode — a stale Fonts list
             // from a previous session would be misleading (fonts may
             // have changed) and surprising (user toggles palette and
@@ -524,6 +532,17 @@ impl CommandPalette {
     pub fn enter_fonts_mode(&mut self, fonts: Vec<String>) {
         self.mode = PaletteMode::Fonts(fonts);
         self.query.clear();
+        self.reset_view_state();
+    }
+
+    pub fn enter_recovery_targets(&mut self, targets: Vec<String>) {
+        self.enabled = true;
+        self.mode = PaletteMode::RecoveryTargets(targets);
+        self.query.clear();
+        self.reset_view_state();
+    }
+
+    fn reset_view_state(&mut self) {
         self.selected_index = 0;
         self.scroll_offset = 0;
         self.caret_blink_start = Instant::now();
@@ -532,12 +551,7 @@ impl CommandPalette {
 
     pub fn set_query(&mut self, query: String) {
         self.query = query;
-        self.selected_index = 0;
-        self.scroll_offset = 0;
-        self.caret_blink_start = Instant::now();
-        // Typing reshapes the list entirely — drop any scrollbar
-        // fade state so the next scroll starts with a clean timer.
-        self.last_scroll_time = None;
+        self.reset_view_state();
     }
 
     pub fn delete_previous_word(&mut self) {
@@ -590,6 +604,16 @@ impl CommandPalette {
             .and_then(|(_, row)| match row {
                 PaletteRow::Font { family } => Some((*family).to_owned()),
                 PaletteRow::Command { .. } => None,
+                PaletteRow::RecoveryTarget { .. } => None,
+            })
+    }
+
+    pub fn get_selected_recovery_target(&self) -> Option<usize> {
+        self.filtered_rows()
+            .get(self.selected_index)
+            .and_then(|(_, row)| match row {
+                PaletteRow::RecoveryTarget { index, .. } => Some(*index),
+                PaletteRow::Command { .. } | PaletteRow::Font { .. } => None,
             })
     }
 
@@ -626,6 +650,14 @@ impl CommandPalette {
                 .filter_map(|family| {
                     let score = fuzzy_score(&self.query, family)?;
                     Some((score, PaletteRow::Font { family }))
+                })
+                .collect(),
+            PaletteMode::RecoveryTargets(targets) => targets
+                .iter()
+                .enumerate()
+                .filter_map(|(index, title)| {
+                    let score = fuzzy_score(&self.query, title)?;
+                    Some((score, PaletteRow::RecoveryTarget { title, index }))
                 })
                 .collect(),
         };
@@ -748,6 +780,7 @@ impl CommandPalette {
         let placeholder = match self.mode {
             PaletteMode::Commands => "Type a command...",
             PaletteMode::Fonts(_) => "Type a font name...",
+            PaletteMode::RecoveryTargets(_) => "Choose a saved session...",
         };
         let display_text = if self.query.is_empty() {
             placeholder
@@ -1236,6 +1269,55 @@ mod tests {
         palette.set_query("zzzz".to_string());
         // Query doesn't match anything → no selected font.
         assert!(palette.get_selected_font().is_none());
+    }
+
+    #[test]
+    fn merge_action_transitions_from_filtered_query_to_target() {
+        let mut palette = CommandPalette::new();
+        palette.set_enabled(true);
+        palette.set_query("merge".into());
+        assert_eq!(
+            palette.get_selected_action(),
+            Some(PaletteAction::MergeWindow)
+        );
+        assert!(palette.get_selected_recovery_target().is_none());
+        assert!(matches!(palette.mode, PaletteMode::Commands));
+    }
+
+    #[test]
+    fn merge_command_describes_selected_tab_semantics() {
+        let command = COMMANDS
+            .iter()
+            .find(|command| command.action == PaletteAction::MergeWindow)
+            .expect("merge command must be registered");
+        assert_eq!(command.title, "Merge Tab");
+    }
+
+    #[test]
+    fn recovery_mode_returns_selected_target() {
+        let mut palette = CommandPalette::new();
+        palette.enter_recovery_targets(vec![
+            "saved session 11".to_string(),
+            "saved session 12".to_string(),
+        ]);
+        palette.move_selection_down();
+        assert_eq!(palette.get_selected_recovery_target(), Some(1));
+        assert!(palette.get_selected_action().is_none());
+    }
+
+    #[test]
+    fn merge_and_recovery_are_separate_commands() {
+        let merge = COMMANDS
+            .iter()
+            .find(|command| command.action == PaletteAction::MergeWindow)
+            .expect("merge command must be registered");
+        let recovery = COMMANDS
+            .iter()
+            .find(|command| command.action == PaletteAction::RecoverSession)
+            .expect("recovery command must be registered");
+
+        assert_eq!(merge.title, "Merge Tab");
+        assert_eq!(recovery.title, "Recover Saved Session");
     }
 
     // Scrollbar geometry + fade math live in `renderer::scrollbar` and

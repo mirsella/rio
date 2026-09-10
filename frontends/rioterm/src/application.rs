@@ -1,3 +1,4 @@
+use crate::context::session::SessionHandle;
 use crate::event::{ClickState, EventPayload, EventProxy, RioEvent, RioEventType};
 use crate::ime::Preedit;
 use crate::renderer::utils::update_colors_based_on_theme;
@@ -12,8 +13,11 @@ use crate::watcher::configuration_file_updates;
 ))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use raw_window_handle::HasDisplayHandle;
-use rio_backend::clipboard::Clipboard;
+use rio_backend::clipboard::{Clipboard, ClipboardType};
 use rio_backend::config::colors::{ColorRgb, NamedColor};
+use rio_session::protocol::{
+    GlyphStatus, SessionCommand, SessionDescriptor, SessionEvent,
+};
 use rio_window::application::ApplicationHandler;
 use rio_window::event::{
     ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, TouchPhase, WindowEvent,
@@ -27,7 +31,9 @@ use rio_window::platform::macos::ActiveEventLoopExtMacOS;
 use rio_window::platform::macos::WindowExtMacOS;
 use rio_window::window::WindowId;
 use rio_window::window::{CursorIcon, Fullscreen};
+use std::collections::HashSet;
 use std::error::Error;
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 #[cfg(all(feature = "wayland", target_os = "linux"))]
@@ -45,8 +51,29 @@ enum DeferredTabDragClose {
 }
 
 #[cfg(all(feature = "wayland", target_os = "linux"))]
+struct ForeignDrag {
+    window: WindowId,
+    offer: crate::tab_drag::PlatformOfferId,
+    index: usize,
+    dropped: bool,
+    selected_move: bool,
+    receiving: bool,
+    token: Option<[u8; 16]>,
+}
+
+fn clipboard_type(kind: u8) -> Option<ClipboardType> {
+    match kind {
+        0 => Some(ClipboardType::Clipboard),
+        1 => Some(ClipboardType::Selection),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "wayland", target_os = "linux"))]
 // ponytail: fixed grace period; a compositor target-enter signal is the precise replacement.
 const TAB_DETACH_GRACE_PERIOD: Duration = Duration::from_millis(750);
+
+const MERGE_SELECTION_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[cfg(all(feature = "wayland", target_os = "linux"))]
 fn deferred_window_close<D, O>(
@@ -76,13 +103,33 @@ pub struct Application<'a> {
     config: rio_backend::config::Config,
     event_proxy: EventProxy,
     router: Router<'a>,
+    window_control: Option<crate::router::window_control::WindowControl>,
+    incoming_prepared_sender: SyncSender<PreparedIncoming>,
+    incoming_prepared: Receiver<PreparedIncoming>,
+    pending_prepared: Vec<PendingPrepared>,
+    pending_outgoing: Vec<PendingOutgoing>,
+    exit_after_transfer: bool,
+    exit_after_session_closes: bool,
+    session_close_deadline: Option<Instant>,
+    pending_session_closes: Vec<SessionHandle>,
+    session_preparations: std::sync::Arc<()>,
+    ready_session_imports: Vec<(rio_backend::event::WindowId, Vec<usize>)>,
     scheduler: Scheduler,
     app_id: Option<String>,
     global_hotkey: Option<crate::global_hotkey::GlobalHotkeys>,
     merge_window_source: Option<rio_backend::event::WindowId>,
     merge_target: Option<(rio_backend::event::WindowId, usize)>,
+    pending_merge_selection: Option<PendingMergeSelection>,
+    armed_merge_selection: Option<ArmedMergeSelection>,
+    recovery_targets: Option<(rio_backend::event::WindowId, Vec<RecoveryCandidate>)>,
+    recovery_probe_sender: SyncSender<RecoveryProbeResult>,
+    recovery_probe: Receiver<RecoveryProbeResult>,
+    recovery_probe_state: Option<RecoveryProbeState>,
+    next_recovery_probe_id: u64,
     #[cfg(all(feature = "wayland", target_os = "linux"))]
     tab_drag: Option<TabDrag>,
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    foreign_drag: Option<ForeignDrag>,
     #[cfg(all(feature = "wayland", target_os = "linux"))]
     retained_tab_drag_owner: Option<crate::router::Route<'a>>,
     #[cfg(all(feature = "wayland", target_os = "linux"))]
@@ -94,6 +141,285 @@ pub struct Application<'a> {
     /// when it hides so focus returns where the user was.
     #[cfg(target_os = "macos")]
     quake_previous_app: Option<i32>,
+}
+
+struct PreparedIncoming {
+    offer: crate::router::window_control::TransferOffer,
+    prepared: Result<Vec<crate::context::session::PreparedSession>, String>,
+    reply: SyncSender<crate::router::window_control::WindowControlResponse>,
+    target_window: Option<u64>,
+    target_index: Option<usize>,
+}
+
+struct PendingPrepared {
+    routes: Vec<PendingPreparedRoute>,
+    ready: HashSet<usize>,
+    window_id: rio_backend::event::WindowId,
+    deadline: Instant,
+    completion: PendingPreparedCompletion,
+}
+
+#[derive(Debug)]
+struct PendingPreparedRoute {
+    source_route: Option<u64>,
+    target_route: usize,
+}
+
+enum PendingPreparedCompletion {
+    Incoming {
+        reply: SyncSender<crate::router::window_control::WindowControlResponse>,
+    },
+    Recovery,
+}
+
+struct PendingOutgoing {
+    transfer_id: [u8; 16],
+    source_window: rio_backend::event::WindowId,
+    source_routes: Vec<u64>,
+}
+
+struct PendingMergeSelection {
+    selection_id: [u8; 16],
+    source_window: rio_backend::event::WindowId,
+    targets: Vec<crate::router::window_control::WindowEndpoint>,
+    armed: usize,
+    resolved: HashSet<[u8; 16]>,
+    deadline: Instant,
+}
+
+struct ArmedMergeSelection {
+    selection_id: [u8; 16],
+    source: crate::router::window_control::WindowEndpoint,
+    target_window: rio_backend::event::WindowId,
+    hover: MergeHoverState,
+    deadline: Instant,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MergeHoverState {
+    index: Option<usize>,
+}
+
+impl MergeHoverState {
+    fn set(&mut self, index: usize) {
+        self.index = Some(index);
+    }
+
+    fn clear(&mut self) {
+        self.index = None;
+    }
+
+    fn clicked_index(&self) -> Option<usize> {
+        self.index
+    }
+}
+
+#[inline]
+fn merge_target_index_is_valid(
+    index: usize,
+    tab_count: usize,
+    has_capacity: bool,
+) -> bool {
+    index <= tab_count && has_capacity
+}
+
+fn transfer_exit_ready(
+    transferred: bool,
+    windows: usize,
+    pending: usize,
+    bootstrap: bool,
+) -> bool {
+    transferred && windows == 0 && pending == 0 && !bootstrap
+}
+
+fn validate_committed_routes(
+    source_routes: &[u64],
+    committed_routes: Vec<u64>,
+) -> Result<Vec<usize>, String> {
+    if committed_routes.is_empty() {
+        return Err("target committed no source routes".into());
+    }
+    let source_routes: HashSet<_> = source_routes.iter().copied().collect();
+    let mut seen = HashSet::with_capacity(committed_routes.len());
+    committed_routes
+        .into_iter()
+        .map(|route_id| {
+            if !source_routes.contains(&route_id) {
+                return Err(format!(
+                    "target committed a route not included in the offer: {route_id}"
+                ));
+            }
+            if !seen.insert(route_id) {
+                return Err(format!("target committed route more than once: {route_id}"));
+            }
+            usize::try_from(route_id).map_err(|_| {
+                format!("target committed an unrepresentable route: {route_id}")
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod outgoing_transfer_tests {
+    use super::validate_committed_routes;
+
+    #[test]
+    fn committed_routes_must_be_offered_unique_and_nonempty() {
+        assert_eq!(
+            validate_committed_routes(&[11, 22], vec![22]).unwrap(),
+            vec![22]
+        );
+        assert!(validate_committed_routes(&[11, 22], vec![]).is_err());
+        assert!(validate_committed_routes(&[11, 22], vec![33]).is_err());
+        assert!(validate_committed_routes(&[11, 22], vec![11, 11]).is_err());
+    }
+
+    #[test]
+    fn committed_routes_reject_large_unknown_ids() {
+        assert!(validate_committed_routes(&[11, 22], vec![u64::MAX]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod merge_hover_tests {
+    use super::{merge_target_index_is_valid, MergeHoverState};
+
+    #[test]
+    fn arm_starts_unhighlighted_and_click_requires_hover() {
+        let mut hover = MergeHoverState::default();
+        assert_eq!(hover.clicked_index(), None);
+
+        hover.set(2);
+        assert_eq!(hover.clicked_index(), Some(2));
+
+        hover.clear();
+        assert_eq!(hover.clicked_index(), None);
+    }
+
+    #[test]
+    fn stale_hover_index_is_rejected_after_target_tabs_change() {
+        assert!(merge_target_index_is_valid(2, 2, true));
+        assert!(!merge_target_index_is_valid(3, 2, true));
+        assert!(!merge_target_index_is_valid(2, 2, false));
+    }
+}
+
+struct RecoveryCandidate {
+    descriptor: SessionDescriptor,
+    label: String,
+}
+
+impl RecoveryCandidate {
+    fn from_probe(
+        descriptor: SessionDescriptor,
+        prepared: crate::context::session::PreparedSession,
+    ) -> Self {
+        let label = Application::recovery_label(&prepared);
+        // Drop the short-lived claim now; user interaction has no time limit.
+        Self { descriptor, label }
+    }
+}
+
+struct RecoveryProbeState {
+    id: u64,
+    source_window: rio_backend::event::WindowId,
+    remaining: usize,
+    candidates: Vec<RecoveryCandidate>,
+}
+
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+fn pointer_outside_surface(
+    position: rio_window::dpi::PhysicalPosition<f64>,
+    size: rio_window::dpi::PhysicalSize<u32>,
+) -> bool {
+    position.x < 0.0
+        || position.y < 0.0
+        || position.x >= f64::from(size.width)
+        || position.y >= f64::from(size.height)
+}
+
+#[cfg(all(test, unix))]
+mod recovery_tests {
+    use super::*;
+
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
+    #[test]
+    fn implicit_grab_motion_detects_exit_before_clamping() {
+        use rio_window::dpi::{PhysicalPosition as P, PhysicalSize};
+        let size = PhysicalSize::new(800, 490);
+        assert!(!pointer_outside_surface(P::new(799.0, 20.0), size));
+        assert!(pointer_outside_surface(P::new(900.0, 20.0), size));
+        assert!(pointer_outside_surface(P::new(-1.0, 20.0), size));
+        assert!(pointer_outside_surface(P::new(400.0, -1.0), size));
+        assert!(pointer_outside_surface(P::new(400.0, 490.0), size));
+    }
+
+    #[test]
+    fn transferred_gui_exits_only_after_windows_and_preparations_are_gone() {
+        assert!(transfer_exit_ready(true, 0, 0, false));
+        assert!(!transfer_exit_ready(false, 0, 0, false));
+        assert!(!transfer_exit_ready(true, 1, 0, false));
+        assert!(!transfer_exit_ready(true, 0, 1, false));
+        assert!(!transfer_exit_ready(true, 0, 0, true));
+    }
+
+    #[test]
+    #[ignore = "requires RIO_TEST_BINARY and a private XDG_RUNTIME_DIR"]
+    fn recovery_candidate_outlives_probe_commit_deadline() {
+        use rio_session::{SessionClient, SessionSpec};
+        let binary = std::env::var_os("RIO_TEST_BINARY").expect("set RIO_TEST_BINARY");
+        let mut owner = SessionClient::spawn_with_worker_path(
+            SessionSpec {
+                shell: Some("/bin/sh".into()),
+                args: vec![
+                    "-c".into(),
+                    "while IFS= read -r line; do printf 'ACK:%s\\n' \"$line\"; done"
+                        .into(),
+                ],
+                ..SessionSpec::default()
+            },
+            binary,
+        )
+        .unwrap();
+        let pid = owner.child_pid().unwrap();
+        let descriptor = owner.descriptor().clone();
+        let prepared = crate::context::session::SessionHandle::prepare_attach(
+            SessionClient::prepare_attach(descriptor.clone()).unwrap(),
+        );
+        let candidate = RecoveryCandidate::from_probe(descriptor, prepared);
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        let mut recovered = SessionClient::prepare_attach(candidate.descriptor)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let recovered_pid = recovered.child_pid().unwrap();
+        recovered.write(b"after-picker-delay\n".to_vec()).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let seen = loop {
+            let frame = recovered.snapshot().unwrap();
+            if frame
+                .rows
+                .iter()
+                .any(|row| row.text.contains("ACK:after-picker-delay"))
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        recovered.close().unwrap();
+        assert_eq!(pid, recovered_pid);
+        assert!(seen, "fresh input must reach the original shell");
+    }
+}
+
+struct RecoveryProbeResult {
+    id: u64,
+    source_window: rio_backend::event::WindowId,
+    prepared: Result<crate::context::session::PreparedSession, String>,
+    descriptor: Option<SessionDescriptor>,
 }
 
 impl<'a> Application<'a> {
@@ -120,6 +446,8 @@ impl<'a> Application<'a> {
             event_proxy.clone(),
         );
         let scheduler = Scheduler::new(proxy);
+        let (incoming_prepared_sender, incoming_prepared) = mpsc::sync_channel(8);
+        let (recovery_probe_sender, recovery_probe) = mpsc::sync_channel(8);
         event_loop.listen_device_events(DeviceEvents::Never);
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -131,13 +459,33 @@ impl<'a> Application<'a> {
             config,
             event_proxy,
             router,
+            window_control: None,
+            incoming_prepared_sender,
+            incoming_prepared,
+            pending_prepared: Vec::new(),
+            pending_outgoing: Vec::new(),
+            exit_after_transfer: false,
+            exit_after_session_closes: false,
+            session_close_deadline: None,
+            pending_session_closes: Vec::new(),
+            session_preparations: std::sync::Arc::new(()),
+            ready_session_imports: Vec::new(),
             scheduler,
             app_id,
             global_hotkey: None,
             merge_window_source: None,
             merge_target: None,
+            pending_merge_selection: None,
+            armed_merge_selection: None,
+            recovery_targets: None,
+            recovery_probe_sender,
+            recovery_probe,
+            recovery_probe_state: None,
+            next_recovery_probe_id: 1,
             #[cfg(all(feature = "wayland", target_os = "linux"))]
             tab_drag: None,
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
+            foreign_drag: None,
             #[cfg(all(feature = "wayland", target_os = "linux"))]
             retained_tab_drag_owner: None,
             #[cfg(all(feature = "wayland", target_os = "linux"))]
@@ -160,7 +508,6 @@ impl<'a> Application<'a> {
                 | WindowEvent::DoubleTapGesture { .. }
                 | WindowEvent::TouchpadPressure { .. }
                 | WindowEvent::RotationGesture { .. }
-                | WindowEvent::CursorEntered { .. }
                 | WindowEvent::PinchGesture { .. }
                 | WindowEvent::AxisMotion { .. }
                 | WindowEvent::PanGesture { .. }
@@ -340,12 +687,14 @@ impl<'a> Application<'a> {
 
     fn close_terminal_at(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        _event_loop: &ActiveEventLoop,
         window_id: rio_backend::event::WindowId,
         route_id: usize,
     ) {
         let mut remove_window = false;
+        let mut closing_sessions = Vec::new();
         if let Some(route) = self.router.routes.get_mut(&window_id) {
+            closing_sessions = route.window.screen.context_manager.session_handles();
             route.window.screen.discard_routes([route_id]);
             remove_window = route
                 .window
@@ -356,20 +705,56 @@ impl<'a> Application<'a> {
                     &mut route.window.screen.sugarloaf,
                 );
             if !remove_window {
-                let size = route.window.screen.context_manager.len();
-                route.window.screen.resize_top_or_bottom_line(size);
-                route.window.screen.mark_dirty();
+                let size = route.window.winit_window.inner_size();
+                route.window.screen.refresh_after_tab_transfer(size);
                 route.request_redraw();
             }
         }
         self.scheduler.unschedule_window(route_id);
         if remove_window {
+            self.pending_session_closes.extend(closing_sessions);
             self.clear_merge_if_window(window_id);
             self.router.remove_route(window_id);
             if self.router.routes.is_empty() {
-                event_loop.exit();
+                self.defer_exit_until_session_closes();
             }
         }
+    }
+
+    fn defer_exit_until_session_closes(&mut self) {
+        self.exit_after_session_closes = true;
+        self.session_close_deadline = Some(Instant::now() + Duration::from_secs(5));
+    }
+
+    fn poll_deferred_session_exit(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        if !self.exit_after_session_closes {
+            return false;
+        }
+
+        self.pending_session_closes
+            .retain(|session| !session.pump_done());
+        if self.pending_session_closes.is_empty() {
+            self.exit_after_session_closes = false;
+            self.session_close_deadline = None;
+            event_loop.exit();
+            return true;
+        }
+
+        if self
+            .session_close_deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            tracing::warn!(
+                pending = self.pending_session_closes.len(),
+                "session workers did not acknowledge GUI close before exit deadline"
+            );
+            self.exit_after_session_closes = false;
+            self.session_close_deadline = None;
+            event_loop.exit();
+            return true;
+        }
+
+        true
     }
 
     fn restore_route_transfer(
@@ -402,6 +787,19 @@ impl<'a> Application<'a> {
         ))
     }
 
+    fn track_outgoing_offer(
+        &mut self,
+        transfer_id: [u8; 16],
+        source_window: rio_backend::event::WindowId,
+        source_routes: Vec<u64>,
+    ) {
+        self.pending_outgoing.push(PendingOutgoing {
+            transfer_id,
+            source_window,
+            source_routes,
+        });
+    }
+
     fn move_tab_to_new_window(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -417,6 +815,39 @@ impl<'a> Application<'a> {
             tracing::warn!(?tab_id, "tab disappeared before detaching");
             return None;
         };
+
+        if let Some(control) = self.window_control.as_ref() {
+            let transfer_id = match crate::router::window_control::new_transfer_id() {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::warn!(%error, "could not allocate cross-window transfer id");
+                    return None;
+                }
+            };
+            let offer = match self.router.routes.get(&source_id).and_then(|route| {
+                route
+                    .window
+                    .screen
+                    .context_manager
+                    .transfer_offer(original_index, transfer_id)
+                    .ok()
+            }) {
+                Some(offer) => offer,
+                None => {
+                    tracing::warn!("session is not ready for cross-window transfer");
+                    return None;
+                }
+            };
+            let source_routes = offer.pane_route_ids();
+            if let Err(error) =
+                control.launch_and_offer_async(offer, self.event_proxy.clone(), source_id)
+            {
+                tracing::warn!(%error, "could not launch target Rio window");
+                return None;
+            }
+            self.track_outgoing_offer(transfer_id, source_id, source_routes);
+            return None;
+        }
 
         let bare = match crate::router::RouteWindow::create(
             event_loop,
@@ -482,7 +913,7 @@ impl<'a> Application<'a> {
 
     fn perform_close_requested(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        _event_loop: &ActiveEventLoop,
         window_id: rio_backend::event::WindowId,
     ) {
         if self.config.confirm_before_quit
@@ -493,15 +924,19 @@ impl<'a> Application<'a> {
             }
             return;
         }
-        if let Some(route) = self.router.routes.get(&window_id) {
+        let closing_sessions = if let Some(route) = self.router.routes.get(&window_id) {
             for route_id in route.window.screen.context_manager.route_ids() {
                 self.scheduler.unschedule_window(route_id);
             }
-        }
+            route.window.screen.context_manager.session_handles()
+        } else {
+            Vec::new()
+        };
         self.clear_merge_if_window(window_id);
+        self.pending_session_closes.extend(closing_sessions);
         self.router.remove_route(window_id);
         if self.router.routes.is_empty() {
-            event_loop.exit();
+            self.defer_exit_until_session_closes();
         }
     }
 }
@@ -762,7 +1197,43 @@ impl<'a> Application<'a> {
                             .route_ids()
                     },
                 };
+                let mut source_routes = None;
+                if let Some(control) = self.window_control.as_ref() {
+                    let offer = if state.whole_window {
+                        route
+                            .window
+                            .screen
+                            .context_manager
+                            .transfer_window_offer(state.token.as_bytes())
+                    } else {
+                        route
+                            .window
+                            .screen
+                            .context_manager
+                            .transfer_offer(state.original_index, state.token.as_bytes())
+                    };
+                    let offer = match offer {
+                        Ok(offer) => offer,
+                        Err(error) => {
+                            tracing::warn!(%error, "could not publish foreign tab drag offer");
+                            return Some(TabDragEvent::OwnerStartFailed(drag_id));
+                        }
+                    };
+                    let offer_routes = offer.pane_route_ids();
+                    if let Err(error) = control.publish_drag_offer(offer) {
+                        tracing::warn!(%error, "could not publish foreign tab drag offer");
+                        return Some(TabDragEvent::OwnerStartFailed(drag_id));
+                    }
+                    source_routes = Some(offer_routes);
+                }
                 let result = route.window.winit_window.start_toplevel_drag(drag_id);
+                if let Some(source_routes) = source_routes {
+                    self.track_outgoing_offer(
+                        state.token.as_bytes(),
+                        source,
+                        source_routes,
+                    );
+                }
                 Some(match result {
                     Ok(()) => TabDragEvent::OwnerStarted { drag_id, owner },
                     Err(error) => {
@@ -820,6 +1291,26 @@ impl<'a> Application<'a> {
             TabDragCommand::MoveOwnerToTarget => {
                 let owner = state.owner.as_ref().expect("target move requires owner");
                 let hover = state.hover.expect("target move requires hover");
+                if let Some(control) = self.window_control.as_ref() {
+                    let target: rio_backend::event::WindowId = hover.target_window.into();
+                    if !self.router.routes.contains_key(&target) {
+                        return Some(
+                            match control.take_drag_offer_async(
+                                state.token.as_bytes(),
+                                u64::from(target),
+                                hover.index,
+                                self.event_proxy.clone(),
+                                target,
+                            ) {
+                                Ok(()) => TabDragEvent::TargetCommitted,
+                                Err(error) => {
+                                    tracing::debug!(%error, "could not request foreign drag offer");
+                                    TabDragEvent::TargetRejected
+                                }
+                            },
+                        );
+                    }
+                }
                 Some(
                     if if state.whole_window {
                         self.move_window_owner_to_target(
@@ -1170,13 +1661,7 @@ impl<'a> Application<'a> {
 
         let target_window = window_id;
         if self.tab_drag.is_none() {
-            match &event {
-                ToplevelDragEvent::Entered { offer_id, .. }
-                | ToplevelDragEvent::Dropped { offer_id } => {
-                    self.cancel_tab_drag_offer(*offer_id, target_window);
-                }
-                _ => {}
-            }
+            self.handle_foreign_drag(target_window, event);
             return;
         }
         let restore_marker = matches!(
@@ -1318,6 +1803,16 @@ impl<'a> Application<'a> {
                 TabDragEvent::OfferCancelled(offer_id)
             }
             ToplevelDragEvent::Finished { drag_id } => {
+                if let Some(drag) = self
+                    .tab_drag
+                    .as_mut()
+                    .filter(|drag| drag.drag_id == Some(drag_id) && drag.hover.is_none())
+                {
+                    // Foreign completion has no local hover. Wait for the
+                    // authenticated commit response before removing source routes.
+                    drag.lifecycle = TabDragLifecycle::AwaitingFinish;
+                    return;
+                }
                 TabDragEvent::SourceFinished(drag_id)
             }
             ToplevelDragEvent::Cancelled { drag_id } => {
@@ -1377,6 +1872,16 @@ impl<'a> Application<'a> {
             .as_ref()
             .map(|owner| owner.route_ids.clone())
             .unwrap_or_default();
+        let withdraw_foreign_offer = !matches!(
+            drag.lifecycle,
+            TabDragLifecycle::Complete(crate::tab_drag::Outcome::Moved)
+        );
+        let transfer_token = drag.token.as_bytes();
+        if withdraw_foreign_offer {
+            if let Some(control) = self.window_control.as_ref() {
+                control.withdraw_drag_offer(transfer_token);
+            }
+        }
         self.reset_tab_drag_input(source_window);
         for route_id in owner_route_ids {
             self.scheduler.unschedule_window(route_id);
@@ -1473,7 +1978,156 @@ impl<'a> Application<'a> {
     }
 
     fn schedule_tab_detach(&mut self) {
+        // Foreign target events belong to the other GUI. Absence of a local
+        // hover is not evidence of an outside drop; wait for source cancellation.
+        if self.window_control.is_some() {
+            return;
+        }
         self.tab_drag_detach_deadline = Some(Instant::now() + TAB_DETACH_GRACE_PERIOD);
+    }
+
+    fn handle_foreign_drag(
+        &mut self,
+        window: WindowId,
+        event: rio_window::platform::wayland::ToplevelDragEvent,
+    ) {
+        use rio_window::platform::wayland::{ToplevelDragEvent as E, WindowExtWayland};
+        let event_name = match &event {
+            E::Entered { .. } => "entered",
+            E::Motion { .. } => "motion",
+            E::Dropped { .. } => "dropped",
+            E::SelectedActionChanged { .. } => "selected-action",
+            E::Left { .. } => "left",
+            E::DataReady { .. } => "data-ready",
+            E::OfferCancelled { .. } => "offer-cancelled",
+            E::OfferDataFailed { .. } => "offer-data-failed",
+            _ => "other",
+        };
+        tracing::info!(?window, event = event_name, "foreign Wayland drag event");
+        let mut failed = false;
+        match event {
+            E::Entered { offer_id, position } | E::Motion { offer_id, position } => {
+                let index = self.tab_drag_target_index(window, position, false, 1);
+                if self.foreign_drag.as_ref().is_some_and(|drag| drag.dropped) {
+                    return;
+                }
+                let Some(index) = index else {
+                    self.reject_tab_drag_offer(offer_id, window);
+                    self.foreign_drag = None;
+                    self.clear_drop_marker();
+                    return;
+                };
+                if self
+                    .foreign_drag
+                    .as_ref()
+                    .is_none_or(|drag| drag.offer != offer_id || drag.window != window)
+                {
+                    let Some(route) = self.router.routes.get(&window.into()) else {
+                        return;
+                    };
+                    if route
+                        .window
+                        .winit_window
+                        .accept_toplevel_drag_offer(offer_id)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    self.foreign_drag = Some(ForeignDrag {
+                        window,
+                        offer: offer_id,
+                        index,
+                        dropped: false,
+                        selected_move: false,
+                        receiving: false,
+                        token: None,
+                    });
+                }
+                self.foreign_drag.as_mut().unwrap().index = index;
+                self.set_drop_marker(window.into(), index);
+            }
+            E::Dropped { offer_id } => {
+                if let Some(drag) = self
+                    .foreign_drag
+                    .as_mut()
+                    .filter(|drag| drag.offer == offer_id && drag.window == window)
+                {
+                    drag.dropped = true;
+                }
+            }
+            E::SelectedActionChanged {
+                offer_id,
+                selected_move,
+            } => {
+                if let Some(drag) = self
+                    .foreign_drag
+                    .as_mut()
+                    .filter(|drag| drag.offer == offer_id && drag.window == window)
+                {
+                    drag.selected_move = selected_move;
+                }
+            }
+            E::Left { offer_id } => {
+                if self
+                    .foreign_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.offer == offer_id && !drag.dropped)
+                {
+                    failed = true;
+                }
+            }
+            E::OfferCancelled { offer_id } | E::OfferDataFailed { offer_id } => {
+                failed = self
+                    .foreign_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.offer == offer_id);
+            }
+            E::DataReady { offer_id, data } => {
+                if let Some(drag) = self.foreign_drag.as_mut().filter(|drag| {
+                    drag.offer == offer_id
+                        && drag.window == window
+                        && drag.dropped
+                        && drag.receiving
+                        && drag.token.is_none()
+                }) {
+                    if let Ok(token) = <[u8; 16]>::try_from(data.as_slice()) {
+                        drag.token = Some(token);
+                        failed = self.window_control.as_ref().is_none_or(|control| {
+                            control
+                                .take_drag_offer_async(
+                                    token,
+                                    u64::from(window),
+                                    drag.index,
+                                    self.event_proxy.clone(),
+                                    window.into(),
+                                )
+                                .is_err()
+                        });
+                    } else {
+                        failed = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(drag) = self.foreign_drag.as_mut() {
+            if drag.dropped && drag.selected_move && !drag.receiving {
+                drag.receiving = true;
+                failed |= self.router.routes.get(&window.into()).is_none_or(|route| {
+                    route
+                        .window
+                        .winit_window
+                        .receive_toplevel_drag_offer(drag.offer)
+                        .is_err()
+                });
+            }
+        }
+        if failed {
+            if let Some(drag) = self.foreign_drag.take() {
+                self.cancel_tab_drag_offer(drag.offer, drag.window);
+            }
+            self.clear_drop_marker();
+        }
     }
 }
 
@@ -1519,6 +2173,55 @@ impl<'a> Application<'a> {
         }
     }
 
+    fn transfer_tab_to_target(
+        &mut self,
+        source_id: rio_backend::event::WindowId,
+        target_id: rio_backend::event::WindowId,
+        index: usize,
+    ) -> bool {
+        if source_id == target_id {
+            return false;
+        }
+        let [Some(source), Some(target)] = self
+            .router
+            .routes
+            .get_disjoint_mut([&source_id, &target_id])
+        else {
+            return false;
+        };
+        if source.path != RoutePath::Terminal || target.path != RoutePath::Terminal {
+            return false;
+        }
+
+        let source_index = source.window.screen.context_manager.current_index();
+        let source_size = source.window.winit_window.inner_size();
+        let target_size = target.window.winit_window.inner_size();
+        let Some(transfer) = source.window.screen.extract_transfer(source_index) else {
+            return false;
+        };
+        match target
+            .window
+            .screen
+            .insert_transfer(index, transfer, target_size)
+        {
+            Ok(()) => {
+                if !source.window.screen.context_manager.is_empty() {
+                    source.window.screen.refresh_after_tab_transfer(source_size);
+                    source.request_redraw();
+                }
+                true
+            }
+            Err(transfer) => {
+                source
+                    .window
+                    .screen
+                    .insert_transfer(source_index, transfer, source_size)
+                    .unwrap_or_else(|_| panic!("tab transfer rollback failed"));
+                false
+            }
+        }
+    }
+
     fn merge_window_into_target(
         &mut self,
         source_id: rio_backend::event::WindowId,
@@ -1533,16 +2236,359 @@ impl<'a> Application<'a> {
                 .map(|route| route.window.screen.context_manager.len())
         });
         let Some(index) = index else { return };
-        if self.transfer_window_to_target(source_id, target_id, index) {
+        if self.transfer_tab_to_target(source_id, target_id, index) {
             self.clear_merge_if_window(source_id);
-            self.router.remove_route(source_id);
+            let source_empty = self
+                .router
+                .routes
+                .get(&source_id)
+                .is_some_and(|route| route.window.screen.context_manager.is_empty());
+            if source_empty {
+                self.router.remove_route(source_id);
+            }
             if let Some(target) = self.router.routes.get(&target_id) {
                 target.window.winit_window.focus_window();
             }
         }
     }
 
+    fn start_foreign_window_merge(
+        &mut self,
+        source_id: rio_backend::event::WindowId,
+        target: crate::router::window_control::WindowEndpoint,
+    ) -> Result<(), String> {
+        let transfer_id = crate::router::window_control::new_transfer_id()?;
+        let source_index = self
+            .router
+            .routes
+            .get(&source_id)
+            .ok_or_else(|| "source window disappeared before merge".to_string())?
+            .window
+            .screen
+            .context_manager
+            .current_index();
+        let offer = self
+            .router
+            .routes
+            .get(&source_id)
+            .ok_or_else(|| "source window disappeared before merge".to_string())?
+            .window
+            .screen
+            .context_manager
+            .transfer_offer(source_index, transfer_id)?;
+        let source_routes = offer.pane_route_ids();
+        let control = self
+            .window_control
+            .as_ref()
+            .ok_or_else(|| "cross-window control is unavailable".to_string())?;
+        control.offer_async(target, offer, self.event_proxy.clone(), source_id)?;
+        self.track_outgoing_offer(transfer_id, source_id, source_routes);
+        Ok(())
+    }
+
+    fn recovery_label(prepared: &crate::context::session::PreparedSession) -> String {
+        let frame = prepared.initial_frame();
+        let source = if !frame.title.trim().is_empty() {
+            frame.title.as_str()
+        } else if let Some(path) = frame.working_dir.as_deref() {
+            path
+        } else {
+            "unnamed session"
+        };
+        let mut label: String = source
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(64)
+            .collect();
+        if label.is_empty() {
+            label = "unnamed session".into();
+        }
+        if prepared.had_active_owner() {
+            format!("Recover \"{label}\" (active owner; takeover)")
+        } else {
+            format!("Recover \"{label}\"")
+        }
+    }
+
+    fn begin_recovery_probes(
+        &mut self,
+        source_window: rio_backend::event::WindowId,
+        descriptors: Vec<SessionDescriptor>,
+    ) {
+        let descriptors: Vec<_> = descriptors.into_iter().take(8).collect();
+        if descriptors.is_empty() {
+            return;
+        }
+        while self.recovery_probe.try_recv().is_ok() {}
+        let probe_id = self.next_recovery_probe_id;
+        self.next_recovery_probe_id = self.next_recovery_probe_id.wrapping_add(1).max(1);
+        let sender = self.recovery_probe_sender.clone();
+        let event_proxy = self.event_proxy.clone();
+        self.recovery_probe_state = Some(RecoveryProbeState {
+            id: probe_id,
+            source_window,
+            remaining: descriptors.len(),
+            candidates: Vec::new(),
+        });
+        for descriptor in descriptors {
+            let sender = sender.clone();
+            let event_proxy = event_proxy.clone();
+            let spawn_result = std::thread::Builder::new()
+                .name("rio-session-recovery-probe".into())
+                .spawn(move || {
+                    let prepared =
+                        rio_session::SessionClient::prepare_attach(descriptor.clone())
+                            .map(crate::context::session::SessionHandle::prepare_attach)
+                            .map_err(|error| error.to_string());
+                    let _ = sender.try_send(RecoveryProbeResult {
+                        id: probe_id,
+                        source_window,
+                        prepared,
+                        descriptor: Some(descriptor),
+                    });
+                    rio_backend::event::EventListener::send_event(
+                        &event_proxy,
+                        RioEvent::Render,
+                        source_window,
+                    );
+                });
+            if spawn_result.is_err() {
+                let _ = self.recovery_probe_sender.try_send(RecoveryProbeResult {
+                    id: probe_id,
+                    source_window,
+                    prepared: Err("could not start recovery probe".into()),
+                    descriptor: None,
+                });
+            }
+        }
+    }
+
+    fn begin_merge_window_action(
+        &mut self,
+        source_id: rio_backend::event::WindowId,
+    ) -> bool {
+        let Some(control) = self.window_control.as_ref() else {
+            return false;
+        };
+        control
+            .discover_peers_async(self.event_proxy.clone(), source_id)
+            .is_ok()
+    }
+
+    fn arm_merge_source(&mut self, source_id: rio_backend::event::WindowId) -> bool {
+        let Some(route) = self.router.routes.get_mut(&source_id) else {
+            return false;
+        };
+        if route.path != RoutePath::Terminal
+            || route.window.screen.context_manager.is_empty()
+        {
+            return false;
+        }
+        let index = route.window.screen.context_manager.current_index();
+        route.window.screen.set_transfer_source_marker(index);
+        self.merge_window_source = Some(source_id);
+        self.set_window_overlay(
+            source_id,
+            Some(crate::renderer::WindowOverlay::MergeSource),
+        );
+        true
+    }
+
+    fn begin_recovery_action(&mut self, source_id: rio_backend::event::WindowId) -> bool {
+        let descriptors = SessionDescriptor::discover_recovery()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|descriptor| {
+                !self.router.routes.values().any(|route| {
+                    route
+                        .window
+                        .screen
+                        .context_manager
+                        .owns_session_id(descriptor.session_id)
+                })
+            })
+            .collect::<Vec<_>>();
+        if descriptors.is_empty() {
+            self.show_merge_error(source_id, "no saved sessions are available".into());
+            return false;
+        }
+        self.begin_recovery_probes(source_id, descriptors);
+        if let Some(route) = self.router.routes.get_mut(&source_id) {
+            // Keep recovery's saved-session list separate from live-window
+            // targeting. The empty list is only a loading state.
+            route.window.screen.begin_recovery_targets(Vec::new());
+            route.request_redraw();
+            true
+        } else {
+            self.recovery_probe_state = None;
+            false
+        }
+    }
+
+    fn arm_discovered_merge_targets(
+        &mut self,
+        source_id: rio_backend::event::WindowId,
+        targets: Vec<crate::router::window_control::WindowEndpoint>,
+    ) -> bool {
+        if self.merge_window_source != Some(source_id) {
+            return false;
+        }
+        if targets.is_empty() {
+            tracing::debug!(
+                source_window = ?source_id,
+                "no foreign Rio windows discovered; retaining local target mode"
+            );
+            return true;
+        }
+        tracing::info!(
+            source_window = ?source_id,
+            foreign_targets = targets.len(),
+            "merge targets discovered"
+        );
+        #[cfg(unix)]
+        self.arm_foreign_merge_selection(source_id, targets);
+        if let Some(route) = self.router.routes.get_mut(&source_id) {
+            route.request_redraw();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn select_recovery_target(
+        &mut self,
+        source_id: rio_backend::event::WindowId,
+        target_index: usize,
+    ) -> bool {
+        let Some((pending_source, candidates)) = self.recovery_targets.take() else {
+            return false;
+        };
+        if pending_source != source_id {
+            self.recovery_targets = Some((pending_source, candidates));
+            return false;
+        }
+        let Some(candidate) = candidates.get(target_index) else {
+            self.recovery_targets = Some((pending_source, candidates));
+            return false;
+        };
+        let candidate = RecoveryCandidate {
+            descriptor: candidate.descriptor.clone(),
+            label: candidate.label.clone(),
+        };
+        tracing::info!(source_window = ?source_id, target_index, "recovery target selected");
+        self.recovery_probe_state = None;
+        while self.recovery_probe.try_recv().is_ok() {}
+        if let Some(route) = self.router.routes.get_mut(&source_id) {
+            route.window.screen.clear_merge_ui();
+            route.request_redraw();
+        }
+        let sender = self.recovery_probe_sender.clone();
+        let listener = self.event_proxy.clone();
+        let preparation = self.session_preparations.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("rio-session-recover".into())
+            .spawn(move || {
+                let prepared =
+                    rio_session::SessionClient::prepare_attach(candidate.descriptor)
+                        .map(crate::context::session::SessionHandle::prepare_attach)
+                        .map_err(|error| error.to_string());
+                let _ = sender.try_send(RecoveryProbeResult {
+                    id: 0,
+                    source_window: source_id,
+                    prepared,
+                    descriptor: None,
+                });
+                drop(preparation);
+                rio_backend::event::EventListener::send_event(
+                    &listener,
+                    RioEvent::Render,
+                    source_id,
+                );
+            })
+        {
+            self.show_merge_error(source_id, error.to_string());
+            return false;
+        }
+        true
+    }
+
+    fn show_merge_error(
+        &mut self,
+        source_id: rio_backend::event::WindowId,
+        error: String,
+    ) {
+        tracing::warn!(%error, "session recovery/merge failed");
+        if let Some(route_id) = self
+            .router
+            .routes
+            .get(&source_id)
+            .map(|route| route.window.screen.context_manager.current_route())
+        {
+            self.show_session_error(source_id, route_id, error);
+        }
+    }
+
+    fn start_recovery_import(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        prepared: crate::context::session::PreparedSession,
+    ) -> Result<(), String> {
+        let Some(route) = self.router.routes.get_mut(&window_id) else {
+            return Err("target window disappeared before recovery".into());
+        };
+        let dimension = route.window.screen.ctx().current().dimension;
+        let size = route.window.winit_window.inner_size();
+        let route_id = route
+            .window
+            .screen
+            .context_manager
+            .insert_prepared_pane(
+                prepared,
+                crate::context::next_rich_text_id(),
+                dimension,
+            )
+            .map_err(|_| "target context capacity is full".to_string())?;
+        route.window.screen.refresh_after_tab_transfer(size);
+        tracing::info!(
+            window_id = ?window_id,
+            route_id,
+            "recovery session inserted; waiting for direct frame readiness"
+        );
+        self.pending_prepared.push(PendingPrepared {
+            routes: vec![PendingPreparedRoute {
+                source_route: None,
+                target_route: route_id,
+            }],
+            ready: HashSet::new(),
+            window_id,
+            deadline: Instant::now() + Duration::from_secs(25),
+            completion: PendingPreparedCompletion::Recovery,
+        });
+        route.request_overlay_redraw();
+        self.event_proxy
+            .send_event(RioEventType::Rio(RioEvent::Render), window_id);
+        Ok(())
+    }
+
     fn clear_merge_window(&mut self) {
+        let mut palette_windows = HashSet::new();
+        if let Some(source_id) = self.merge_window_source {
+            palette_windows.insert(source_id);
+        }
+        if let Some(pending) = self.pending_merge_selection.as_ref() {
+            palette_windows.insert(pending.source_window);
+        }
+        if let Some((source_id, _)) = self.recovery_targets.as_ref() {
+            palette_windows.insert(*source_id);
+        }
+        if let Some(state) = self.recovery_probe_state.as_ref() {
+            palette_windows.insert(state.source_window);
+        }
+        self.cancel_pending_merge_selection();
+        self.clear_armed_merge_selection_and_notify();
+        self.recovery_targets = None;
+        self.recovery_probe_state = None;
+        while self.recovery_probe.try_recv().is_ok() {}
         if let Some(source_id) = self.merge_window_source.take() {
             if let Some(route) = self.router.routes.get_mut(&source_id) {
                 route.window.screen.clear_transfer_source_marker();
@@ -1550,16 +2596,140 @@ impl<'a> Application<'a> {
             self.set_window_overlay(source_id, None);
         }
         self.clear_merge_target();
+        for window_id in palette_windows {
+            if let Some(route) = self.router.routes.get_mut(&window_id) {
+                route.window.screen.clear_merge_ui();
+                route.request_redraw();
+            }
+        }
+    }
+
+    fn cancel_pending_merge_selection(&mut self) {
+        let Some(pending) = self.pending_merge_selection.take() else {
+            return;
+        };
+        if let Some(control) = self.window_control.as_ref() {
+            for target in pending.targets {
+                let _ = control.cancel_selection_async(target, pending.selection_id);
+            }
+        }
+    }
+
+    fn clear_armed_merge_selection(&mut self) {
+        let Some(armed) = self.armed_merge_selection.take() else {
+            return;
+        };
+        self.set_window_overlay(armed.target_window, None);
+        if self.drop_marker_window == Some(armed.target_window) {
+            self.clear_drop_marker();
+        }
+    }
+
+    fn clear_armed_merge_selection_and_notify(&mut self) {
+        let Some(armed) = self.armed_merge_selection.as_ref() else {
+            return;
+        };
+        let source = armed.source.clone();
+        let selection_id = armed.selection_id;
+        self.clear_armed_merge_selection();
+        if let Some(control) = self.window_control.as_ref() {
+            let _ = control.cancel_selection_async(source, selection_id);
+        }
+    }
+
+    #[cfg(unix)]
+    fn arm_foreign_merge_selection(
+        &mut self,
+        source_window: rio_backend::event::WindowId,
+        targets: Vec<crate::router::window_control::WindowEndpoint>,
+    ) {
+        if targets.is_empty() {
+            return;
+        }
+        let Some(source) = self
+            .window_control
+            .as_ref()
+            .map(|control| control.descriptor().clone())
+        else {
+            return;
+        };
+        let Ok(selection_id) = crate::router::window_control::new_transfer_id() else {
+            tracing::warn!("could not create native merge selection id");
+            return;
+        };
+        let target_count = targets.len();
+        self.pending_merge_selection = Some(PendingMergeSelection {
+            selection_id,
+            source_window,
+            targets,
+            armed: 0,
+            resolved: HashSet::new(),
+            deadline: Instant::now() + MERGE_SELECTION_TIMEOUT,
+        });
+        tracing::info!(
+            source_window = ?source_window,
+            target_count,
+            "arming native merge targets"
+        );
+        self.merge_window_source = Some(source_window);
+        if let Some(route) = self.router.routes.get_mut(&source_window) {
+            let index = route.window.screen.context_manager.current_index();
+            route.window.screen.set_transfer_source_marker(index);
+        }
+        self.set_window_overlay(
+            source_window,
+            Some(crate::renderer::WindowOverlay::MergeSource),
+        );
+        let pending = self
+            .pending_merge_selection
+            .as_ref()
+            .expect("native merge selection was not installed");
+        if let Some(control) = self.window_control.as_ref() {
+            for target in &pending.targets {
+                if let Err(error) = control.arm_selection_async(
+                    target.clone(),
+                    selection_id,
+                    source.clone(),
+                    self.event_proxy.clone(),
+                    source_window,
+                ) {
+                    tracing::debug!(%error, "could not arm native merge target");
+                }
+            }
+        }
     }
 
     fn clear_merge_if_window(&mut self, window_id: rio_backend::event::WindowId) {
-        if self.merge_window_source == Some(window_id)
+        if self.merge_state_uses_window(window_id) {
+            self.clear_merge_window();
+        }
+    }
+
+    fn merge_state_uses_window(&self, window_id: rio_backend::event::WindowId) -> bool {
+        self.merge_source_uses_window(window_id)
             || self
                 .merge_target
                 .is_some_and(|(target_id, _)| target_id == window_id)
-        {
-            self.clear_merge_window();
-        }
+            || self
+                .armed_merge_selection
+                .as_ref()
+                .is_some_and(|armed| armed.target_window == window_id)
+    }
+
+    fn merge_source_uses_window(&self, window_id: rio_backend::event::WindowId) -> bool {
+        self.merge_window_source == Some(window_id)
+            || self
+                .pending_merge_selection
+                .as_ref()
+                .is_some_and(|pending| pending.source_window == window_id)
+            || self
+                .recovery_targets
+                .as_ref()
+                .is_some_and(|(source_id, _)| *source_id == window_id)
+            || self
+                .recovery_probe_state
+                .as_ref()
+                .is_some_and(|state| state.source_window == window_id)
     }
 
     fn clear_merge_target(&mut self) {
@@ -1581,16 +2751,16 @@ impl<'a> Application<'a> {
             self.clear_merge_target();
             return;
         }
-        let Some(source_count) = self
+        let source_ready = self
             .router
             .routes
             .get(&source_id)
             .filter(|route| route.path == RoutePath::Terminal)
-            .map(|route| route.window.screen.context_manager.len())
-        else {
+            .is_some_and(|route| !route.window.screen.context_manager.is_empty());
+        if !source_ready {
             self.clear_merge_target();
             return;
-        };
+        }
         let Some(route) = self
             .router
             .routes
@@ -1610,7 +2780,7 @@ impl<'a> Application<'a> {
             .window
             .screen
             .context_manager
-            .can_insert_grids(index, source_count)
+            .can_insert_grids(index, 1)
         {
             self.clear_merge_target();
             return;
@@ -1635,7 +2805,9 @@ impl<'a> Application<'a> {
         overlay: Option<crate::renderer::WindowOverlay>,
     ) {
         if let Some(route) = self.router.routes.get_mut(&window_id) {
-            if route.window.screen.set_window_overlay(overlay) {
+            let changed = route.window.screen.set_window_overlay(overlay);
+            tracing::info!(window_id = ?window_id, changed, "window overlay state updated");
+            if changed {
                 route.request_redraw();
             }
         }
@@ -1664,6 +2836,175 @@ impl<'a> Application<'a> {
         }
     }
 
+    fn clear_armed_merge_hover(&mut self, window_id: rio_backend::event::WindowId) {
+        if let Some(armed) = self.armed_merge_selection.as_mut() {
+            if armed.target_window == window_id {
+                armed.hover.clear();
+            }
+        }
+        self.set_window_overlay(window_id, None);
+        if self.drop_marker_window == Some(window_id) {
+            self.clear_drop_marker();
+        }
+    }
+
+    fn valid_merge_target_index(
+        &self,
+        window_id: rio_backend::event::WindowId,
+        index: usize,
+    ) -> bool {
+        let Some(route) = self.router.routes.get(&window_id) else {
+            return false;
+        };
+        if route.path != RoutePath::Terminal
+            || route.window.screen.context_manager.is_empty()
+        {
+            return false;
+        }
+        let count = route.window.screen.context_manager.len();
+        merge_target_index_is_valid(
+            index,
+            count,
+            route
+                .window
+                .screen
+                .context_manager
+                .can_insert_grids(index, 1),
+        )
+    }
+
+    fn merge_target_index_at(
+        &self,
+        window_id: rio_backend::event::WindowId,
+        position: Option<rio_window::dpi::PhysicalPosition<f64>>,
+    ) -> Option<usize> {
+        let route = self.router.routes.get(&window_id)?;
+        if route.path != RoutePath::Terminal
+            || route.window.screen.context_manager.is_empty()
+        {
+            return None;
+        }
+        let count = route.window.screen.context_manager.len();
+        let index = position
+            .and_then(|position| {
+                route.window.screen.tab_drop_index(position.x, position.y)
+            })
+            .unwrap_or(count);
+        self.valid_merge_target_index(window_id, index)
+            .then_some(index)
+    }
+
+    fn handle_armed_merge_window_event(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        event: &WindowEvent,
+    ) -> bool {
+        let Some(armed) = self.armed_merge_selection.as_ref() else {
+            return false;
+        };
+        if armed.target_window != window_id {
+            return false;
+        }
+        let selection_id = armed.selection_id;
+        let source = armed.source.clone();
+        let send_selection = |application: &mut Self, index: usize, clicked: bool| {
+            if let Some(control) = application.window_control.as_ref() {
+                let _ = control.send_selection_event_async(
+                    source.clone(),
+                    selection_id,
+                    index,
+                    clicked,
+                );
+            }
+        };
+        match event {
+            WindowEvent::CursorEntered { .. } => {
+                let Some(index) = self.merge_target_index_at(window_id, None) else {
+                    self.clear_armed_merge_hover(window_id);
+                    return true;
+                };
+                if let Some(armed) = self.armed_merge_selection.as_mut() {
+                    armed.hover.set(index);
+                }
+                self.set_window_overlay(
+                    window_id,
+                    Some(crate::renderer::WindowOverlay::MergeTarget),
+                );
+                self.set_drop_marker(window_id, index);
+                tracing::info!(
+                    target_window = ?window_id,
+                    target_index = index,
+                    "native merge target pointer entered"
+                );
+                send_selection(self, index, false);
+                true
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.clear_armed_merge_hover(window_id);
+                true
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let Some(index) = self.merge_target_index_at(window_id, Some(*position))
+                else {
+                    self.clear_armed_merge_hover(window_id);
+                    return true;
+                };
+                let changed = self
+                    .armed_merge_selection
+                    .as_ref()
+                    .is_none_or(|armed| armed.hover.index != Some(index));
+                self.set_window_overlay(
+                    window_id,
+                    Some(crate::renderer::WindowOverlay::MergeTarget),
+                );
+                self.set_drop_marker(window_id, index);
+                if changed {
+                    if let Some(armed) = self.armed_merge_selection.as_mut() {
+                        armed.hover.set(index);
+                    }
+                    tracing::info!(
+                        target_window = ?window_id,
+                        target_index = index,
+                        "native merge target pointer moved"
+                    );
+                    send_selection(self, index, false);
+                }
+                true
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let Some(index) = self
+                    .armed_merge_selection
+                    .as_ref()
+                    .and_then(|armed| armed.hover.clicked_index())
+                else {
+                    tracing::debug!(
+                        target_window = ?window_id,
+                        "ignoring merge click without a hovered target"
+                    );
+                    return true;
+                };
+                if !self.valid_merge_target_index(window_id, index) {
+                    self.clear_armed_merge_hover(window_id);
+                    return true;
+                }
+                tracing::info!(
+                    target_window = ?window_id,
+                    target_index = index,
+                    "native merge target clicked"
+                );
+                send_selection(self, index, true);
+                self.clear_armed_merge_selection();
+                true
+            }
+            WindowEvent::MouseInput { .. } => true,
+            _ => false,
+        }
+    }
+
     #[cfg(all(feature = "wayland", target_os = "linux"))]
     fn tab_drag_owns_offer(
         &self,
@@ -1675,7 +3016,933 @@ impl<'a> Application<'a> {
     }
 }
 
-impl ApplicationHandler<EventPayload> for Application<'_> {
+impl Application<'_> {
+    fn ensure_window_control(&mut self, window_id: rio_backend::event::WindowId) {
+        if self.window_control.is_some() {
+            return;
+        }
+        match crate::router::window_control::WindowControl::new(
+            self.event_proxy.clone(),
+            window_id,
+        ) {
+            Ok(control) => self.window_control = Some(control),
+            Err(error) => tracing::warn!(%error, "cross-window control unavailable"),
+        }
+    }
+
+    fn poll_recovery_probes(&mut self) {
+        let recovery_source = self
+            .recovery_probe_state
+            .as_ref()
+            .map(|state| state.source_window)
+            .or_else(|| self.recovery_targets.as_ref().map(|(source, _)| *source));
+        if let Some(source_window) = recovery_source {
+            let picker_open =
+                self.router.routes.get(&source_window).is_some_and(|route| {
+                    route.window.screen.renderer.command_palette.is_enabled()
+                });
+            if !picker_open {
+                self.recovery_probe_state = None;
+                self.recovery_targets = None;
+                while self.recovery_probe.try_recv().is_ok() {}
+                if let Some(route) = self.router.routes.get_mut(&source_window) {
+                    route.window.screen.clear_merge_ui();
+                    route.request_redraw();
+                }
+                return;
+            }
+        }
+        let recovery_open = self.recovery_probe_state.as_ref().is_some_and(|state| {
+            self.router
+                .routes
+                .get(&state.source_window)
+                .is_some_and(|route| {
+                    route.window.screen.renderer.command_palette.is_enabled()
+                })
+        });
+        if self.recovery_probe_state.is_some() && !recovery_open {
+            self.recovery_probe_state = None;
+            while self.recovery_probe.try_recv().is_ok() {}
+            return;
+        }
+        while let Ok(result) = self.recovery_probe.try_recv() {
+            if result.id == 0 {
+                let outcome = result.prepared.and_then(|prepared| {
+                    self.start_recovery_import(result.source_window, prepared)
+                });
+                if let Err(error) = outcome {
+                    self.show_merge_error(result.source_window, error);
+                }
+                continue;
+            }
+            let Some(state) = self.recovery_probe_state.as_mut() else {
+                continue;
+            };
+            if state.id != result.id || state.source_window != result.source_window {
+                continue;
+            }
+            state.remaining = state.remaining.saturating_sub(1);
+            if let Ok(prepared) = result.prepared {
+                // A probe's commit deadline must not span user interaction.
+                if let Some(descriptor) = result.descriptor {
+                    state
+                        .candidates
+                        .push(RecoveryCandidate::from_probe(descriptor, prepared));
+                }
+            }
+            if state.remaining != 0 {
+                continue;
+            }
+            let state = self
+                .recovery_probe_state
+                .take()
+                .expect("probe state exists");
+            let still_open =
+                self.router
+                    .routes
+                    .get(&state.source_window)
+                    .is_some_and(|route| {
+                        route.window.screen.renderer.command_palette.is_enabled()
+                    });
+            if !still_open {
+                continue;
+            }
+            let labels = state
+                .candidates
+                .iter()
+                .map(|candidate| candidate.label.clone())
+                .collect::<Vec<_>>();
+            if state.candidates.is_empty() {
+                self.show_merge_error(
+                    state.source_window,
+                    "no recoverable sessions could be prepared".into(),
+                );
+                if let Some(route) = self.router.routes.get_mut(&state.source_window) {
+                    route.window.screen.clear_merge_ui();
+                    route.request_redraw();
+                }
+                continue;
+            }
+            tracing::info!(
+                source_window = ?state.source_window,
+                recovery_targets = state.candidates.len(),
+                "saved session recovery targets discovered"
+            );
+            self.recovery_targets = Some((state.source_window, state.candidates));
+            if let Some(route) = self.router.routes.get_mut(&state.source_window) {
+                route.window.screen.begin_recovery_targets(labels);
+                route.request_redraw();
+            }
+        }
+    }
+
+    fn expire_merge_selection(&mut self) {
+        let now = Instant::now();
+        let pending_expired = self
+            .pending_merge_selection
+            .as_ref()
+            .is_some_and(|pending| pending.deadline <= now);
+        let armed_expired = self
+            .armed_merge_selection
+            .as_ref()
+            .is_some_and(|armed| armed.deadline <= now);
+        if pending_expired || armed_expired {
+            self.clear_merge_window();
+        }
+    }
+
+    fn handle_arm_selection(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        selection_id: [u8; 16],
+        source: crate::router::window_control::WindowEndpoint,
+        reply: SyncSender<crate::router::window_control::WindowControlResponse>,
+    ) {
+        let valid_source = self
+            .window_control
+            .as_ref()
+            .is_some_and(|control| control.descriptor().instance != source.instance);
+        let has_terminal = self.router.routes.get(&window_id).is_some_and(|route| {
+            route.path == RoutePath::Terminal
+                && !route.window.screen.context_manager.is_empty()
+        });
+        let has_capacity = self.router.routes.get(&window_id).is_some_and(|route| {
+            let count = route.window.screen.context_manager.len();
+            route
+                .window
+                .screen
+                .context_manager
+                .can_insert_grids(count, 1)
+        });
+        if !valid_source || !has_terminal || !has_capacity {
+            tracing::warn!(
+                target_window = ?window_id,
+                valid_source,
+                has_terminal,
+                has_capacity,
+                "rejecting native merge target arm"
+            );
+            let _ = reply.try_send(
+                crate::router::window_control::WindowControlResponse::Rejected(
+                    "target window is unavailable".into(),
+                ),
+            );
+            return;
+        }
+        if let Some(armed) = self.armed_merge_selection.as_ref() {
+            if armed.selection_id != selection_id {
+                let _ = reply.try_send(
+                    crate::router::window_control::WindowControlResponse::Rejected(
+                        "target already has a merge selection".into(),
+                    ),
+                );
+                return;
+            }
+        }
+        self.clear_armed_merge_selection();
+        self.armed_merge_selection = Some(ArmedMergeSelection {
+            selection_id,
+            source,
+            target_window: window_id,
+            hover: MergeHoverState::default(),
+            deadline: Instant::now() + MERGE_SELECTION_TIMEOUT,
+        });
+        tracing::info!(target_window = ?window_id, "native merge target armed");
+        let _ = reply.try_send(
+            crate::router::window_control::WindowControlResponse::SelectionArmed,
+        );
+    }
+
+    fn handle_arm_selection_result(
+        &mut self,
+        selection_id: [u8; 16],
+        target: crate::router::window_control::WindowEndpoint,
+        result: Result<(), String>,
+    ) {
+        if let Err(error) = &result {
+            tracing::warn!(%error, "native merge target arm failed");
+        }
+        let Some(pending) = self.pending_merge_selection.as_mut() else {
+            if result.is_ok() {
+                if let Some(control) = self.window_control.as_ref() {
+                    let _ = control.cancel_selection_async(target, selection_id);
+                }
+            }
+            return;
+        };
+        if pending.selection_id != selection_id {
+            if result.is_ok() {
+                if let Some(control) = self.window_control.as_ref() {
+                    let _ = control.cancel_selection_async(target, selection_id);
+                }
+            }
+            return;
+        }
+        if !pending.resolved.insert(target.instance) {
+            return;
+        }
+        if result.is_ok() {
+            pending.armed += 1;
+        } else {
+            tracing::debug!(
+                target = target.native_window_id,
+                error = ?result,
+                "native merge target did not arm"
+            );
+        }
+        let all_resolved = pending.resolved.len() == pending.targets.len();
+        let no_target_armed = pending.armed == 0;
+        if all_resolved && no_target_armed {
+            self.clear_merge_window();
+        }
+    }
+
+    fn handle_selection_event(
+        &mut self,
+        selection_id: [u8; 16],
+        target_window: u64,
+        _target_index: usize,
+        clicked: bool,
+    ) {
+        let Some(pending) = self.pending_merge_selection.as_ref() else {
+            return;
+        };
+        if pending.selection_id != selection_id {
+            return;
+        }
+        let Some(target) = pending
+            .targets
+            .iter()
+            .find(|target| target.native_window_id == target_window)
+            .cloned()
+        else {
+            return;
+        };
+        if !clicked {
+            return;
+        }
+        let source_window = pending.source_window;
+        self.clear_merge_window();
+        if let Err(error) = self.start_foreign_window_merge(source_window, target) {
+            self.show_merge_error(source_window, error);
+        }
+    }
+
+    fn poll_window_control(&mut self) {
+        self.poll_recovery_probes();
+        self.expire_merge_selection();
+        self.expire_pending_prepared();
+        let ready = std::mem::take(&mut self.ready_session_imports);
+        for (window_id, routes) in ready {
+            tracing::info!(
+                ?window_id,
+                ready_routes = ?routes,
+                pending_prepared = self.pending_prepared.len(),
+                "processing direct-ready session imports"
+            );
+            self.finish_ready_prepared(window_id, routes);
+        }
+
+        let events = self
+            .window_control
+            .as_ref()
+            .map(crate::router::window_control::WindowControl::poll)
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                crate::router::window_control::WindowControlEvent::DragResult {
+                    transfer_id,
+                    result,
+                } => {
+                    #[cfg(all(feature = "wayland", target_os = "linux"))]
+                    if self
+                        .foreign_drag
+                        .as_ref()
+                        .is_some_and(|drag| drag.token == Some(transfer_id))
+                    {
+                        use rio_window::platform::wayland::WindowExtWayland;
+                        let drag = self.foreign_drag.take().unwrap();
+                        if let Some(route) = self.router.routes.get(&drag.window.into()) {
+                            if result.is_ok() {
+                                if let Err(error) = route
+                                    .window
+                                    .winit_window
+                                    .finish_toplevel_drag_offer(drag.offer)
+                                {
+                                    tracing::warn!(%error, "committed foreign drag finish failed");
+                                }
+                            } else {
+                                let _ = route
+                                    .window
+                                    .winit_window
+                                    .cancel_toplevel_drag_offer(drag.offer);
+                            }
+                        }
+                        self.clear_drop_marker();
+                        if let Err(error) = result {
+                            self.show_merge_error(drag.window.into(), error);
+                        }
+                    }
+                    #[cfg(not(all(feature = "wayland", target_os = "linux")))]
+                    let _ = (transfer_id, result);
+                }
+                crate::router::window_control::WindowControlEvent::Probe {
+                    window_id,
+                    reply,
+                } => {
+                    let response = if self.router.routes.contains_key(&window_id) {
+                        crate::router::window_control::WindowControlResponse::Hello
+                    } else {
+                        crate::router::window_control::WindowControlResponse::Rejected(
+                            "window is gone".into(),
+                        )
+                    };
+                    let _ = reply.try_send(response);
+                }
+                crate::router::window_control::WindowControlEvent::Peers {
+                    window_id,
+                    targets,
+                } => {
+                    self.arm_discovered_merge_targets(window_id, targets);
+                }
+                crate::router::window_control::WindowControlEvent::IncomingOffer {
+                    offer,
+                    reply,
+                    target_window,
+                    target_index,
+                } => {
+                    let sender = self.incoming_prepared_sender.clone();
+                    let preparation = self.session_preparations.clone();
+                    let event_proxy = self.event_proxy.clone();
+                    let wake_window = target_window
+                        .map(rio_backend::event::WindowId::from)
+                        .or_else(|| self.router.routes.keys().next().copied());
+                    std::thread::Builder::new()
+                        .name("rio-window-prepare".into())
+                        .spawn(move || {
+                            let prepared = offer
+                                .panes
+                                .iter()
+                                .map(|pane| {
+                                    rio_session::SessionClient::prepare_attach(
+                                        pane.session.clone(),
+                                    )
+                                    .map(crate::context::session::SessionHandle::prepare_attach)
+                                    .map_err(|error| error.to_string())
+                                })
+                                .collect::<Result<Vec<_>, _>>();
+                            let _ = sender.try_send(PreparedIncoming {
+                                offer,
+                                prepared,
+                                reply,
+                                target_window,
+                                target_index,
+                            });
+                            drop(preparation);
+                            if let Some(window_id) = wake_window {
+                                rio_backend::event::EventListener::send_event(
+                                    &event_proxy,
+                                    RioEvent::Render,
+                                    window_id,
+                                );
+                            }
+                        })
+                        .ok();
+                }
+                crate::router::window_control::WindowControlEvent::OfferResult {
+                    transfer_id,
+                    result,
+                } => {
+                    tracing::info!(
+                        committed = result.is_ok(),
+                        "received foreign drag commit result"
+                    );
+                    self.finish_outgoing_transfer(transfer_id, result)
+                }
+                crate::router::window_control::WindowControlEvent::ArmSelection {
+                    window_id,
+                    selection_id,
+                    source,
+                    reply,
+                } => {
+                    tracing::info!(target_window = ?window_id, "processing native merge target arm");
+                    self.handle_arm_selection(window_id, selection_id, source, reply)
+                }
+                crate::router::window_control::WindowControlEvent::CancelSelection {
+                    window_id,
+                    selection_id,
+                } => {
+                    if self
+                        .pending_merge_selection
+                        .as_ref()
+                        .is_some_and(|pending| pending.selection_id == selection_id)
+                    {
+                        self.clear_merge_window();
+                    } else if self
+                        .armed_merge_selection
+                        .as_ref()
+                        .is_some_and(|armed| {
+                            armed.target_window == window_id
+                                && armed.selection_id == selection_id
+                        })
+                    {
+                        self.clear_armed_merge_selection();
+                    }
+                }
+                crate::router::window_control::WindowControlEvent::Selection {
+                    selection_id,
+                    target_window,
+                    target_index,
+                    clicked,
+                } => self.handle_selection_event(
+                    selection_id,
+                    target_window,
+                    target_index as usize,
+                    clicked,
+                ),
+                crate::router::window_control::WindowControlEvent::ArmSelectionResult {
+                    selection_id,
+                    target,
+                    result,
+                } => self.handle_arm_selection_result(selection_id, target, result),
+            }
+        }
+
+        loop {
+            match self.incoming_prepared.try_recv() {
+                Ok(prepared) => self.install_incoming_transfer(prepared),
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                    break
+                }
+            }
+        }
+    }
+
+    fn expire_pending_prepared(&mut self) {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        let mut index = 0;
+        while index < self.pending_prepared.len() {
+            if self.pending_prepared[index].deadline <= now {
+                expired.push(self.pending_prepared.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        for pending in expired {
+            let routes: Vec<_> = pending
+                .routes
+                .iter()
+                .map(|route| route.target_route)
+                .collect();
+            let recovery =
+                matches!(&pending.completion, PendingPreparedCompletion::Recovery);
+            let mut current_route = None;
+            if let Some(route) = self.router.routes.get_mut(&pending.window_id) {
+                route
+                    .window
+                    .screen
+                    .context_manager
+                    .remove_transferred_routes(
+                        &routes,
+                        &mut route.window.screen.sugarloaf,
+                    );
+                if !route.window.screen.context_manager.is_empty() {
+                    let size = route.window.winit_window.inner_size();
+                    route.window.screen.refresh_after_tab_transfer(size);
+                }
+                if recovery {
+                    current_route =
+                        Some(route.window.screen.context_manager.current_route());
+                }
+                route.request_redraw();
+            }
+            match pending.completion {
+                PendingPreparedCompletion::Incoming { reply } => {
+                    let _ = reply.try_send(
+                        crate::router::window_control::WindowControlResponse::Rejected(
+                            "target renderer readiness timed out".into(),
+                        ),
+                    );
+                }
+                PendingPreparedCompletion::Recovery => {
+                    if let Some(route_id) = current_route {
+                        self.show_session_error(
+                            pending.window_id,
+                            route_id,
+                            "recovery renderer readiness timed out".into(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn install_incoming_transfer(&mut self, incoming: PreparedIncoming) {
+        let window_id = incoming
+            .target_window
+            .map(rio_backend::event::WindowId::from)
+            .filter(|window_id| self.router.routes.contains_key(window_id))
+            .or_else(|| self.router.get_focused_route())
+            .or_else(|| self.router.routes.keys().next().copied());
+        let Some(window_id) = window_id else {
+            let _ = incoming.reply.try_send(
+                crate::router::window_control::WindowControlResponse::Rejected(
+                    "target has no terminal window".into(),
+                ),
+            );
+            return;
+        };
+        let prepared = match incoming.prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = incoming.reply.try_send(
+                    crate::router::window_control::WindowControlResponse::Rejected(error),
+                );
+                return;
+            }
+        };
+        let Some(route) = self.router.routes.get_mut(&window_id) else {
+            let _ = incoming.reply.try_send(
+                crate::router::window_control::WindowControlResponse::Rejected(
+                    "target route disappeared".into(),
+                ),
+            );
+            return;
+        };
+        if route
+            .window
+            .screen
+            .context_manager
+            .bootstrap_transfer
+            .is_some_and(|(id, _)| id != incoming.offer.transfer_id)
+        {
+            let _ = incoming.reply.try_send(
+                crate::router::window_control::WindowControlResponse::Rejected(
+                    "unexpected bootstrap transfer".into(),
+                ),
+            );
+            return;
+        }
+        let dimension = route.window.screen.ctx().current().dimension;
+        let size = route.window.winit_window.inner_size();
+        let source_routes: Vec<_> = incoming
+            .offer
+            .panes
+            .iter()
+            .map(|pane| pane.route_id)
+            .collect();
+        let prepared = incoming.offer.panes.iter().cloned().zip(prepared).collect();
+        let target_routes = route.window.screen.context_manager.insert_prepared_tabs(
+            prepared,
+            incoming.offer.tabs.clone(),
+            incoming.offer.active_pane as usize,
+            incoming.target_index,
+            dimension,
+        );
+        let Ok(target_routes) = target_routes else {
+            let _ = incoming.reply.try_send(
+                crate::router::window_control::WindowControlResponse::Rejected(
+                    "target context capacity is full".into(),
+                ),
+            );
+            return;
+        };
+        if let Some((_, placeholder)) = route
+            .window
+            .screen
+            .context_manager
+            .bootstrap_transfer
+            .take()
+        {
+            route
+                .window
+                .screen
+                .context_manager
+                .remove_transferred_routes(
+                    &[placeholder],
+                    &mut route.window.screen.sugarloaf,
+                );
+        }
+        route.window.screen.refresh_after_tab_transfer(size);
+        let routes = source_routes
+            .into_iter()
+            .zip(target_routes)
+            .map(|(source_route, target_route)| PendingPreparedRoute {
+                source_route: Some(source_route),
+                target_route,
+            })
+            .collect();
+        self.pending_prepared.push(PendingPrepared {
+            routes,
+            ready: HashSet::new(),
+            window_id,
+            deadline: Instant::now() + Duration::from_secs(25),
+            completion: PendingPreparedCompletion::Incoming {
+                reply: incoming.reply,
+            },
+        });
+        route.request_overlay_redraw();
+        // Installation is drained from about_to_wait, after this iteration's
+        // native redraw dispatch. Wake another iteration for the first frame.
+        self.event_proxy
+            .send_event(RioEventType::Rio(RioEvent::Render), window_id);
+    }
+
+    fn finish_outgoing_transfer(
+        &mut self,
+        transfer_id: [u8; 16],
+        result: Result<Vec<u64>, String>,
+    ) {
+        let Some(index) = self
+            .pending_outgoing
+            .iter()
+            .position(|pending| pending.transfer_id == transfer_id)
+        else {
+            tracing::warn!(
+                "received foreign drag result without a pending outgoing transfer"
+            );
+            return;
+        };
+        let pending = self.pending_outgoing.remove(index);
+        let routes = match result {
+            Ok(routes) => match validate_committed_routes(&pending.source_routes, routes)
+            {
+                Ok(routes) => routes,
+                Err(error) => {
+                    tracing::warn!(%error, "cross-window transfer returned an invalid commit");
+                    if let Some(route_id) =
+                        self.router.routes.get(&pending.source_window).map(|route| {
+                            route.window.screen.context_manager.current_route()
+                        })
+                    {
+                        self.show_session_error(pending.source_window, route_id, error);
+                    }
+                    return;
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "cross-window transfer rejected");
+                if let Some(route_id) = self
+                    .router
+                    .routes
+                    .get(&pending.source_window)
+                    .map(|route| route.window.screen.context_manager.current_route())
+                {
+                    self.show_session_error(pending.source_window, route_id, error);
+                }
+                return;
+            }
+        };
+        tracing::info!(
+            source_window = ?pending.source_window,
+            routes = ?routes,
+            "applying committed foreign drag routes"
+        );
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        if let Some(drag) = self
+            .tab_drag
+            .as_mut()
+            .filter(|drag| drag.token.as_bytes() == transfer_id)
+        {
+            drag.lifecycle = TabDragLifecycle::Complete(crate::tab_drag::Outcome::Moved);
+        }
+        if let Some(route) = self.router.routes.get_mut(&pending.source_window) {
+            route
+                .window
+                .screen
+                .context_manager
+                .remove_transferred_routes(&routes, &mut route.window.screen.sugarloaf);
+            route.window.screen.discard_routes(routes.iter().copied());
+            if route.window.screen.context_manager.is_empty() {
+                tracing::info!(
+                    source_window = ?pending.source_window,
+                    "foreign drag emptied source window"
+                );
+                self.clear_merge_if_window(pending.source_window);
+                self.router.remove_route(pending.source_window);
+                self.exit_after_transfer = true;
+            } else {
+                let size = route.window.winit_window.inner_size();
+                route.window.screen.refresh_after_tab_transfer(size);
+                tracing::info!(
+                    remaining_routes = ?route.window.screen.context_manager.route_ids(),
+                    "foreign drag left source routes"
+                );
+                route.request_overlay_redraw();
+            }
+        } else {
+            tracing::warn!(
+                source_window = ?pending.source_window,
+                "foreign drag source window disappeared before route removal"
+            );
+        }
+    }
+
+    fn commit_prepared_route(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        route_id: usize,
+        kind: &str,
+    ) -> Result<(), String> {
+        let event_proxy = self.event_proxy.clone();
+        let Some(route) = self.router.routes.get_mut(&window_id) else {
+            return Err(format!("{kind} target window disappeared before commit"));
+        };
+        let Some(context) = route
+            .window
+            .screen
+            .context_manager
+            .get_by_route_id(route_id)
+        else {
+            return Err(format!("{kind} target route disappeared"));
+        };
+        if let Some(error) = context.terminal.lock().decoder_error() {
+            return Err(format!("cannot decode {kind} session frame: {error}"));
+        }
+        context
+            .commit_pending_session(event_proxy)
+            .map_err(|error| error.to_string())
+    }
+
+    fn finish_ready_prepared(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        ready: Vec<usize>,
+    ) {
+        for route_id in &ready {
+            for pending in &mut self.pending_prepared {
+                if pending.window_id == window_id
+                    && pending
+                        .routes
+                        .iter()
+                        .any(|route| route.target_route == *route_id)
+                {
+                    pending.ready.insert(*route_id);
+                }
+            }
+        }
+
+        let mut index = 0;
+        while index < self.pending_prepared.len() {
+            if self.pending_prepared[index].ready.len()
+                != self.pending_prepared[index].routes.len()
+            {
+                index += 1;
+                continue;
+            }
+            let pending = self.pending_prepared.remove(index);
+            match pending.completion {
+                PendingPreparedCompletion::Incoming { reply } => {
+                    self.commit_ready_incoming(
+                        window_id,
+                        ready.as_slice(),
+                        pending.routes,
+                        reply,
+                    );
+                }
+                PendingPreparedCompletion::Recovery => {
+                    self.commit_ready_recovery(window_id, pending.routes);
+                }
+            }
+        }
+    }
+
+    fn commit_ready_incoming(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        ready: &[usize],
+        routes: Vec<PendingPreparedRoute>,
+        reply: SyncSender<crate::router::window_control::WindowControlResponse>,
+    ) {
+        tracing::info!(
+            ?window_id,
+            ready_routes = ?ready,
+            pending_routes = ?routes,
+            "committing direct-ready session imports"
+        );
+        let mut committed = Vec::new();
+        let mut committed_targets = HashSet::new();
+        let mut error = None;
+        if self.router.routes.contains_key(&window_id) {
+            for route in &routes {
+                let source_route = route
+                    .source_route
+                    .expect("incoming prepared route has no source route");
+                match self.commit_prepared_route(
+                    window_id,
+                    route.target_route,
+                    "prepared",
+                ) {
+                    Ok(()) => {
+                        committed.push(source_route);
+                        committed_targets.insert(route.target_route);
+                    }
+                    Err(error_value) => {
+                        error = Some(error_value);
+                        break;
+                    }
+                }
+            }
+            if error.is_some() {
+                let uncommitted: Vec<_> = routes
+                    .iter()
+                    .filter(|route| !committed_targets.contains(&route.target_route))
+                    .map(|route| route.target_route)
+                    .collect();
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    route
+                        .window
+                        .screen
+                        .context_manager
+                        .remove_transferred_routes(
+                            &uncommitted,
+                            &mut route.window.screen.sugarloaf,
+                        );
+                    if !route.window.screen.context_manager.is_empty() {
+                        let size = route.window.winit_window.inner_size();
+                        route.window.screen.refresh_after_tab_transfer(size);
+                    }
+                }
+            }
+            if let Some(route) = self.router.routes.get_mut(&window_id) {
+                route.request_redraw();
+            }
+        } else {
+            error = Some("target window disappeared before commit".into());
+        }
+        if let Some(error) = error {
+            tracing::warn!(
+                ?window_id,
+                committed_routes = ?committed,
+                %error,
+                "direct-ready session import commit failed"
+            );
+            if committed.is_empty() {
+                let _ = reply.try_send(
+                    crate::router::window_control::WindowControlResponse::Rejected(error),
+                );
+            } else {
+                let _ = reply.try_send(
+                    crate::router::window_control::WindowControlResponse::Committed {
+                        routes: committed,
+                    },
+                );
+            }
+        } else {
+            tracing::info!(
+                ?window_id,
+                committed_routes = ?committed,
+                "direct-ready session imports committed"
+            );
+            let _ = reply.try_send(
+                crate::router::window_control::WindowControlResponse::Committed {
+                    routes: committed,
+                },
+            );
+        }
+    }
+
+    fn commit_ready_recovery(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        routes: Vec<PendingPreparedRoute>,
+    ) {
+        let [route] = routes.as_slice() else {
+            unreachable!("recovery has exactly one prepared route")
+        };
+        let target_route = route.target_route;
+        let error = self
+            .commit_prepared_route(window_id, target_route, "recovered")
+            .err();
+        let current_route = if let Some(route) = self.router.routes.get_mut(&window_id) {
+            let current_route = route.window.screen.context_manager.current_route();
+            if error.is_some() {
+                route
+                    .window
+                    .screen
+                    .context_manager
+                    .remove_transferred_routes(
+                        &[target_route],
+                        &mut route.window.screen.sugarloaf,
+                    );
+                if !route.window.screen.context_manager.is_empty() {
+                    let size = route.window.winit_window.inner_size();
+                    route.window.screen.refresh_after_tab_transfer(size);
+                }
+            }
+            route.request_redraw();
+            Some(current_route)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            if let Some(route_id) = current_route {
+                self.show_session_error(window_id, route_id, error);
+            }
+        }
+    }
+
     fn resumed(&mut self, _active_event_loop: &ActiveEventLoop) {}
 
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
@@ -1731,6 +3998,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             None,
             self.app_id.as_deref(),
         );
+        if let Some(window_id) = self.router.routes.keys().next().copied() {
+            self.ensure_window_control(window_id);
+        }
 
         if cause == StartCause::Init {
             self.setup_quake_hotkey();
@@ -1753,6 +4023,398 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
         tracing::info!("Initialisation complete");
     }
+}
+
+impl Application<'_> {
+    fn process_session_events(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: rio_backend::event::WindowId,
+        route_id: usize,
+    ) {
+        let events = self
+            .router
+            .routes
+            .get_mut(&window_id)
+            .and_then(|route| {
+                route
+                    .window
+                    .screen
+                    .context_manager
+                    .get_by_route_id(route_id)
+                    .and_then(|context| {
+                        context
+                            .terminal
+                            .lock()
+                            .session()
+                            .map(SessionHandle::take_events)
+                    })
+            })
+            .unwrap_or_default();
+
+        for event in events {
+            self.handle_session_event(event_loop, window_id, route_id, event);
+        }
+        while let Some((kind, text, copy_to_clipboard)) =
+            self.router.routes.get_mut(&window_id).and_then(|route| {
+                route
+                    .window
+                    .screen
+                    .context_manager
+                    .get_by_route_id(route_id)
+                    .and_then(|context| context.terminal.lock().take_selection_text())
+            })
+        {
+            if let Some(text) = text {
+                self.router.clipboard.set(kind, text);
+                if copy_to_clipboard {
+                    let text = self.router.clipboard.get(kind).to_string();
+                    self.router.clipboard.set(ClipboardType::Clipboard, text);
+                }
+            }
+        }
+        if let Some(route) = self.router.routes.get_mut(&window_id) {
+            route.window.screen.sync_session_search(route_id);
+        }
+    }
+
+    fn handle_session_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: rio_backend::event::WindowId,
+        route_id: usize,
+        event: SessionEvent,
+    ) {
+        match event {
+            SessionEvent::FrameReady => {
+                unreachable!("frame-ready events are consumed by the session pump")
+            }
+            SessionEvent::Title { title } => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    if let Some(context) = route
+                        .window
+                        .screen
+                        .context_manager
+                        .get_by_route_id(route_id)
+                    {
+                        context.terminal.lock().title = title.clone();
+                    }
+                    if route.window.screen.ctx().current_route() == route_id {
+                        route.set_window_title(&title);
+                    }
+                }
+            }
+            SessionEvent::Bell => {
+                if self.config.bell.audio {
+                    self.handle_audio_bell();
+                }
+            }
+            SessionEvent::CursorBlinkingChanged => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    if let Some(context) = route
+                        .window
+                        .screen
+                        .context_manager
+                        .get_by_route_id(route_id)
+                    {
+                        context
+                            .renderable_content
+                            .pending_update
+                            .set_terminal_damage(
+                                rio_backend::event::TerminalDamage::CursorOnly,
+                            );
+                    }
+                    route.request_redraw();
+                }
+            }
+            SessionEvent::Progress { state, value } => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    if let Some(island) = &mut route.window.screen.renderer.island {
+                        let state = match state {
+                            0 => rio_backend::event::ProgressState::Remove,
+                            1 => rio_backend::event::ProgressState::Set,
+                            2 => rio_backend::event::ProgressState::Error,
+                            3 => rio_backend::event::ProgressState::Indeterminate,
+                            4 => rio_backend::event::ProgressState::Pause,
+                            _ => return,
+                        };
+                        island.set_progress_report(rio_backend::event::ProgressReport {
+                            state,
+                            progress: Some(value),
+                        });
+                        route.request_redraw();
+                    }
+                }
+            }
+            SessionEvent::ClipboardStore { kind, text } => {
+                let Some(kind) = clipboard_type(kind) else {
+                    return;
+                };
+                let focused = self
+                    .router
+                    .routes
+                    .get(&window_id)
+                    .is_some_and(|route| route.window.is_focused);
+                if focused {
+                    self.router.clipboard.set(kind, text);
+                }
+            }
+            SessionEvent::ChildExited { .. } => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    route.request_redraw();
+                }
+            }
+            SessionEvent::ClipboardOverflow => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    route.report_error(&rio_backend::error::RioError {
+                        report: rio_backend::error::RioErrorType::InitializationError(
+                            "terminal clipboard response exceeded the session limit"
+                                .into(),
+                        ),
+                        level: rio_backend::error::RioErrorLevel::Warning,
+                    });
+                    route.request_redraw();
+                }
+            }
+            SessionEvent::ClipboardLoad {
+                request_id,
+                route_id: worker_route_id,
+                kind,
+            } => {
+                let Some(kind) = clipboard_type(kind) else {
+                    return;
+                };
+                let text = self.router.clipboard.get(kind).to_string();
+                self.send_session_command(
+                    window_id,
+                    route_id,
+                    SessionCommand::ClipboardResponse {
+                        request_id,
+                        route_id: worker_route_id,
+                        text,
+                    },
+                );
+            }
+            SessionEvent::ColorRequest {
+                request_id,
+                route_id: worker_route_id,
+                index,
+            } => {
+                let renderer_color = self
+                    .router
+                    .routes
+                    .get(&window_id)
+                    .map(|route| route.window.screen.renderer.colors[index as usize]);
+                let color = {
+                    let Some(route) = self.router.routes.get_mut(&window_id) else {
+                        return;
+                    };
+                    let Some(context) = route
+                        .window
+                        .screen
+                        .context_manager
+                        .get_by_route_id(route_id)
+                    else {
+                        return;
+                    };
+                    context.terminal.lock().colors[index as usize]
+                        .map(ColorRgb::from_color_arr)
+                        .or_else(|| renderer_color.map(ColorRgb::from_color_arr))
+                        .map(|color| [color.r, color.g, color.b])
+                };
+                self.send_session_command(
+                    window_id,
+                    route_id,
+                    SessionCommand::ColorResponse {
+                        request_id,
+                        route_id: worker_route_id,
+                        color,
+                    },
+                );
+            }
+            SessionEvent::TextAreaSizeRequest {
+                request_id,
+                route_id: worker_route_id,
+            } => {
+                let size = {
+                    let Some(route) = self.router.routes.get_mut(&window_id) else {
+                        return;
+                    };
+                    let Some(context) = route
+                        .window
+                        .screen
+                        .context_manager
+                        .get_by_route_id(route_id)
+                    else {
+                        return;
+                    };
+                    crate::renderer::utils::terminal_dimensions(&context.dimension)
+                };
+                self.send_session_command(
+                    window_id,
+                    route_id,
+                    SessionCommand::TextAreaSizeResponse {
+                        request_id,
+                        route_id: worker_route_id,
+                        rows: size.rows,
+                        columns: size.cols,
+                        pixel_width: size.width,
+                        pixel_height: size.height,
+                    },
+                );
+            }
+            SessionEvent::GlyphProtocolQuery {
+                request_id,
+                route_id: worker_route_id,
+                codepoint,
+            } => {
+                let Some(route) = self.router.routes.get(&window_id) else {
+                    return;
+                };
+                let library = route.window.screen.sugarloaf.font_library();
+                let in_glossary = library
+                    .glyph_registry_for(route_id)
+                    .is_some_and(|registry| registry.contains(codepoint));
+                let in_system = library.covers_codepoint(codepoint);
+                let status = match (in_glossary, in_system) {
+                    (true, true) => GlyphStatus::Both,
+                    (true, false) => GlyphStatus::Glossary,
+                    (false, true) => GlyphStatus::System,
+                    (false, false) => GlyphStatus::Free,
+                };
+                self.send_session_command(
+                    window_id,
+                    route_id,
+                    SessionCommand::GlyphProtocolResponse {
+                        request_id,
+                        route_id: worker_route_id,
+                        status,
+                    },
+                );
+            }
+            SessionEvent::DesktopNotification { title, body } => {
+                self.handle_desktop_notification(&title, &body);
+            }
+            SessionEvent::ColorChange {
+                route_id: _worker_route_id,
+                index,
+                color,
+            } => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    if let Some(context) = route
+                        .window
+                        .screen
+                        .context_manager
+                        .get_by_route_id(route_id)
+                    {
+                        use crate::context::renderable::BackgroundState;
+                        if index == NamedColor::Foreground as u16 + 1 {
+                            context.renderable_content.background = Some(match color {
+                                Some([r, g, b]) => {
+                                    BackgroundState::Set(ColorRgb { r, g, b }.to_wgpu())
+                                }
+                                None => BackgroundState::Reset,
+                            });
+                        }
+                        context
+                            .renderable_content
+                            .pending_update
+                            .set_terminal_damage(
+                                rio_backend::event::TerminalDamage::Full,
+                            );
+                    }
+                    route.request_redraw();
+                }
+            }
+            SessionEvent::RequestRefused {
+                request_id,
+                kind,
+                reason,
+            } => {
+                self.show_session_error(
+                    window_id,
+                    route_id,
+                    format!(
+                        "terminal request {request_id} ({kind:?}) refused: {reason:?}"
+                    ),
+                );
+            }
+            SessionEvent::RequestExpired { request_id, kind } => {
+                self.show_session_error(
+                    window_id,
+                    route_id,
+                    format!("terminal request {request_id} ({kind:?}) expired"),
+                );
+            }
+            SessionEvent::Closed => {
+                self.close_terminal_at(event_loop, window_id, route_id);
+            }
+        }
+    }
+
+    fn send_session_command(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        route_id: usize,
+        command: SessionCommand,
+    ) {
+        let Some(route) = self.router.routes.get_mut(&window_id) else {
+            return;
+        };
+        let Some(context) = route
+            .window
+            .screen
+            .context_manager
+            .get_by_route_id(route_id)
+        else {
+            return;
+        };
+        let result = context
+            .terminal
+            .lock()
+            .session()
+            .map(|session| session.enqueue(command));
+        if let Some(Err(error)) = result {
+            context.renderable_content.session_error = Some(error.to_string());
+            context
+                .renderable_content
+                .pending_update
+                .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+        }
+    }
+
+    fn show_session_error(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        route_id: usize,
+        error: String,
+    ) {
+        if let Some(route) = self.router.routes.get_mut(&window_id) {
+            if let Some(context) = route
+                .window
+                .screen
+                .context_manager
+                .get_by_route_id(route_id)
+            {
+                context.renderable_content.session_error = Some(error);
+                context
+                    .renderable_content
+                    .pending_update
+                    .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
+            }
+            route.request_redraw();
+        }
+    }
+}
+
+impl ApplicationHandler<EventPayload> for Application<'_> {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        Application::resumed(self, event_loop);
+    }
+
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        Application::new_events(self, event_loop, cause);
+    }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: EventPayload) {
         let target = event.target.clone();
@@ -1769,18 +4431,44 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
         }) {
             return;
         }
+        // Prepared attachments must produce their first frame before commit,
+        // even when the source window covers the destination.
+        let preparing_session = self
+            .pending_prepared
+            .iter()
+            .any(|pending| pending.window_id == window_id);
+        if preparing_session
+            && matches!(
+                &event.payload,
+                RioEventType::Rio(RioEvent::Render | RioEvent::RenderRoute(_))
+            )
+        {
+            if let Some(route) = self.router.routes.get_mut(&window_id) {
+                let ready = route.window.screen.prepare_session_imports();
+                tracing::info!(
+                    window_id = ?window_id,
+                    ready_routes = ?ready,
+                    "prepared pending session imports"
+                );
+                if !ready.is_empty() {
+                    self.ready_session_imports.push((window_id, ready));
+                }
+            }
+        }
         match event.payload {
             RioEventType::Rio(RioEvent::Render) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
                     // Skip rendering for unfocused windows if configured
-                    if self.config.renderer.disable_unfocused_render
+                    if !preparing_session
+                        && self.config.renderer.disable_unfocused_render
                         && !route.window.is_focused
                     {
                         return;
                     }
 
                     // Skip rendering for occluded windows if configured, unless we need to render after occlusion
-                    if self.config.renderer.disable_occluded_render
+                    if !preparing_session
+                        && self.config.renderer.disable_occluded_render
                         && route.window.is_occluded
                         && !route.window.needs_render_after_occlusion
                     {
@@ -1796,10 +4484,16 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             RioEventType::Rio(RioEvent::RenderRoute(route_id)) => {
+                // SessionPump delivers all worker-originated events through
+                // the existing route wakeup. Drain them before applying the
+                // render throttling policy so callback requests are answered
+                // even for an unfocused or occluded pane.
+                self.process_session_events(event_loop, window_id, route_id);
                 if self.config.renderer.strategy.is_event_based() {
                     if let Some(route) = self.router.routes.get_mut(&window_id) {
                         // Skip rendering for unfocused windows if configured
-                        if self.config.renderer.disable_unfocused_render
+                        if !preparing_session
+                            && self.config.renderer.disable_unfocused_render
                             && !route.window.is_focused
                         {
                             if route.window.screen.renderer.scrollbar.needs_redraw() {
@@ -1809,7 +4503,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         }
 
                         // Skip rendering for occluded windows if configured, unless we need to render after occlusion
-                        if self.config.renderer.disable_occluded_render
+                        if !preparing_session
+                            && self.config.renderer.disable_occluded_render
                             && route.window.is_occluded
                             && !route.window.needs_render_after_occlusion
                         {
@@ -2069,31 +4764,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             RioEventType::Rio(RioEvent::GlyphProtocolQuery { route_id, cp }) => {
-                if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    use rio_backend::ansi::glyph_protocol::{
-                        format_query_response, QueryStatus,
-                    };
-                    let library = route.window.screen.sugarloaf.font_library();
-                    let in_glossary = library
-                        .glyph_registry_for(route_id)
-                        .is_some_and(|r| r.contains(cp));
-                    let in_system = library.covers_codepoint(cp);
-                    let status = match (in_glossary, in_system) {
-                        (true, true) => QueryStatus::Both,
-                        (true, false) => QueryStatus::Glossary,
-                        (false, true) => QueryStatus::System,
-                        (false, false) => QueryStatus::Free,
-                    };
-                    let resp = format_query_response(cp, status);
-                    if let Some(context) = route
-                        .window
-                        .screen
-                        .context_manager
-                        .get_by_route_id(route_id)
-                    {
-                        context.messenger.send_bytes(resp.into_bytes());
-                    }
-                }
+                tracing::warn!(
+                    route_id,
+                    cp,
+                    "ignored legacy glyph query; session workers use SessionEvent::GlyphProtocolQuery"
+                );
             }
             RioEventType::Rio(RioEvent::CloseTerminal(route_id)) => {
                 #[cfg(all(feature = "wayland", target_os = "linux"))]
@@ -2252,25 +4927,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 clipboard_type,
                 format,
             )) => {
-                let Router {
-                    routes, clipboard, ..
-                } = &mut self.router;
-                if let Some(route) = routes.get_mut(&window_id) {
-                    if route.window.is_focused {
-                        let text = format(clipboard.get(clipboard_type).as_str());
-                        // Route the paste back to the panel that asked for it
-                        // (OSC 52 reply), not whichever panel happens to be
-                        // focused now.
-                        if let Some(context) = route
-                            .window
-                            .screen
-                            .context_manager
-                            .get_by_route_id(route_id)
-                        {
-                            context.messenger.send_bytes(text.into_bytes());
-                        }
-                    }
-                }
+                let _ = (route_id, clipboard_type, format, window_id);
+                tracing::warn!(
+                    "ignored legacy clipboard request; session workers use SessionEvent"
+                );
             }
             RioEventType::Rio(RioEvent::ClipboardStore(clipboard_type, content)) => {
                 let Router {
@@ -2283,68 +4943,22 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             RioEventType::Rio(RioEvent::PtyWrite(route_id, text)) => {
-                if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    // Route reply bytes (CSI / OSC responses) back to the
-                    // PTY of the panel that emitted them, not whichever
-                    // panel happens to be focused.
-                    if let Some(context) = route
-                        .window
-                        .screen
-                        .context_manager
-                        .get_by_route_id(route_id)
-                    {
-                        context.messenger.send_bytes(text.into_bytes());
-                    }
-                }
+                let _ = (route_id, text, window_id);
+                tracing::warn!(
+                    "ignored legacy PTY reply; session workers own terminal responses"
+                );
             }
             RioEventType::Rio(RioEvent::TextAreaSizeRequest(route_id, format)) => {
-                if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    if let Some(context) = route
-                        .window
-                        .screen
-                        .context_manager
-                        .get_by_route_id(route_id)
-                    {
-                        let dimension = context.dimension;
-                        let text = format(crate::renderer::utils::terminal_dimensions(
-                            &dimension,
-                        ));
-                        context.messenger.send_bytes(text.into_bytes());
-                    }
-                }
+                let _ = (route_id, format, window_id);
+                tracing::warn!(
+                    "ignored legacy size request; session workers use SessionEvent"
+                );
             }
             RioEventType::Rio(RioEvent::ColorRequest(route_id, index, format)) => {
-                if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    // Read the originating panel's terminal colors and
-                    // route the reply back to that same panel — color
-                    // theme overrides via OSC 4 / OSC 10-19 are
-                    // per-context, so reading from `current()` would
-                    // mis-report when the user has focused a different
-                    // split mid-flight.
-                    let renderer_color = route.window.screen.renderer.colors[index];
-                    let Some(context) = route
-                        .window
-                        .screen
-                        .context_manager
-                        .get_by_route_id(route_id)
-                    else {
-                        return;
-                    };
-                    let terminal = context.terminal.lock();
-                    let color: ColorRgb = match terminal.colors()[index] {
-                        Some(color) => ColorRgb::from_color_arr(color),
-                        // Ignore cursor color requests unless it was changed.
-                        None if index
-                            == crate::crosswords::NamedColor::Cursor as usize =>
-                        {
-                            return
-                        }
-                        None => ColorRgb::from_color_arr(renderer_color),
-                    };
-                    drop(terminal);
-
-                    context.messenger.send_bytes(format(color).into_bytes());
-                }
+                let _ = (route_id, index, format, window_id);
+                tracing::warn!(
+                    "ignored legacy color request; session workers use SessionEvent"
+                );
             }
             RioEventType::Rio(RioEvent::CreateWindow) => {
                 self.router.create_window(
@@ -2370,21 +4984,28 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 let _ = self.move_tab_to_new_window(event_loop, window_id, tab_id);
             }
             RioEventType::Rio(RioEvent::MergeWindow) => {
-                self.clear_merge_window();
-                if self.router.routes.get(&window_id).is_some_and(|route| {
-                    route.path == RoutePath::Terminal
-                        && !route.window.screen.context_manager.is_empty()
-                }) {
-                    if let Some(route) = self.router.routes.get_mut(&window_id) {
-                        let index = route.window.screen.context_manager.current_index();
-                        route.window.screen.set_transfer_source_marker(index);
-                    }
-                    self.set_window_overlay(
-                        window_id,
-                        Some(crate::renderer::WindowOverlay::MergeSource),
-                    );
-                    self.merge_window_source = Some(window_id);
+                let selected_recovery_target = self
+                    .router
+                    .routes
+                    .get_mut(&window_id)
+                    .and_then(|route| route.window.screen.take_recovery_target());
+                if let Some(target_index) = selected_recovery_target {
+                    let _ = self.select_recovery_target(window_id, target_index);
+                    return;
                 }
+                let recovery_requested =
+                    self.router.routes.get_mut(&window_id).is_some_and(|route| {
+                        route.window.screen.take_recovery_action_request()
+                    });
+                self.clear_merge_window();
+                if recovery_requested {
+                    let _ = self.begin_recovery_action(window_id);
+                    return;
+                }
+                if !self.arm_merge_source(window_id) {
+                    return;
+                }
+                let _ = self.begin_merge_window_action(window_id);
             }
             RioEventType::Rio(RioEvent::ToggleQuake) => {
                 self.toggle_quake_window(event_loop);
@@ -2433,10 +5054,17 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         self.scheduler.unschedule_window(route_id);
                     }
                 }
+                let closing_sessions = self
+                    .router
+                    .routes
+                    .get(&window_id)
+                    .map(|route| route.window.screen.context_manager.session_handles())
+                    .unwrap_or_default();
                 self.clear_merge_if_window(window_id);
+                self.pending_session_closes.extend(closing_sessions);
                 self.router.remove_route(window_id);
                 if self.router.routes.is_empty() && !self.config.confirm_before_quit {
-                    event_loop.exit();
+                    self.defer_exit_until_session_closes();
                 }
             }
             #[cfg(target_os = "macos")]
@@ -2632,6 +5260,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
         // core's `WindowId`. Convert once at this boundary.
         let window_id: rio_backend::event::WindowId = window_id.into();
 
+        if self.handle_armed_merge_window_event(window_id, &event) {
+            return;
+        }
+
         if matches!(
             &event,
             WindowEvent::MouseInput {
@@ -2661,6 +5293,28 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
         if let WindowEvent::CursorMoved { position, .. } = &event {
             self.update_merge_target(window_id, *position);
+        }
+
+        // Escape normally belongs to the command palette. Once native merge
+        // targeting is armed, it must also cancel the authenticated target so
+        // the palette cannot hide while the remote overlay remains active.
+        let escape_pressed = matches!(
+            &event,
+            WindowEvent::KeyboardInput {
+                event: key_event,
+                ..
+            } if key_event.state == ElementState::Pressed
+                && key_event.logical_key
+                    == rio_window::keyboard::Key::Named(
+                        rio_window::keyboard::NamedKey::Escape,
+                    )
+        );
+        if escape_pressed && self.merge_state_uses_window(window_id) {
+            self.clear_merge_window();
+            if let Some(route) = self.router.routes.get_mut(&window_id) {
+                route.request_redraw();
+            }
+            return;
         }
 
         let route = match self.router.routes.get_mut(&window_id) {
@@ -3146,6 +5800,26 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                #[cfg(all(feature = "wayland", target_os = "linux"))]
+                if route.path == RoutePath::Terminal
+                    && route.window.screen.mouse.left_button_state.is_pressed()
+                    && route
+                        .window
+                        .screen
+                        .renderer
+                        .island
+                        .as_ref()
+                        .is_some_and(|island| island.is_dragging())
+                {
+                    let size = route.window.winit_window.inner_size();
+                    if pointer_outside_surface(position, size) {
+                        // Wayland's implicit button grab suppresses Leave until
+                        // release. Start DnD from out-of-surface motion while the
+                        // press serial is still valid, before clamping positions.
+                        self.start_external_drag(event_loop, window_id);
+                        return;
+                    }
+                }
                 if self.config.hide_cursor_when_typing {
                     route.window.winit_window.set_cursor_visible(true);
                 }
@@ -3309,12 +5983,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         .screen
                         .context_manager
                         .current_grid_mut()
-                        .resize_border(
-                            &border,
-                            original_sizes,
-                            delta,
-                            &mut route.window.screen.sugarloaf,
-                        );
+                        .resize_border(&border, original_sizes, delta);
                     // Dragging a split divider displaces panel origins;
                     // that is layout, not cursor travel.
                     route.window.screen.renderer.trail_cursor.snap();
@@ -3760,6 +6429,12 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             }
                         }
 
+                        let ready_imports =
+                            route.window.screen.take_ready_session_imports();
+                        if !ready_imports.is_empty() {
+                            self.ready_session_imports.push((window_id, ready_imports));
+                        }
+
                         // Update IME cursor position after rendering to ensure it's current
                         route.window.screen.update_ime_cursor_position_if_needed(
                             &route.window.winit_window,
@@ -3811,6 +6486,37 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_window_control();
+
+        if self.poll_deferred_session_exit(event_loop) {
+            return;
+        }
+
+        // Transferred contexts were disarmed before removal: exiting the GUI
+        // must not send Close to their workers. Bootstrap windows remain routes.
+        if self.exit_after_transfer {
+            tracing::info!(
+                windows = self.router.routes.len(),
+                pending_prepared = self.pending_prepared.len(),
+                pending_outgoing = self.pending_outgoing.len(),
+                session_preparations =
+                    std::sync::Arc::strong_count(&self.session_preparations),
+                "checking transferred GUI exit"
+            );
+        }
+        if transfer_exit_ready(
+            self.exit_after_transfer,
+            self.router.routes.len(),
+            self.pending_prepared.len()
+                + self.pending_outgoing.len()
+                + std::sync::Arc::strong_count(&self.session_preparations)
+                - 1,
+            crate::WINDOW_BOOTSTRAP.lock().unwrap().is_some(),
+        ) {
+            event_loop.exit();
+            return;
+        }
+
         #[cfg(all(feature = "wayland", target_os = "linux"))]
         if self
             .tab_drag_detach_deadline
@@ -3826,7 +6532,12 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
         }
 
-        let scheduler_deadline = self.scheduler.update();
+        let scheduler_deadline = self
+            .scheduler
+            .update()
+            .into_iter()
+            .chain(self.pending_prepared.iter().map(|pending| pending.deadline))
+            .min();
         #[cfg(all(feature = "wayland", target_os = "linux"))]
         let detach_deadline = self.tab_drag_detach_deadline;
         #[cfg(not(all(feature = "wayland", target_os = "linux")))]

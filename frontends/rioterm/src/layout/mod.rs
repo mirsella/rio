@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod compute_tests;
 
+use crate::context::session::SessionHandle;
 use crate::context::Context;
 use crate::mouse::Mouse;
 use rio_backend::config::layout::Margin;
@@ -30,6 +31,10 @@ impl TabId {
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("TabId counter exhausted");
         Self(id)
+    }
+
+    pub fn value(self) -> usize {
+        self.0
     }
 
     #[cfg(test)]
@@ -169,6 +174,114 @@ impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
     }
 }
 
+fn build_layout_node(
+    tree: &mut TaffyTree<()>,
+    node: &crate::router::window_control::LayoutNodeOffer,
+    panel_style: &Style,
+    panel_config: &rio_backend::config::layout::Panel,
+    scale: f32,
+    pane_rects: &FxHashMap<u64, [f32; 4]>,
+    parent_direction: Option<taffy::FlexDirection>,
+    leaves: &mut Vec<(u64, NodeId)>,
+) -> Result<NodeId, String> {
+    let flex_grow = offered_flex_grow(node, pane_rects, parent_direction);
+    if node.children.is_empty() {
+        let mut style = panel_style.clone();
+        style.flex_grow = flex_grow;
+        let panel_node = tree
+            .new_leaf(style)
+            .map_err(|error| format!("create transfer panel: {error}"))?;
+        leaves.push((node.route_id, panel_node));
+        return Ok(panel_node);
+    }
+    let direction = match node.direction {
+        Some(crate::router::window_control::LayoutDirection::Horizontal) => {
+            taffy::FlexDirection::Row
+        }
+        Some(crate::router::window_control::LayoutDirection::Vertical) => {
+            taffy::FlexDirection::Column
+        }
+        None => return Err("transfer layout container has no direction".into()),
+    };
+    let container_style = Style {
+        display: Display::Flex,
+        flex_direction: direction,
+        flex_grow,
+        flex_shrink: 1.0,
+        gap: geometry::Size {
+            width: length(panel_config.column_gap * scale),
+            height: length(panel_config.row_gap * scale),
+        },
+        ..Default::default()
+    };
+    let container = tree
+        .new_leaf(container_style)
+        .map_err(|error| format!("create transfer split: {error}"))?;
+    for child in &node.children {
+        let child = build_layout_node(
+            tree,
+            child,
+            panel_style,
+            panel_config,
+            scale,
+            pane_rects,
+            Some(direction),
+            leaves,
+        )?;
+        tree.add_child(container, child)
+            .map_err(|error| format!("attach transfer split: {error}"))?;
+    }
+    Ok(container)
+}
+
+fn offered_bounds(
+    node: &crate::router::window_control::LayoutNodeOffer,
+    pane_rects: &FxHashMap<u64, [f32; 4]>,
+) -> Option<[f32; 4]> {
+    if node.children.is_empty() {
+        return pane_rects.get(&node.route_id).copied();
+    }
+
+    let mut bounds: Option<[f32; 4]> = None;
+    for child in &node.children {
+        let [left, top, width, height] = offered_bounds(child, pane_rects)?;
+        let right = left + width;
+        let bottom = top + height;
+        bounds = Some(match bounds {
+            Some([min_left, min_top, max_right, max_bottom]) => [
+                min_left.min(left),
+                min_top.min(top),
+                max_right.max(right),
+                max_bottom.max(bottom),
+            ],
+            None => [left, top, right, bottom],
+        });
+    }
+    bounds.map(|[left, top, right, bottom]| [left, top, right - left, bottom - top])
+}
+
+fn offered_flex_grow(
+    node: &crate::router::window_control::LayoutNodeOffer,
+    pane_rects: &FxHashMap<u64, [f32; 4]>,
+    parent_direction: Option<taffy::FlexDirection>,
+) -> f32 {
+    let Some(direction) = parent_direction else {
+        return node.flex_grow;
+    };
+    let Some([_, _, width, height]) = offered_bounds(node, pane_rects) else {
+        return node.flex_grow;
+    };
+    let size = match direction {
+        taffy::FlexDirection::Row | taffy::FlexDirection::RowReverse => width,
+        taffy::FlexDirection::Column | taffy::FlexDirection::ColumnReverse => height,
+    };
+    if size.is_finite() && size > 0.0 {
+        size
+    } else {
+        node.flex_grow
+    }
+}
+
 impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     pub fn new(
         context: Context<T>,
@@ -271,6 +384,253 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             self.inner.values().map(|item| item.val.route_id).collect();
         route_ids.sort_unstable();
         route_ids
+    }
+
+    pub fn owns_session_id(&self, session_id: rio_session::protocol::SessionId) -> bool {
+        self.inner.values().any(|item| {
+            item.val
+                .terminal
+                .lock()
+                .session()
+                .and_then(crate::context::session::SessionHandle::descriptor)
+                .is_some_and(|descriptor| descriptor.session_id == session_id)
+        })
+    }
+
+    pub fn transfer_parts(
+        &self,
+    ) -> Result<
+        (
+            Vec<crate::router::window_control::PaneOffer>,
+            crate::router::window_control::TabOffer,
+        ),
+        String,
+    > {
+        let panes = self
+            .get_ordered_keys()
+            .into_iter()
+            .filter_map(|node| self.inner.get(&node))
+            .map(|item| {
+                let session = item
+                    .val
+                    .terminal
+                    .lock()
+                    .session()
+                    .and_then(crate::context::session::SessionHandle::descriptor)
+                    .ok_or_else(|| "session is not ready for transfer".to_string())?;
+                Ok::<_, String>(crate::router::window_control::PaneOffer {
+                    route_id: item.val.route_id as u64,
+                    tab_id: self.id.value() as u64,
+                    layout_rect: item.layout_rect,
+                    session,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
+            panes,
+            crate::router::window_control::TabOffer {
+                tab_id: self.id.value() as u64,
+                layout: self.layout_offer()?,
+                active_route: self.current().route_id as u64,
+            },
+        ))
+    }
+
+    pub fn layout_offer(
+        &self,
+    ) -> Result<crate::router::window_control::LayoutNodeOffer, String> {
+        let children = self
+            .tree
+            .children(self.root_node)
+            .map_err(|error| format!("read transfer layout root: {error}"))?;
+        let root = children
+            .first()
+            .copied()
+            .ok_or_else(|| "transfer layout root has no panel".to_string())?;
+        self.layout_offer_node(root)
+    }
+
+    fn layout_offer_node(
+        &self,
+        node: NodeId,
+    ) -> Result<crate::router::window_control::LayoutNodeOffer, String> {
+        let children = self
+            .tree
+            .children(node)
+            .map_err(|error| format!("read transfer layout node: {error}"))?;
+        let style = self
+            .tree
+            .style(node)
+            .map_err(|error| format!("read transfer layout style: {error}"))?;
+        if children.is_empty() {
+            let route_id = self
+                .inner
+                .get(&node)
+                .map(|item| item.val.route_id as u64)
+                .ok_or_else(|| "transfer layout leaf is not a pane".to_string())?;
+            return Ok(crate::router::window_control::LayoutNodeOffer {
+                route_id,
+                direction: None,
+                flex_grow: style.flex_grow,
+                children: Vec::new(),
+            });
+        }
+
+        let direction = match style.flex_direction {
+            taffy::FlexDirection::Row | taffy::FlexDirection::RowReverse => {
+                crate::router::window_control::LayoutDirection::Horizontal
+            }
+            taffy::FlexDirection::Column | taffy::FlexDirection::ColumnReverse => {
+                crate::router::window_control::LayoutDirection::Vertical
+            }
+        };
+        let children = children
+            .into_iter()
+            .map(|child| self.layout_offer_node(child))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::router::window_control::LayoutNodeOffer {
+            route_id: 0,
+            direction: Some(direction),
+            flex_grow: style.flex_grow,
+            children,
+        })
+    }
+
+    pub fn from_layout_offer(
+        contexts: Vec<Context<T>>,
+        layout: &crate::router::window_control::LayoutNodeOffer,
+        active_route: u64,
+        route_map: &FxHashMap<u64, usize>,
+        pane_rects: &FxHashMap<u64, [f32; 4]>,
+        scaled_margin: Margin,
+        border_color: [f32; 4],
+        _border_active_color: [f32; 4],
+        panel_config: rio_backend::config::layout::Panel,
+    ) -> Result<Self, (Vec<Context<T>>, String)> {
+        let Some(first) = contexts.first() else {
+            return Err((contexts, "transfer layout has no contexts".into()));
+        };
+        let width = first.dimension.width;
+        let height = first.dimension.height;
+        let scale = first.dimension.dimension.scale;
+        let available_width = width - scaled_margin.left - scaled_margin.right;
+        let available_height = height - scaled_margin.top - scaled_margin.bottom;
+        let root_style = Style {
+            display: Display::Flex,
+            gap: geometry::Size {
+                width: length(panel_config.column_gap * scale),
+                height: length(panel_config.row_gap * scale),
+            },
+            size: geometry::Size {
+                width: length(available_width),
+                height: length(available_height),
+            },
+            ..Default::default()
+        };
+        let panel_style = Style {
+            display: Display::Flex,
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            padding: geometry::Rect {
+                left: length(panel_config.padding.left * scale),
+                right: length(panel_config.padding.right * scale),
+                top: length(panel_config.padding.top * scale),
+                bottom: length(panel_config.padding.bottom * scale),
+            },
+            margin: geometry::Rect {
+                left: length(panel_config.margin.left * scale),
+                right: length(panel_config.margin.right * scale),
+                top: length(panel_config.margin.top * scale),
+                bottom: length(panel_config.margin.bottom * scale),
+            },
+            ..Default::default()
+        };
+        let mut tree = TaffyTree::new();
+        let root_node = match tree.new_leaf(root_style) {
+            Ok(node) => node,
+            Err(error) => {
+                return Err((contexts, format!("create transfer layout root: {error}")))
+            }
+        };
+        let mut leaves = Vec::new();
+        let panel_node = match build_layout_node(
+            &mut tree,
+            layout,
+            &panel_style,
+            &panel_config,
+            scale,
+            pane_rects,
+            None,
+            &mut leaves,
+        ) {
+            Ok(node) => node,
+            Err(error) => return Err((contexts, error)),
+        };
+        if let Err(error) = tree.add_child(root_node, panel_node) {
+            return Err((contexts, format!("attach transfer layout root: {error}")));
+        }
+        let mut contexts = contexts.into_iter();
+        let mut by_route = FxHashMap::default();
+        while let Some(context) = contexts.next() {
+            by_route.insert(context.route_id, context);
+        }
+        let mut inner = FxHashMap::default();
+        for (route_id, node) in leaves {
+            let Some(target_route) = route_map.get(&route_id).copied() else {
+                return Err((
+                    by_route.into_values().collect(),
+                    format!("transfer layout has no target route for {route_id}"),
+                ));
+            };
+            let Some(context) = by_route.remove(&target_route) else {
+                return Err((
+                    by_route.into_values().collect(),
+                    format!("transfer layout has no context for route {route_id}"),
+                ));
+            };
+            inner.insert(node, ContextGridItem::new(context));
+        }
+        if !by_route.is_empty() {
+            return Err((
+                by_route.into_values().collect(),
+                "transfer layout has unused contexts".into(),
+            ));
+        }
+        let Some(current) = inner.iter().find_map(|(node, item)| {
+            route_map
+                .get(&active_route)
+                .is_some_and(|route| item.val.route_id == *route)
+                .then_some(*node)
+        }) else {
+            let contexts = inner.into_values().map(|item| item.val).collect();
+            return Err((contexts, "transfer layout active route is missing".into()));
+        };
+        let root = inner.keys().next().copied();
+        let border_config = BorderConfig {
+            width: panel_config.border_width,
+            color: border_color,
+        };
+        let mut grid = Self {
+            id: TabId::next(),
+            width,
+            height,
+            current,
+            scaled_margin,
+            custom_title: None,
+            custom_color: None,
+            scale,
+            inner,
+            root,
+            panel_config,
+            tree,
+            root_node,
+            border_config,
+        };
+        if !grid.apply_taffy_layout() {
+            let contexts = grid.inner.into_values().map(|item| item.val).collect();
+            return Err((contexts, "apply transfer layout failed".into()));
+        }
+        Ok(grid)
     }
 
     /// Reassign every split in this grid to a new owning window.
@@ -944,19 +1304,16 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             item.val.dimension.update_width(width);
             item.val.dimension.update_height(height);
 
-            // Update terminal size
-            let mut terminal = item.val.terminal.lock();
-            terminal.resize::<ContextDimension>(item.val.dimension);
-            drop(terminal);
-
             let winsize =
                 crate::renderer::utils::terminal_dimensions(&item.val.dimension);
-            let _ = item.val.messenger.send_resize(winsize);
+            item.val.terminal.lock().resize_to(winsize);
 
-            // The reflow damages the Crosswords, but the present gate reads
-            // `pending_update.is_dirty()` and skips the panel before reading
-            // that. Mark it dirty so an idle terminal still presents.
-            item.val.renderable_content.pending_update.set_dirty();
+            // The worker publishes a replacement frame after resize; keep
+            // the panel eligible for the next passive frame.
+            item.val
+                .renderable_content
+                .pending_update
+                .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
         }
         true
     }
@@ -964,6 +1321,12 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     #[inline]
     pub fn contexts_mut(&mut self) -> &mut FxHashMap<NodeId, ContextGridItem<T>> {
         &mut self.inner
+    }
+
+    pub fn session_handles(&self) -> impl Iterator<Item = SessionHandle> + '_ {
+        self.inner
+            .values()
+            .filter_map(|item| item.val.terminal.lock().session().cloned())
     }
 
     /// Get contexts ordered by visual position (top-to-bottom, left-to-right)
@@ -1451,219 +1814,90 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
     }
 
-    pub fn move_divider_up(&mut self, amount: f32) -> bool {
+    fn move_divider(
+        &mut self,
+        amount: f32,
+        direction: BorderDirection,
+        first_grows_when_current_is_second: bool,
+    ) -> bool {
         if self.len() <= 1 {
             return false;
         }
 
-        let current_node = self.current;
+        let current = self.current;
+        let neighbors = match direction {
+            BorderDirection::Vertical => self.find_horizontal_neighbors(current),
+            BorderDirection::Horizontal => self.find_vertical_neighbors(current),
+        };
+        let Some((first, second)) = neighbors else {
+            return false;
+        };
+        let Some(first_layout) = self.tree.layout(first).ok() else {
+            return false;
+        };
+        let Some(second_layout) = self.tree.layout(second).ok() else {
+            return false;
+        };
 
-        // Find vertically adjacent panels - returns (top_node, bottom_node)
-        if let Some((top_node, bottom_node)) = self.find_vertical_neighbors(current_node)
-        {
-            // Get current sizes
-            let top_layout = match self.tree.layout(top_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-            let bottom_layout = match self.tree.layout(bottom_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-
-            let min_height = 50.0;
-
-            // Determine which panel to shrink based on which one is current
-            let new_top_height;
-            let new_bottom_height;
-
-            if current_node == bottom_node {
-                // Current is bottom: shrink bottom, expand top (divider moves up)
-                new_bottom_height = bottom_layout.size.height - amount;
-                new_top_height = top_layout.size.height + amount;
-            } else {
-                // Current is top: shrink top, expand bottom (divider moves up)
-                new_top_height = top_layout.size.height - amount;
-                new_bottom_height = bottom_layout.size.height + amount;
+        let first_delta = if (current == second) == first_grows_when_current_is_second {
+            amount
+        } else {
+            -amount
+        };
+        let (first_size, second_size, min_size) = match direction {
+            BorderDirection::Vertical => {
+                (first_layout.size.width, second_layout.size.width, 100.0)
             }
-
-            if new_top_height < min_height || new_bottom_height < min_height {
-                return false;
+            BorderDirection::Horizontal => {
+                (first_layout.size.height, second_layout.size.height, 50.0)
             }
-
-            // Update panel sizes using flex_basis
-            let _ = self.set_panel_size(top_node, None, Some(new_top_height));
-            let _ = self.set_panel_size(bottom_node, None, Some(new_bottom_height));
-
-            // Apply layout and update all contexts
-            return self.apply_taffy_layout();
+        };
+        let new_first_size = first_size + first_delta;
+        let new_second_size = second_size - first_delta;
+        if new_first_size < min_size || new_second_size < min_size {
+            return false;
         }
 
-        false
+        match direction {
+            BorderDirection::Vertical => {
+                let _ = self.set_panel_size(first, Some(new_first_size), None);
+                let _ = self.set_panel_size(second, Some(new_second_size), None);
+            }
+            BorderDirection::Horizontal => {
+                let _ = self.set_panel_size(first, None, Some(new_first_size));
+                let _ = self.set_panel_size(second, None, Some(new_second_size));
+            }
+        }
+        self.apply_taffy_layout()
+    }
+
+    pub fn move_divider_up(&mut self, amount: f32) -> bool {
+        self.move_divider(amount, BorderDirection::Horizontal, true)
     }
 
     pub fn move_divider_down(&mut self, amount: f32) -> bool {
-        if self.len() <= 1 {
-            return false;
-        }
-
-        let current_node = self.current;
-
-        // Find vertically adjacent panels - returns (top_node, bottom_node)
-        if let Some((top_node, bottom_node)) = self.find_vertical_neighbors(current_node)
-        {
-            // Get current sizes
-            let top_layout = match self.tree.layout(top_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-            let bottom_layout = match self.tree.layout(bottom_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-
-            let min_height = 50.0;
-
-            // Determine which panel to expand based on which one is current
-            let new_top_height;
-            let new_bottom_height;
-
-            if current_node == bottom_node {
-                // Current is bottom: expand bottom, shrink top (divider moves down)
-                new_bottom_height = bottom_layout.size.height + amount;
-                new_top_height = top_layout.size.height - amount;
-            } else {
-                // Current is top: expand top, shrink bottom (divider moves down)
-                new_top_height = top_layout.size.height + amount;
-                new_bottom_height = bottom_layout.size.height - amount;
-            }
-
-            if new_top_height < min_height || new_bottom_height < min_height {
-                return false;
-            }
-
-            // Update panel sizes using flex_basis
-            let _ = self.set_panel_size(top_node, None, Some(new_top_height));
-            let _ = self.set_panel_size(bottom_node, None, Some(new_bottom_height));
-
-            // Apply layout and update all contexts
-            return self.apply_taffy_layout();
-        }
-
-        false
+        self.move_divider(amount, BorderDirection::Horizontal, false)
     }
 
     pub fn move_divider_left(&mut self, amount: f32) -> bool {
-        if self.len() <= 1 {
-            return false;
-        }
-
-        let current_node = self.current;
-
-        // Find horizontally adjacent panels - returns (left_node, right_node)
-        if let Some((left_node, right_node)) =
-            self.find_horizontal_neighbors(current_node)
-        {
-            // Get current sizes
-            let left_layout = match self.tree.layout(left_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-            let right_layout = match self.tree.layout(right_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-
-            let min_width = 100.0;
-
-            // Determine which panel to shrink based on which one is current
-            let new_left_width;
-            let new_right_width;
-
-            if current_node == right_node {
-                // Current is right: shrink right, expand left (divider moves left)
-                new_right_width = right_layout.size.width - amount;
-                new_left_width = left_layout.size.width + amount;
-            } else {
-                // Current is left: shrink left, expand right (divider moves left)
-                new_left_width = left_layout.size.width - amount;
-                new_right_width = right_layout.size.width + amount;
-            }
-
-            if new_left_width < min_width || new_right_width < min_width {
-                return false;
-            }
-
-            // Update panel sizes using flex_basis
-            let _ = self.set_panel_size(left_node, Some(new_left_width), None);
-            let _ = self.set_panel_size(right_node, Some(new_right_width), None);
-
-            // Apply layout and update all contexts
-            return self.apply_taffy_layout();
-        }
-
-        false
+        self.move_divider(amount, BorderDirection::Vertical, true)
     }
 
     pub fn move_divider_right(&mut self, amount: f32) -> bool {
-        if self.len() <= 1 {
-            return false;
-        }
-
-        let current_node = self.current;
-
-        // Find horizontally adjacent panels - returns (left_node, right_node)
-        if let Some((left_node, right_node)) =
-            self.find_horizontal_neighbors(current_node)
-        {
-            // Get current sizes
-            let left_layout = match self.tree.layout(left_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-            let right_layout = match self.tree.layout(right_node).ok() {
-                Some(layout) => layout,
-                None => return false,
-            };
-
-            let min_width = 100.0;
-
-            // Determine which panel to expand based on which one is current
-            let new_left_width;
-            let new_right_width;
-
-            if current_node == right_node {
-                // Current is right: expand right, shrink left (divider moves right)
-                new_right_width = right_layout.size.width + amount;
-                new_left_width = left_layout.size.width - amount;
-            } else {
-                // Current is left: expand left, shrink right (divider moves right)
-                new_left_width = left_layout.size.width + amount;
-                new_right_width = right_layout.size.width - amount;
-            }
-
-            if new_left_width < min_width || new_right_width < min_width {
-                return false;
-            }
-
-            // Update panel sizes using flex_basis
-            let _ = self.set_panel_size(left_node, Some(new_left_width), None);
-            let _ = self.set_panel_size(right_node, Some(new_right_width), None);
-
-            // Apply layout and update all contexts
-            return self.apply_taffy_layout();
-        }
-
-        false
+        self.move_divider(amount, BorderDirection::Vertical, false)
     }
 
-    /// Drop image overlays for every panel in the grid. Used on tab
-    /// teardown — the panels themselves go away with the
-    /// `ContextManager`; only the kitty graphics state needs an
-    /// explicit cleanup signal.
+    /// Clear image overlays without dropping the image data, used when a
+    /// tab or split is hidden.
     #[inline]
-    /// Release everything this grid's panels hold in sugarloaf: image
-    /// overlays and the images they drew.
+    pub fn clear_image_overlays(&self, sugarloaf: &mut Sugarloaf) {
+        for item in self.inner.values() {
+            sugarloaf.clear_image_overlays_for(item.val.rich_text_id);
+        }
+    }
+
+    /// Drop image overlays and image data for every panel in the grid.
+    #[inline]
     pub fn remove_from_sugarloaf(&self, sugarloaf: &mut Sugarloaf) {
         for item in self.inner.values() {
             sugarloaf.clear_image_overlays_for(item.val.rich_text_id);

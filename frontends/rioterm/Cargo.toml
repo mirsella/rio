@@ -17,12 +17,14 @@ name = "rio"
 path = "src/main.rs"
 
 [dependencies]
+bincode = "2.0.1"
 global-hotkey = "0.8.0"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry"] }
 wgpu = { workspace = true }
 rio-backend = { workspace = true }
 rio-grid = { workspace = true }
+rio-session = { path = "../../rio-session" }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
