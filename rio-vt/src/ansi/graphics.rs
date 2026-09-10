@@ -885,23 +885,6 @@ impl Graphics {
             &mut self.kitty_inactive_screen.atlas_key_refs,
         );
 
-        // The renderer has one route-local texture namespace, while Kitty
-        // image stores are screen-local. Re-upload every newly active image
-        // that has placement metadata so equal IDs on main/alt cannot leave
-        // the previous screen's pixels cached.
-        let active_ids: std::collections::HashSet<_> = self
-            .kitty_placements
-            .keys()
-            .chain(self.kitty_virtual_placements.keys())
-            .map(|(image_id, _)| *image_id)
-            .collect();
-        for image_id in active_ids {
-            if let Some(stored) = self.kitty_images.get(&image_id) {
-                let mut data = stored.data.clone();
-                data.transmit_time = stored.transmission_time;
-                self.pending_images.push((image_id, data));
-            }
-        }
         self.kitty_graphics_dirty = true;
         self.requeue_placed_kitty_images()
     }
@@ -981,6 +964,7 @@ impl Graphics {
         self.atlas_key_refs.clear();
         self.pending.clear();
         self.pending_images.clear();
+        self.kitty_texture_contents.clear();
         self.image_timestamps.clear();
         self.kitty_chunking_state = Default::default();
         self.total_bytes = 0;
@@ -1798,6 +1782,9 @@ fn test_kitty_eviction_protects_virtual_placements_and_sweeps_dangling() {
         y: 0,
         width: 0,
         height: 0,
+        cell_x_offset: 0,
+        cell_y_offset: 0,
+        z_index: 0,
     };
 
     graphics.store_kitty_image(1, None, image(1));
@@ -1854,6 +1841,9 @@ fn test_kitty_texture_contents_tracks_uploads_across_screens() {
         y: 0,
         width: 0,
         height: 0,
+        cell_x_offset: 0,
+        cell_y_offset: 0,
+        z_index: 0,
     };
 
     // Unknown image: nothing to upload, nothing recorded.
@@ -2087,7 +2077,7 @@ fn kitty_delete_updates_bytes_queue_and_virtual_placements() {
             z_index: 0,
         },
     );
-    graphics.pending_images.push((1, kitty_test_data(1, 4)));
+    assert!(graphics.queue_kitty_upload(1));
 
     graphics.delete_kitty_images(|id, _| *id == 1);
 

@@ -1,0 +1,31 @@
+[package]
+name = "rio-session"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+keywords.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+publish = false
+
+[dependencies]
+bincode = "2.0.1"
+getrandom = "0.3.4"
+librio = { path = "../librio", version = "0.5.27" }
+rio-graphics = { workspace = true }
+rio-vt = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[[bin]]
+name = "rio-session-worker"
+path = "src/bin/rio-session-worker.rs"
+
+[[bin]]
+name = "rio-sessionctl"
+path = "src/bin/rio-sessionctl.rs"

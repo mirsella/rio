@@ -577,6 +577,9 @@ pub unsafe extern "C" fn rio_surface_new(
             pixel_width: config.pixel_width,
             pixel_height: config.pixel_height,
             scrollback: config.scrollback,
+            environment: None,
+            clear_environment: false,
+            input_queue_limit: None,
         };
         match engine.create_surface(&desc) {
             Ok(surface) => Box::into_raw(Box::new(surface)),
@@ -1821,6 +1824,9 @@ mod persistence_tests {
                 pixel_width: 640,
                 pixel_height: 384,
                 scrollback: 1000,
+                environment: None,
+                clear_environment: false,
+                input_queue_limit: None,
             })
             .expect("surface");
         // The child writes and exits; poll rather than sleep a fixed span.
@@ -1849,6 +1855,9 @@ mod persistence_tests {
                 pixel_width: 640,
                 pixel_height: 384,
                 scrollback: 1000,
+                environment: None,
+                clear_environment: false,
+                input_queue_limit: None,
             })
             .expect("surface");
         // Drive bytes straight into the terminal (no PTY round-trip).
