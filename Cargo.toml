@@ -6,6 +6,7 @@ members = [
     "rio-graphics",
     "rio-fonts",
     "rio-vt",
+    "rio-session",
     "rio-backend",
     "rio-grapheme-width",
     "rio-unicode",

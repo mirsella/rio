@@ -297,9 +297,38 @@ impl ProcessReadWrite for Pty {
 // From alacritty: https://github.com/alacritty/alacritty/blob/2df8f860b960d7c96efaf4f059fe2fbbdce82bcc/alacritty_terminal/src/tty/mod.rs#L83
 /// Check if a terminfo entry exists on the system.
 pub fn terminfo_exists(terminfo: &str) -> bool {
+    terminfo_exists_with_environment(terminfo, None, false)
+}
+
+/// Check terminfo using launch-time environment overrides without changing
+/// the process environment. `clear_environment` makes the supplied entries
+/// authoritative and avoids consulting the worker's unrelated environment.
+pub fn terminfo_exists_with_environment(
+    terminfo: &str,
+    environment: Option<&[(String, String)]>,
+    clear_environment: bool,
+) -> bool {
     // Get first terminfo character for the parent directory.
     let first = terminfo.get(..1).unwrap_or_default();
     let first_hex = format!("{:x}", first.chars().next().unwrap_or_default() as usize);
+
+    let value = |name: &str| {
+        environment
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            })
+            .or_else(|| {
+                if clear_environment {
+                    None
+                } else {
+                    std::env::var(name).ok()
+                }
+            })
+    };
 
     // Return true if the terminfo file exists at the specified location.
     macro_rules! check_path {
@@ -312,19 +341,22 @@ pub fn terminfo_exists(terminfo: &str) -> bool {
         };
     }
 
-    if let Some(dir) = std::env::var_os("TERMINFO") {
+    if let Some(dir) = value("TERMINFO") {
         check_path!(PathBuf::from(&dir));
-    } else if let Some(home) = dirs::home_dir() {
+    } else if let Some(home) = value("HOME")
+        .map(PathBuf::from)
+        .or_else(|| (!clear_environment).then(dirs::home_dir).flatten())
+    {
         check_path!(home.join(".terminfo"));
     }
 
-    if let Ok(dirs) = std::env::var("TERMINFO_DIRS") {
+    if let Some(dirs) = value("TERMINFO_DIRS") {
         for dir in dirs.split(':') {
             check_path!(PathBuf::from(dir));
         }
     }
 
-    if let Ok(prefix) = std::env::var("PREFIX") {
+    if let Some(prefix) = value("PREFIX") {
         let path = PathBuf::from(prefix);
         check_path!(path.join("etc/terminfo"));
         check_path!(path.join("lib/terminfo"));
@@ -448,28 +480,48 @@ impl ShellUser {
     /// look for shell, username, longname, and home dir in the respective environment variables
     /// before falling back on looking in to `passwd`.
     fn from_env() -> Result<Self, Error> {
+        Self::from_sources(None, false)
+    }
+
+    fn from_sources(
+        overrides: Option<&[(String, String)]>,
+        clear_environment: bool,
+    ) -> Result<Self, Error> {
         let mut buf = [0; 1024];
         let pw = get_pw_entry(&mut buf);
+        let value = |name: &str| {
+            overrides
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .rev()
+                        .find(|(key, _)| key == name)
+                        .map(|(_, value)| value.clone())
+                })
+                .or_else(|| {
+                    (!clear_environment)
+                        .then(|| std::env::var(name).ok())
+                        .flatten()
+                })
+        };
 
-        let user = match std::env::var("USER") {
-            Ok(user) => user,
-            Err(_) => match pw {
+        let user = match value("USER") {
+            Some(user) => user,
+            None => match pw {
                 Ok(ref pw) => pw.name.to_owned(),
                 Err(err) => return Err(err),
             },
         };
-
-        let home = match std::env::var("HOME") {
-            Ok(home) => home,
-            Err(_) => match pw {
+        let home = match value("HOME") {
+            Some(home) => home,
+            None => match pw {
                 Ok(ref pw) => pw.dir.to_owned(),
                 Err(err) => return Err(err),
             },
         };
-
-        let shell = match std::env::var("SHELL") {
-            Ok(env_shell) => env_shell,
-            Err(_) => match pw {
+        let shell = match value("SHELL") {
+            Some(shell) => shell,
+            None => match pw {
                 Ok(ref pw) => pw.shell.to_owned(),
                 Err(err) => return Err(err),
             },
@@ -542,6 +594,59 @@ pub fn create_pty_with_spawn(
     width: u16,
     height: u16,
 ) -> Result<Pty, Error> {
+    create_pty_with_spawn_inner(
+        shell,
+        args,
+        working_directory,
+        env,
+        false,
+        columns,
+        rows,
+        width,
+        height,
+    )
+}
+
+/// Spawn a PTY with an explicitly supplied environment. Unlike
+/// `create_pty_with_spawn`, this clears the worker's inherited environment
+/// before applying `env`. The caller is responsible for supplying any
+/// variables it needs, including PATH.
+#[allow(clippy::too_many_arguments)]
+pub fn create_pty_with_spawn_clear_env(
+    shell: Option<&str>,
+    args: Vec<String>,
+    working_directory: &Option<String>,
+    env: Vec<(String, String)>,
+    columns: u16,
+    rows: u16,
+    width: u16,
+    height: u16,
+) -> Result<Pty, Error> {
+    create_pty_with_spawn_inner(
+        shell,
+        args,
+        working_directory,
+        Some(env),
+        true,
+        columns,
+        rows,
+        width,
+        height,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_pty_with_spawn_inner(
+    shell: Option<&str>,
+    args: Vec<String>,
+    working_directory: &Option<String>,
+    env: Option<Vec<(String, String)>>,
+    clear_environment: bool,
+    columns: u16,
+    rows: u16,
+    width: u16,
+    height: u16,
+) -> Result<Pty, Error> {
     // Only expanded here: the flatpak branch below hands the path to
     // the host, which may see directories this sandbox cannot, so
     // existence is validated at the local use site instead.
@@ -553,6 +658,14 @@ pub fn create_pty_with_spawn(
         return Err(Error::new(
             io::ErrorKind::InvalidInput,
             "working-dir contains a NUL byte",
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    if clear_environment && Path::new("/.flatpak-info").exists() {
+        return Err(Error::new(
+            io::ErrorKind::Unsupported,
+            "exact PTY environment is unsupported through flatpak-spawn",
         ));
     }
 
@@ -605,7 +718,7 @@ pub fn create_pty_with_spawn(
     set_cloexec(file.as_raw_fd())?;
     set_cloexec(owned_child.as_raw_fd())?;
 
-    let user = match ShellUser::from_env() {
+    let user = match ShellUser::from_sources(env.as_deref(), clear_environment) {
         Ok(data) => data,
         Err(..) => ShellUser {
             shell: shell.unwrap_or_default().to_string(),
@@ -685,6 +798,9 @@ pub fn create_pty_with_spawn(
     builder.stderr(owned_child.try_clone()?);
     builder.stdout(owned_child);
 
+    if clear_environment {
+        builder.env_clear();
+    }
     builder.env("USER", user.user);
     builder.env("HOME", user.home);
     if let Some(env) = env {
@@ -894,7 +1010,7 @@ impl Child {
     }
 
     fn try_wait(&mut self) -> io::Result<Option<i32>> {
-        let result = wait_for_child(self.pid, libc::WNOHANG);
+        let result = wait_for_child_status(self.pid, libc::WNOHANG);
         if matches!(&result, Ok(Some(_)))
             || matches!(&result, Err(error) if error.raw_os_error() == Some(libc::ECHILD))
         {
@@ -904,7 +1020,10 @@ impl Child {
     }
 }
 
-fn wait_for_child(pid: libc::pid_t, options: libc::c_int) -> io::Result<Option<i32>> {
+fn wait_for_child_status(
+    pid: libc::pid_t,
+    options: libc::c_int,
+) -> io::Result<Option<i32>> {
     loop {
         let mut status = 0;
         match unsafe { libc::waitpid(pid, &mut status, options) } {
@@ -920,14 +1039,30 @@ fn wait_for_child(pid: libc::pid_t, options: libc::c_int) -> io::Result<Option<i
     }
 }
 
-fn reap_child(pid: libc::pid_t) {
-    let _ = wait_for_child(pid, 0);
+/// Reap a child owned by this process. This deliberately never sends a
+/// signal; callers must only pass a direct child PID they still own.
+pub fn reap_child(pid: libc::pid_t) -> io::Result<()> {
+    if pid <= 1 || pid == std::process::id() as libc::pid_t {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to reap an unsafe process ID",
+        ));
+    }
+    match wait_for_child_status(pid, 0) {
+        Ok(_) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn reap_child_unchecked(pid: libc::pid_t) {
+    let _ = reap_child(pid);
 }
 
 fn terminate_and_reap_child(pid: libc::pid_t) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
-        match wait_for_child(pid, libc::WNOHANG) {
+        match wait_for_child_status(pid, libc::WNOHANG) {
             Ok(Some(_)) | Err(_) => return,
             Ok(None) if std::time::Instant::now() >= deadline => break,
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
@@ -935,7 +1070,7 @@ fn terminate_and_reap_child(pid: libc::pid_t) {
     }
 
     unsafe { libc::kill(pid, libc::SIGKILL) };
-    reap_child(pid);
+    reap_child_unchecked(pid);
 }
 
 impl Drop for Child {
@@ -962,7 +1097,7 @@ impl Drop for Child {
         {
             tracing::error!("failed to start PTY child reaper: {error}");
             unsafe { libc::kill(pid, libc::SIGKILL) };
-            reap_child(pid);
+            reap_child_unchecked(pid);
         }
     }
 }
@@ -1357,5 +1492,34 @@ mod termp_tests {
         let term = create_termp(true);
         assert_eq!(term.c_ospeed, libc::B230400);
         assert_eq!(term.c_ispeed, libc::B230400);
+    }
+}
+
+#[cfg(test)]
+mod terminfo_tests {
+    use super::terminfo_exists_with_environment;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn terminfo_lookup_uses_explicit_cleared_environment() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir()
+            .join(format!("rio-terminfo-{}-{suffix}", std::process::id()));
+        let entry = "rio-session-test";
+        let directory = root.join("72");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(entry), []).unwrap();
+
+        let environment =
+            vec![("TERMINFO".to_string(), root.to_string_lossy().into_owned())];
+        assert!(terminfo_exists_with_environment(
+            entry,
+            Some(&environment),
+            true
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

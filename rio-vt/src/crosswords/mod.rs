@@ -116,6 +116,102 @@ bitflags! {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionTextError;
+
+impl std::fmt::Display for SelectionTextError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("selection text exceeds its byte limit")
+    }
+}
+
+impl std::error::Error for SelectionTextError {}
+
+trait SelectionOutput {
+    fn empty(&self) -> Self;
+    fn push_char(&mut self, character: char) -> Result<(), SelectionTextError>;
+    fn append(&mut self, other: &Self) -> Result<(), SelectionTextError>;
+    fn strip_last_newline(&mut self);
+}
+
+impl SelectionOutput for String {
+    fn empty(&self) -> Self {
+        String::new()
+    }
+
+    fn push_char(&mut self, character: char) -> Result<(), SelectionTextError> {
+        self.push(character);
+        Ok(())
+    }
+
+    fn append(&mut self, other: &Self) -> Result<(), SelectionTextError> {
+        self.push_str(other);
+        Ok(())
+    }
+
+    fn strip_last_newline(&mut self) {
+        if self.ends_with('\n') {
+            self.pop();
+        }
+    }
+}
+
+struct BoundedSelectionText {
+    text: String,
+    limit: usize,
+}
+
+impl BoundedSelectionText {
+    fn new(limit: usize) -> Self {
+        Self {
+            text: String::new(),
+            limit,
+        }
+    }
+
+    fn finish(self) -> String {
+        self.text
+    }
+}
+
+impl SelectionOutput for BoundedSelectionText {
+    fn empty(&self) -> Self {
+        Self::new(self.limit)
+    }
+
+    fn push_char(&mut self, character: char) -> Result<(), SelectionTextError> {
+        let next = self
+            .text
+            .len()
+            .checked_add(character.len_utf8())
+            .ok_or(SelectionTextError)?;
+        if next > self.limit {
+            return Err(SelectionTextError);
+        }
+        self.text.push(character);
+        Ok(())
+    }
+
+    fn append(&mut self, other: &Self) -> Result<(), SelectionTextError> {
+        let next = self
+            .text
+            .len()
+            .checked_add(other.text.len())
+            .ok_or(SelectionTextError)?;
+        if next > self.limit {
+            return Err(SelectionTextError);
+        }
+        self.text.push_str(&other.text);
+        Ok(())
+    }
+
+    fn strip_last_newline(&mut self) {
+        if self.text.ends_with('\n') {
+            self.text.pop();
+        }
+    }
+}
+
 /// The state of the [`Mode`] and [`PrivateMode`].
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
@@ -1062,6 +1158,14 @@ impl<U: EventListener> Crosswords<U> {
         self.vi_mode_cursor.pos = pos;
 
         self.vi_mode_recompute_selection();
+    }
+
+    /// Return the vi cursor without applying the current viewport offset.
+    /// Embedders use this to save and restore vi navigation state while the
+    /// rendered cursor continues to expose viewport coordinates.
+    #[inline]
+    pub fn vi_cursor_pos(&self) -> Pos {
+        self.vi_mode_cursor.pos
     }
 
     /// Scroll display to point if it is outside of viewport.
@@ -2490,40 +2594,65 @@ impl<U: EventListener> Crosswords<U> {
     }
 
     pub fn selection_to_string(&self) -> Option<String> {
-        let selection_range = self.selection.as_ref().and_then(|s| s.to_range(self))?;
-        let SelectionRange { start, end, .. } = selection_range;
+        self.selection_to_string_bounded(usize::MAX)
+            .expect("unbounded selection output cannot exceed usize::MAX")
+    }
 
-        let mut res = String::new();
+    pub fn selection_to_string_bounded(
+        &self,
+        max_bytes: usize,
+    ) -> Result<Option<String>, SelectionTextError> {
+        let selection_range = self.selection.as_ref().and_then(|s| s.to_range(self));
+        let Some(SelectionRange { start, end, .. }) = selection_range else {
+            return Ok(None);
+        };
 
+        let mut output = BoundedSelectionText::new(max_bytes);
         match self.selection.as_ref() {
             Some(Selection {
                 ty: SelectionType::Block,
                 ..
             }) => {
                 for line in (start.row.0..end.row.0).map(Line::from) {
-                    res +=
-                        &self.line_to_string(line, start.col..end.col, start.col.0 != 0);
-                    res += "\n";
+                    self.line_to_output(
+                        &mut output,
+                        line,
+                        start.col..end.col,
+                        start.col.0 != 0,
+                    )?;
+                    output.push_char('\n')?;
                 }
 
-                res += &self.line_to_string(end.row, start.col..end.col, true);
+                self.line_to_output(&mut output, end.row, start.col..end.col, true)?;
             }
             Some(Selection {
                 ty: SelectionType::Lines,
                 ..
             }) => {
-                res = self.bounds_to_string(start, end) + "\n";
+                self.bounds_to_output(&mut output, start, end)?;
+                output.push_char('\n')?;
             }
             _ => {
-                res = self.bounds_to_string(start, end);
+                self.bounds_to_output(&mut output, start, end)?;
             }
         }
 
-        Some(res)
+        Ok(Some(output.finish()))
     }
 
     pub fn bounds_to_string(&self, start: Pos, end: Pos) -> String {
         let mut text = String::new();
+        self.bounds_to_output(&mut text, start, end)
+            .expect("unbounded selection output cannot exceed its limit");
+        text
+    }
+
+    fn bounds_to_output<S: SelectionOutput>(
+        &self,
+        text: &mut S,
+        start: Pos,
+        end: Pos,
+    ) -> Result<(), SelectionTextError> {
         let mut blank_rows: usize = 0;
         let mut blank_cells: usize = 0;
         let last_col = self.grid.last_column();
@@ -2545,14 +2674,14 @@ impl<U: EventListener> Crosswords<U> {
                 blank_cells = 0;
             }
 
-            let mut row_text = String::new();
+            let mut row_text = text.empty();
             let had_content = self.append_cells(
                 &mut row_text,
                 line,
                 start_col..end_col,
                 line == end.row,
                 &mut blank_cells,
-            );
+            )?;
 
             if !had_content {
                 // Defer entirely-blank rows; trailing blank rows get dropped.
@@ -2561,41 +2690,33 @@ impl<U: EventListener> Crosswords<U> {
             }
 
             for _ in 0..blank_rows {
-                text.push('\n');
+                text.push_char('\n')?;
             }
             blank_rows = 0;
 
-            text.push_str(&row_text);
+            text.append(&row_text)?;
 
             let cur_wraps = self.grid[line][last_col].wrapline();
             if end_col >= last_col && !cur_wraps {
-                text.push('\n');
+                text.push_char('\n')?;
                 blank_cells = 0;
             }
         }
 
-        text.strip_suffix('\n').map(str::to_owned).unwrap_or(text)
+        text.strip_last_newline();
+        Ok(())
     }
 
-    /// Convert a single line in the grid to a String. Used by Block selection;
-    /// trailing blank cells are dropped. No trailing newline is appended —
-    /// the caller controls row separation.
-    fn line_to_string(
+    fn line_to_output<S: SelectionOutput>(
         &self,
+        text: &mut S,
         line: Line,
         cols: Range<Column>,
         include_wrapped_wide: bool,
-    ) -> String {
-        let mut text = String::new();
+    ) -> Result<(), SelectionTextError> {
         let mut blank_cells = 0;
-        self.append_cells(
-            &mut text,
-            line,
-            cols,
-            include_wrapped_wide,
-            &mut blank_cells,
-        );
-        text
+        self.append_cells(text, line, cols, include_wrapped_wide, &mut blank_cells)
+            .map(|_| ())
     }
 
     /// Append cells from a single line to `text`, buffering blank cells
@@ -2605,14 +2726,14 @@ impl<U: EventListener> Crosswords<U> {
     ///   whether to flush them via the `blank_cells` accumulator)
     ///
     /// Returns true if the line emitted any non-blank content.
-    fn append_cells(
+    fn append_cells<S: SelectionOutput>(
         &self,
-        text: &mut String,
+        text: &mut S,
         line: Line,
         mut cols: Range<Column>,
         include_wrapped_wide: bool,
         blank_cells: &mut usize,
-    ) -> bool {
+    ) -> Result<bool, SelectionTextError> {
         let mut had_content = false;
         let grid_line = &self.grid[line];
         let line_length = std::cmp::min(grid_line.line_length(), cols.end + 1);
@@ -2656,15 +2777,15 @@ impl<U: EventListener> Crosswords<U> {
             }
 
             for _ in 0..*blank_cells {
-                text.push(' ');
+                text.push_char(' ')?;
             }
             *blank_cells = 0;
 
-            text.push(c);
+            text.push_char(c)?;
             if let Some(extras_id) = cell.extras_id_checked() {
                 if let Some(extras) = self.grid.extras_table.get(extras_id) {
                     for c in &extras.zerowidth {
-                        text.push(*c);
+                        text.push_char(*c)?;
                     }
                 }
             }
@@ -2678,14 +2799,14 @@ impl<U: EventListener> Crosswords<U> {
             && include_wrapped_wide
         {
             for _ in 0..*blank_cells {
-                text.push(' ');
+                text.push_char(' ')?;
             }
             *blank_cells = 0;
-            text.push(self.grid[line - 1i32][Column(0)].c());
+            text.push_char(self.grid[line - 1i32][Column(0)].c())?;
             had_content = true;
         }
 
-        had_content
+        Ok(had_content)
     }
 
     #[inline]
@@ -7061,6 +7182,28 @@ mod tests {
                 "Old command should be cleared"
             );
         }
+    }
+
+    #[test]
+    fn bounded_selection_rejects_before_unbounded_growth() {
+        let mut term = make_crosswords();
+        term.grid[Line(0)][Column(0)].set_c('a');
+        term.grid[Line(0)][Column(1)].set_c('b');
+        term.selection = Some(Selection::new(
+            SelectionType::Simple,
+            Pos::new(Line(0), Column(0)),
+            Side::Left,
+        ));
+        term.selection
+            .as_mut()
+            .unwrap()
+            .update(Pos::new(Line(0), Column(2)), Side::Right);
+
+        assert!(term.selection_to_string_bounded(1).is_err());
+        assert_eq!(
+            term.selection_to_string_bounded(16).unwrap(),
+            Some(String::from("ab"))
+        );
     }
 
     #[test]

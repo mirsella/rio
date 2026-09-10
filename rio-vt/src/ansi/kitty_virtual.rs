@@ -700,6 +700,9 @@ mod tests {
             y: 0,
             width: 0,
             height: 0,
+            cell_x_offset: 0,
+            cell_y_offset: 0,
+            z_index: 0,
         }
     }
 

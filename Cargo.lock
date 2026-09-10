@@ -3942,6 +3942,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-session"
+version = "0.5.27"
+dependencies = [
+ "bincode",
+ "getrandom 0.3.4",
+ "libc",
+ "librio",
+ "rio-graphics",
+ "rio-vt",
+]
+
+[[package]]
 name = "rio-unicode"
 version = "0.5.27"
 dependencies = [
@@ -4041,6 +4053,7 @@ name = "rioterm"
 version = "0.5.27"
 dependencies = [
  "ahash",
+ "bincode",
  "bitflags 2.13.1",
  "cfg_aliases",
  "clap",
@@ -4067,6 +4080,7 @@ dependencies = [
  "rio-backend",
  "rio-grid",
  "rio-notifier",
+ "rio-session",
  "rio-unicode",
  "rio-window",
  "rustc-hash 2.1.3",

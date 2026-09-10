@@ -105,6 +105,116 @@ impl From<WindowId> for WindowTarget {
     }
 }
 
+/// A byte budget for input waiting to reach a PTY. The default terminal paths
+/// do not use this opt-in guard; session workers use it to bound the queue
+/// between the client and the performer until the PTY consumes it.
+#[derive(Clone, Debug)]
+pub struct InputBudget {
+    state: Arc<InputBudgetState>,
+    limit: usize,
+}
+
+#[derive(Debug)]
+struct InputBudgetState {
+    in_flight: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputBudgetError {
+    WouldBlock,
+}
+
+/// A reservation held by one input message. Dropping a queued or partially
+/// written message releases its unconsumed bytes; the performer releases
+/// consumed bytes as each write succeeds.
+#[derive(Debug)]
+pub struct InputReservation {
+    state: Arc<InputBudgetState>,
+    remaining: usize,
+}
+
+impl InputBudget {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            state: Arc::new(InputBudgetState {
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            limit,
+        }
+    }
+
+    pub fn try_reserve(
+        &self,
+        bytes: usize,
+    ) -> Result<InputReservation, InputBudgetError> {
+        let mut current = self
+            .state
+            .in_flight
+            .load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return Err(InputBudgetError::WouldBlock);
+            };
+            if next > self.limit {
+                return Err(InputBudgetError::WouldBlock);
+            }
+            match self.state.in_flight.compare_exchange_weak(
+                current,
+                next,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(InputReservation {
+                        state: Arc::clone(&self.state),
+                        remaining: bytes,
+                    });
+                }
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.state
+            .in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl InputReservation {
+    pub fn consume(&mut self, bytes: usize) {
+        assert!(bytes <= self.remaining, "input reservation over-consumed");
+        self.release(bytes);
+        self.remaining -= bytes;
+    }
+
+    fn release(&self, bytes: usize) {
+        let mut current = self
+            .state
+            .in_flight
+            .load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            assert!(bytes <= current, "input budget underflow");
+            match self.state.in_flight.compare_exchange_weak(
+                current,
+                current - bytes,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+impl Drop for InputReservation {
+    fn drop(&mut self) {
+        self.release(self.remaining);
+    }
+}
+
 /// Terminal viewport size, in cells and in pixels.
 ///
 /// Owned by the core so the event model does not name the PTY layer's type
@@ -140,6 +250,13 @@ pub enum RioEventType {
 pub enum Msg {
     /// Data that should be written to the PTY.
     Input(Cow<'static, [u8]>),
+
+    /// Input with an authoritative reservation released as the performer
+    /// consumes or drops the queued bytes.
+    InputBounded {
+        input: Cow<'static, [u8]>,
+        reservation: InputReservation,
+    },
 
     #[allow(dead_code)]
     Shutdown,
@@ -544,7 +661,9 @@ impl EventListener for EventProxy {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventPayload, RioEvent, RioEventType, WindowId, WindowTarget};
+    use super::{
+        EventPayload, InputBudget, RioEvent, RioEventType, WindowId, WindowTarget,
+    };
 
     #[test]
     fn dynamic_window_target_rebinds_all_clones() {
@@ -567,6 +686,23 @@ mod tests {
 
         assert_eq!(queued.window_id(), WindowId::from(3));
         assert_eq!(repeated.window_id(), WindowId::from(3));
+    }
+
+    #[test]
+    fn input_budget_releases_partial_consumption_and_drop() {
+        let budget = InputBudget::new(8);
+        let mut first = budget.try_reserve(6).expect("first reservation");
+        assert_eq!(budget.in_flight(), 6);
+        assert!(budget.try_reserve(3).is_err());
+
+        first.consume(2);
+        assert_eq!(budget.in_flight(), 4);
+        let second = budget.try_reserve(4).expect("released bytes are reusable");
+        assert_eq!(budget.in_flight(), 8);
+        drop(second);
+        assert_eq!(budget.in_flight(), 4);
+        drop(first);
+        assert_eq!(budget.in_flight(), 0);
     }
 }
 
