@@ -717,17 +717,16 @@ fn transfer_layout_uses_offered_pane_widths() {
         ..Default::default()
     };
     let mut leaves = Vec::new();
-    let split = build_layout_node(
-        &mut tree,
-        &layout,
-        &panel_style,
-        &panel_config,
-        1.0,
-        &pane_rects,
-        Some(FlexDirection::Row),
-        &mut leaves,
-    )
-    .unwrap();
+    let mut build_context = LayoutBuildContext {
+        tree: &mut tree,
+        panel_style: &panel_style,
+        panel_config: &panel_config,
+        scale: 1.0,
+        pane_rects: &pane_rects,
+        leaves: &mut leaves,
+    };
+    let split =
+        build_layout_node(&layout, Some(FlexDirection::Row), &mut build_context).unwrap();
     tree.add_child(root, split).unwrap();
     tree.compute_layout(
         root,

@@ -1050,15 +1050,12 @@ impl Drop for VulkanContext {
 /// Path to the on-disk pipeline cache. Returns `None` if neither
 /// `XDG_CACHE_HOME` nor `HOME` is set.
 fn pipeline_cache_path() -> Option<std::path::PathBuf> {
-    let dir = if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        std::path::PathBuf::from(xdg)
-    } else if let Some(home) = std::env::var_os("HOME") {
-        let mut p = std::path::PathBuf::from(home);
-        p.push(".cache");
-        p
-    } else {
-        return None;
-    };
+    let dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })?;
     Some(dir.join("rio").join("sugarloaf-vulkan.cache"))
 }
 

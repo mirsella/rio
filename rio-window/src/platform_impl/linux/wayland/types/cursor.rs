@@ -37,17 +37,16 @@ impl CustomCursor {
             )
             .unwrap();
 
-        for (canvas_chunk, rgba) in
-            canvas.chunks_exact_mut(4).zip(image.rgba.chunks_exact(4))
-        {
+        let (canvas_chunks, _) = canvas.as_chunks_mut::<4>();
+        let (rgba_chunks, _) = image.rgba.as_chunks::<4>();
+        for (canvas_chunk, rgba) in canvas_chunks.iter_mut().zip(rgba_chunks) {
             // Alpha in buffer is premultiplied.
             let alpha = rgba[3] as f32 / 255.;
             let r = (rgba[0] as f32 * alpha) as u32;
             let g = (rgba[1] as f32 * alpha) as u32;
             let b = (rgba[2] as f32 * alpha) as u32;
             let color = ((rgba[3] as u32) << 24) + (r << 16) + (g << 8) + b;
-            let array: &mut [u8; 4] = canvas_chunk.try_into().unwrap();
-            *array = color.to_le_bytes();
+            *canvas_chunk = color.to_le_bytes();
         }
 
         CustomCursor {

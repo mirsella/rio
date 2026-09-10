@@ -157,6 +157,26 @@ pub struct TabStripLayout {
     pub strip_width: f32,
 }
 
+pub(crate) struct TabRenderContext<'a, 's> {
+    pub(crate) sugarloaf: &'a mut Sugarloaf<'s>,
+    pub(crate) dimensions: (f32, f32, f32),
+    pub(crate) context_manager: &'a ContextManager<EventProxy>,
+    pub(crate) navigation: &'a Navigation,
+    pub(crate) inactive_text_color: [f32; 4],
+    pub(crate) active_text_color: [f32; 4],
+    pub(crate) bg_color: [f32; 4],
+}
+
+pub(crate) struct ColorPickerClick<'a> {
+    pub(crate) mouse_x: f32,
+    pub(crate) mouse_y: f32,
+    pub(crate) scale_factor: f32,
+    pub(crate) window_width: f32,
+    pub(crate) num_tabs: usize,
+    pub(crate) navigation: &'a Navigation,
+    pub(crate) context_manager: &'a mut ContextManager<EventProxy>,
+}
+
 /// Compute the tab strip layout from the physical window width.
 pub fn tab_strip_layout(
     window_width: f32,
@@ -906,16 +926,16 @@ impl Island {
 
     /// Render tabs using equal-width layout
     #[inline]
-    pub fn render(
-        &mut self,
-        sugarloaf: &mut Sugarloaf,
-        dimensions: (f32, f32, f32),
-        context_manager: &ContextManager<EventProxy>,
-        navigation: &Navigation,
-        inactive_text_color: [f32; 4],
-        active_text_color: [f32; 4],
-        bg_color: [f32; 4],
-    ) {
+    pub fn render(&mut self, render_context: TabRenderContext<'_, '_>) {
+        let TabRenderContext {
+            sugarloaf,
+            dimensions,
+            context_manager,
+            navigation,
+            inactive_text_color,
+            active_text_color,
+            bg_color,
+        } = render_context;
         let (window_width, _, scale_factor) = dimensions;
         let num_tabs = context_manager.len();
         let current_tab_index = context_manager.current_index();
@@ -1369,16 +1389,16 @@ impl Island {
 
     /// Check if a click hits a color swatch in the picker.
     /// Returns true if the click was consumed.
-    pub fn handle_color_picker_click(
-        &mut self,
-        mouse_x: f32,
-        mouse_y: f32,
-        scale_factor: f32,
-        window_width: f32,
-        num_tabs: usize,
-        navigation: &Navigation,
-        context_manager: &mut ContextManager<EventProxy>,
-    ) -> bool {
+    pub fn handle_color_picker_click(&mut self, click: ColorPickerClick<'_>) -> bool {
+        let ColorPickerClick {
+            mouse_x,
+            mouse_y,
+            scale_factor,
+            window_width,
+            num_tabs,
+            navigation,
+            context_manager,
+        } = click;
         let picker_tab = match self.color_picker_tab {
             Some(t) => t,
             None => return false,

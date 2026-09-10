@@ -2236,9 +2236,11 @@ pub fn rasterize_swash_glyph(
         Source::Outline,
     ];
     let mut image = Image::new();
-    let embolden = synthetic_bold
-        .then(|| (size_px / 14.0).max(1.0))
-        .unwrap_or(0.0);
+    let embolden = if synthetic_bold {
+        (size_px / 14.0).max(1.0)
+    } else {
+        0.0
+    };
     if !Render::new(&sources)
         .format(Format::Alpha)
         .embolden(embolden)
@@ -2276,7 +2278,7 @@ fn premultiply_color_bitmap(image: &mut swash::scale::image::Image) {
     }
 
     debug_assert_eq!(image.data.len() % 4, 0);
-    for pixel in image.data.chunks_exact_mut(4) {
+    for pixel in image.data.as_chunks_mut::<4>().0 {
         let alpha = pixel[3] as u16;
         for channel in &mut pixel[..3] {
             *channel = ((*channel as u16 * alpha + 127) / 255) as u8;

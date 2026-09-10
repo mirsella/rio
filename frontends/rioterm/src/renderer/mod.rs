@@ -641,15 +641,15 @@ impl Renderer {
                 .last_window_bg
                 .map(|c| [c.r as f32, c.g as f32, c.b as f32, c.a as f32])
                 .unwrap_or(self.named_colors.background.0);
-            island.render(
+            island.render(island::TabRenderContext {
                 sugarloaf,
-                (window_size.width, window_size.height, scale_factor),
+                dimensions: (window_size.width, window_size.height, scale_factor),
                 context_manager,
-                &self.navigation,
-                self.named_colors.tabs,
-                self.named_colors.tabs_active,
-                island_bg,
-            );
+                navigation: &self.navigation,
+                inactive_text_color: self.named_colors.tabs,
+                active_text_color: self.named_colors.tabs_active,
+                bg_color: island_bg,
+            });
         }
 
         self.assistant.render(

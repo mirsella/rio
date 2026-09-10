@@ -729,17 +729,13 @@ impl<'a> RouteWindow<'a> {
             raw_display_handle,
             window_id: window.id(),
         };
-        #[allow(unused_mut)]
-        let mut screen = match Screen::from_transfer(
+        let screen = Screen::from_transfer(
             properties,
             config,
             event_proxy,
             font_library,
             transfer,
-        ) {
-            Ok(screen) => screen,
-            Err(failure) => return Err(failure),
-        };
+        )?;
 
         window.set_visible(true);
         Ok(Self {

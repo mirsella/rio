@@ -22,6 +22,7 @@ use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::path::Path;
 
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::ThreadPoolBuilder;
 use std::sync::Arc;
 
@@ -331,8 +332,8 @@ impl FilterChain {
         adapter_info: Option<&wgpu::AdapterInfo>,
         disable_cache: bool,
     ) -> Result<Box<[FilterPass]>, Box<FilterChainError>> {
-        #[cfg(not(target_arch = "wasm32"))]
         let filter_creation_fn = || {
+            #[cfg(not(target_arch = "wasm32"))]
             let passes_iter = passes.into_par_iter();
             #[cfg(target_arch = "wasm32")]
             let passes_iter = passes.into_iter();
