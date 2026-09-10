@@ -1,7 +1,7 @@
-use crate::{Listener, Surface};
+use crate::{GraphicsSnapshot, GraphicsSnapshotError, Listener, Surface};
 use rio_vt::ansi::graphics::{
     kitty_overlay_geometry, KittyOverlayGeometry, KittyPlacement, OverlayViewport,
-    VirtualPlacement,
+    UpdateQueues, VirtualPlacement,
 };
 use rio_vt::ansi::kitty_virtual::{
     compute_run_geometry, resolve_virtual_placement, IncompletePlacement, PlaceholderRun,
@@ -28,6 +28,35 @@ pub struct ViewportSelection {
     pub end_line: u16,
     pub end_col: u16,
     pub is_block: bool,
+}
+
+/// Terminal metadata captured while the same lock protects the rows and
+/// placement state in [`RenderState`].
+#[derive(Debug)]
+pub struct SurfaceSnapshot {
+    pub modes: u32,
+    /// Whether the terminal requested a blinking cursor. The effective
+    /// visibility remains available through `RenderState::cursor_visible`.
+    pub cursor_blinking: bool,
+    pub title: String,
+    pub working_dir: Option<String>,
+    /// Total bytes in active Kitty images. Pixel data is intentionally absent
+    /// from the metadata snapshot and can be copied later after a wire-size
+    /// preflight.
+    pub graphics_bytes: usize,
+    /// Complete active graphics state. Delta captures leave this absent when
+    /// graphics and dimensions are unchanged, because deltas carry no graphics.
+    pub graphics: Option<GraphicsSnapshot>,
+    /// Current retained Atlas keys are needed to reconcile the session's
+    /// bounded pixel cache even when a delta does not copy active images.
+    pub atlas_keys: Vec<u64>,
+    /// Atlas uploads/removals drained while the terminal lock was held. The
+    /// session snapshotter incorporates these into its retained asset store.
+    pub graphics_updates: Option<UpdateQueues>,
+    /// Graphics changes require a complete publication because deltas do not
+    /// carry image pixels or placement state. Full-snapshot consumers reconcile
+    /// against `atlas_keys` when a removal delta was discarded.
+    pub graphics_changed: bool,
 }
 
 /// One drawable kitty item: a direct overlay placement, or one row-run
@@ -76,6 +105,7 @@ pub struct RenderState {
     display_offset: usize,
     selection: Option<ViewportSelection>,
     history_size: i64,
+    lines_evicted: u64,
     alt_screen: bool,
     /// Kitty graphics placements (direct overlays and virtual
     /// placeholder runs), captured under the same lock as the grid
@@ -107,6 +137,7 @@ impl RenderState {
             display_offset: 0,
             selection: None,
             history_size: 0,
+            lines_evicted: 0,
             alt_screen: false,
             kitty: Vec::new(),
             epoch: rio_vt::time::Instant::now(),
@@ -114,7 +145,167 @@ impl RenderState {
     }
 
     pub fn update(&mut self) {
+        let terminal = Arc::clone(&self.terminal);
+        let mut term = terminal.lock();
+        self.update_locked(&mut term);
+    }
+
+    /// Update the render cache and capture all terminal-facing metadata under
+    /// one terminal lock. Active image pixels are counted before they are
+    /// cloned, so callers can reject an over-budget frame without allocating
+    /// a second copy of its graphics.
+    pub fn update_with_surface_state(
+        &mut self,
+        surface: &Surface,
+        graphics_budget: usize,
+        per_image_budget: usize,
+        graphics_item_limit: usize,
+    ) -> Result<SurfaceSnapshot, GraphicsSnapshotError> {
+        self.update_with_surface_state_inner(
+            surface,
+            graphics_budget,
+            per_image_budget,
+            graphics_item_limit,
+            true,
+        )
+    }
+
+    /// Update render state for a delta publication. Active image pixels are
+    /// copied only when graphics or dimensions changed; the caller still gets
+    /// the current retained Atlas keys for cache reconciliation.
+    pub fn update_with_surface_state_for_delta(
+        &mut self,
+        surface: &Surface,
+        graphics_budget: usize,
+        per_image_budget: usize,
+        graphics_item_limit: usize,
+    ) -> Result<SurfaceSnapshot, GraphicsSnapshotError> {
+        self.update_with_surface_state_inner(
+            surface,
+            graphics_budget,
+            per_image_budget,
+            graphics_item_limit,
+            false,
+        )
+    }
+
+    fn update_with_surface_state_inner(
+        &mut self,
+        surface: &Surface,
+        graphics_budget: usize,
+        per_image_budget: usize,
+        graphics_item_limit: usize,
+        include_graphics: bool,
+    ) -> Result<SurfaceSnapshot, GraphicsSnapshotError> {
+        let terminal = Arc::clone(&self.terminal);
+        let mut term = terminal.lock();
+        let previous_columns = self.columns;
+        let previous_lines = self.rows.len();
+        self.update_locked(&mut term);
+        let kitty_graphics_changed = term.graphics.kitty_graphics_dirty;
+        let graphics_count = term
+            .graphics
+            .kitty_images
+            .len()
+            .checked_add(term.graphics.kitty_placements.len())
+            .and_then(|count| {
+                count.checked_add(term.graphics.kitty_virtual_placements.len())
+            })
+            .and_then(|count| count.checked_add(term.graphics.atlas_placements.len()))
+            .ok_or(GraphicsSnapshotError {
+                required_bytes: usize::MAX,
+                limit_bytes: graphics_item_limit,
+            })?;
+        let retained_atlas_count = term
+            .graphics
+            .atlas_key_refs
+            .len()
+            .saturating_add(term.graphics.kitty_inactive_screen.atlas_key_refs.len());
+        if graphics_count > graphics_item_limit
+            || retained_atlas_count > graphics_item_limit
+        {
+            return Err(GraphicsSnapshotError {
+                required_bytes: usize::MAX,
+                limit_bytes: graphics_item_limit,
+            });
+        }
+        if let Some(required_bytes) = term
+            .graphics
+            .kitty_images
+            .values()
+            .map(|image| image.data.pixels.len())
+            .find(|&bytes| bytes > per_image_budget)
+        {
+            return Err(GraphicsSnapshotError {
+                required_bytes,
+                limit_bytes: per_image_budget,
+            });
+        }
+        let graphics_bytes = crate::active_graphics_bytes_locked(&term, graphics_budget)?;
+        let (
+            graphics_updates,
+            graphics_updates_over_budget,
+            graphics_removals_over_budget,
+        ) = {
+            let mut graphics_store = surface.graphics_updates.lock().unwrap();
+            graphics_store.take_with_over_budget()
+        };
+        let working_dir = term
+            .current_directory
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .or_else(|| {
+                #[cfg(all(feature = "pty", not(target_os = "windows")))]
+                {
+                    teletypewriter::foreground_process_path(
+                        surface.main_fd,
+                        surface.shell_pid,
+                    )
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned())
+                }
+                #[cfg(any(not(feature = "pty"), target_os = "windows"))]
+                {
+                    let _ = surface;
+                    None
+                }
+            });
+        let graphics_changed = kitty_graphics_changed
+            || graphics_updates.is_some()
+            || graphics_updates_over_budget
+            || graphics_removals_over_budget;
+        let dimensions_changed =
+            previous_columns != self.columns || previous_lines != self.rows.len();
+        let atlas_keys = crate::atlas_keys_locked(&term);
+        let graphics = if include_graphics || dimensions_changed || graphics_changed {
+            Some(crate::graphics_snapshot_locked(&term))
+        } else {
+            None
+        };
+        // Consume the flag only after complete graphics state and update
+        // queues have been captured under the terminal lock.
+        term.graphics.kitty_graphics_dirty = false;
+        Ok(SurfaceSnapshot {
+            modes: term.mode().bits(),
+            cursor_blinking: term.blinking_cursor,
+            title: term.title.clone(),
+            working_dir,
+            graphics_bytes,
+            graphics,
+            atlas_keys,
+            graphics_updates,
+            graphics_changed,
+        })
+    }
+
+    /// Preserve a graphics resync requirement when publication or encoding
+    /// fails after `update_with_surface_state` consumed the flag.
+    pub fn restore_graphics_dirty(&self) {
         let mut term = self.terminal.lock();
+        term.graphics.kitty_graphics_dirty = true;
+    }
+
+    fn update_locked(&mut self, term: &mut Crosswords<Listener>) {
         let damage = if self.rows.is_empty() {
             TerminalDamage::Full
         } else {
@@ -136,7 +327,8 @@ impl RenderState {
         // Kitty dest_rows live in absolute row space: rows evicted from
         // the ring still count (rio-vt anchors placements the same way),
         // so a full scrollback must not shift placements off-screen.
-        self.history_size = term.lines_evicted() as i64 + term.history_size() as i64;
+        self.lines_evicted = term.lines_evicted();
+        self.history_size = self.lines_evicted as i64 + term.history_size() as i64;
         self.alt_screen = term.mode().contains(rio_vt::crosswords::Mode::ALT_SCREEN);
         self.kitty.clear();
         for placement in term.graphics.kitty_placements.values() {
@@ -148,7 +340,7 @@ impl RenderState {
                 });
             }
         }
-        let virtual_runs = self.collect_virtual_runs(&term);
+        let virtual_runs = self.collect_virtual_runs(term);
         self.kitty.extend(virtual_runs);
         // Under-background placements (z < i32::MIN / 2) first, then
         // under-text (z < 0), then over-text: drawing in order layers
@@ -318,6 +510,16 @@ impl RenderState {
 
     pub fn display_offset(&self) -> usize {
         self.display_offset
+    }
+
+    pub fn history_size(&self) -> usize {
+        self.history_size
+            .saturating_sub(self.lines_evicted as i64)
+            .max(0) as usize
+    }
+
+    pub fn lines_evicted(&self) -> u64 {
+        self.lines_evicted
     }
 
     /// Whether the alternate screen (full-screen TUIs) is active. Hosts
