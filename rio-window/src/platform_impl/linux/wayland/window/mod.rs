@@ -752,14 +752,13 @@ impl Window {
             let frame_grab_key = backend
                 .frame_drag_grabs
                 .iter()
-                .filter(|(key, grab)| {
+                .find(|(key, grab)| {
                     key.0 == self.window_id
                         && frame_grab_hint.is_none_or(|(seat_id, pointer_id)| {
                             grab.seat_id.protocol_id() == seat_id
                                 && grab.pointer_id.protocol_id() == pointer_id
                         })
                 })
-                .find_map(|(key, grab)| Some((key, grab)))
                 .and_then(|(key, grab)| {
                     let active = backend
                         .seats

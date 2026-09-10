@@ -372,7 +372,7 @@ mod recovery_tests {
     fn recovery_candidate_outlives_probe_commit_deadline() {
         use rio_session::{SessionClient, SessionSpec};
         let binary = std::env::var_os("RIO_TEST_BINARY").expect("set RIO_TEST_BINARY");
-        let mut owner = SessionClient::spawn_with_worker_path(
+        let owner = SessionClient::spawn_with_worker_path(
             SessionSpec {
                 shell: Some("/bin/sh".into()),
                 args: vec![
@@ -392,7 +392,7 @@ mod recovery_tests {
         );
         let candidate = RecoveryCandidate::from_probe(descriptor, prepared);
         std::thread::sleep(std::time::Duration::from_secs(4));
-        let mut recovered = SessionClient::prepare_attach(candidate.descriptor)
+        let recovered = SessionClient::prepare_attach(candidate.descriptor)
             .unwrap()
             .commit()
             .unwrap();
@@ -869,9 +869,7 @@ impl<'a> Application<'a> {
         };
 
         let (original_index, transfer, source_empty) = {
-            let Some(source) = self.router.routes.get_mut(&source_id) else {
-                return None;
-            };
+            let source = self.router.routes.get_mut(&source_id)?;
             let Some(transfer) = source.window.screen.extract_transfer(original_index)
             else {
                 tracing::error!("current tab disappeared before extraction");
@@ -2295,10 +2293,8 @@ impl<'a> Application<'a> {
         let frame = prepared.initial_frame();
         let source = if !frame.title.trim().is_empty() {
             frame.title.as_str()
-        } else if let Some(path) = frame.working_dir.as_deref() {
-            path
         } else {
-            "unnamed session"
+            frame.working_dir.as_deref().unwrap_or("unnamed session")
         };
         let mut label: String = source
             .chars()
@@ -3473,13 +3469,8 @@ impl Application<'_> {
             }
         }
 
-        loop {
-            match self.incoming_prepared.try_recv() {
-                Ok(prepared) => self.install_incoming_transfer(prepared),
-                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
-                    break
-                }
-            }
+        while let Ok(prepared) = self.incoming_prepared.try_recv() {
+            self.install_incoming_transfer(prepared);
         }
     }
 
@@ -3597,10 +3588,10 @@ impl Application<'_> {
             .iter()
             .map(|pane| pane.route_id)
             .collect();
-        let prepared = incoming.offer.panes.iter().cloned().zip(prepared).collect();
+        let prepared = incoming.offer.panes.into_iter().zip(prepared).collect();
         let target_routes = route.window.screen.context_manager.insert_prepared_tabs(
             prepared,
-            incoming.offer.tabs.clone(),
+            incoming.offer.tabs,
             incoming.offer.active_pane as usize,
             incoming.target_index,
             dimension,

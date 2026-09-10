@@ -508,26 +508,21 @@ impl ShellUser {
                 })
         };
 
-        let user = match value("USER") {
-            Some(user) => user,
-            None => match pw {
-                Ok(ref pw) => pw.name.to_owned(),
-                Err(err) => return Err(err),
-            },
-        };
-        let home = match value("HOME") {
-            Some(home) => home,
-            None => match pw {
-                Ok(ref pw) => pw.dir.to_owned(),
-                Err(err) => return Err(err),
-            },
-        };
-        let shell = match value("SHELL") {
-            Some(shell) => shell,
-            None => match pw {
-                Ok(ref pw) => pw.shell.to_owned(),
-                Err(err) => return Err(err),
-            },
+        let user = value("USER");
+        let home = value("HOME");
+        let shell = value("SHELL");
+        let (user, home, shell) = match pw {
+            Ok(pw) => (
+                user.unwrap_or_else(|| pw.name.to_owned()),
+                home.unwrap_or_else(|| pw.dir.to_owned()),
+                shell.unwrap_or_else(|| pw.shell.to_owned()),
+            ),
+            Err(err) => {
+                let (Some(user), Some(home), Some(shell)) = (user, home, shell) else {
+                    return Err(err);
+                };
+                (user, home, shell)
+            }
         };
 
         Ok(Self { user, home, shell })
@@ -1497,15 +1492,13 @@ mod login_argv_tests {
 
 #[cfg(test)]
 mod termp_tests {
-    use super::*;
-
     // The pty output-queue watermark is derived from the baud rate on
     // BSD/XNU; a zero speed clamps it to a ~100-byte floor and caps
     // drain throughput.
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn create_termp_sets_pty_speed() {
-        let term = create_termp(true);
+        let term = super::create_termp(true);
         assert_eq!(term.c_ospeed, libc::B230400);
         assert_eq!(term.c_ispeed, libc::B230400);
     }

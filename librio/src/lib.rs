@@ -28,7 +28,9 @@ use rio_vt::event::sync::FairMutex;
 use rio_vt::event::Msg;
 #[cfg(feature = "pty")]
 use rio_vt::event::WindowSize;
-use rio_vt::event::{EventListener, InputBudget, InputBudgetError, RioEvent, WindowId};
+use rio_vt::event::{EventListener, RioEvent, WindowId};
+#[cfg(feature = "pty")]
+use rio_vt::event::{InputBudget, InputBudgetError};
 #[cfg(feature = "pty")]
 use rio_vt::performer::Machine;
 use rio_vt::selection::{Selection, SelectionType};

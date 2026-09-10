@@ -165,7 +165,6 @@ pub struct ContextManagerConfig {
     pub cwd: bool,
     pub is_native: bool,
     pub split_color: [f32; 4],
-    pub split_active_color: [f32; 4],
     pub panel: rio_backend::config::layout::Panel,
     pub title: rio_backend::config::title::Title,
     pub keyboard: rio_backend::config::keyboard::Keyboard,
@@ -520,7 +519,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 initial_context,
                 scaled_margin,
                 ctx_config.split_color,
-                ctx_config.split_active_color,
                 ctx_config.panel,
             )],
             capacity: DEFAULT_CONTEXT_CAPACITY,
@@ -558,7 +556,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 initial_context,
                 Margin::default(),
                 config.split_color,
-                config.split_active_color,
                 config.panel,
             )],
             capacity,
@@ -903,56 +900,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
-    /// Index of the tab containing `route_id`'s pane. Per-route state
-    /// can live ANYWHERE (a background split of a background tab
-    /// included), so the search covers every panel of every tab.
-    #[inline]
-    pub fn tab_index_for_route(&mut self, route_id: usize) -> Option<usize> {
-        self.contexts
-            .iter_mut()
-            .position(|grid| grid.get_by_route_id(route_id).is_some())
-    }
-
-    /// A pane rang the bell. Flags its tab so the strip can surface it.
-    /// The current tab is skipped only while the window has focus: the
-    /// user is already looking at it then, but a ring in the visible
-    /// tab of an UNFOCUSED window would otherwise leave no trace at
-    /// all. Edge-triggered: a BEL flood marks once and repaints once.
-    #[inline]
-    pub fn ring_bell(&mut self, route_id: usize, window_focused: bool) -> bool {
-        let Some(tab_index) = self.tab_index_for_route(route_id) else {
-            return false;
-        };
-
-        if window_focused && tab_index == self.current_index {
-            return false;
-        }
-
-        !std::mem::replace(&mut self.contexts[tab_index].bell, true)
-    }
-
-    #[inline]
-    pub fn bell(&self, index: usize) -> bool {
-        self.contexts.get(index).is_some_and(|grid| grid.bell)
-    }
-
-    /// Clears the focused tab's bell flag. Called every FOCUSED frame so
-    /// the mark drops the moment the tab is shown to the user, whatever
-    /// brought it to the front; an unfocused window still renders on PTY
-    /// damage, and clearing there would wipe a mark nobody has seen yet.
-    #[inline]
-    pub fn clear_current_bell(&mut self) -> bool {
-        let grid = &mut self.contexts[self.current_index];
-        std::mem::replace(&mut grid.bell, false)
-    }
-
-    #[inline]
-    pub fn resize_all_grids(&mut self, width: f32, height: f32) {
-        for context_grid in self.contexts.iter_mut() {
-            context_grid.resize(width, height);
-        }
-    }
-
     pub fn update_titles(&mut self) {
         if self.is_empty() {
             return;
@@ -1201,9 +1148,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         prepared: PreparedSession,
         rich_text_id: usize,
         dimension: ContextDimension,
-    ) -> Result<usize, PreparedSession> {
+    ) -> Result<usize, Box<PreparedSession>> {
         if self.contexts.len() >= self.capacity {
-            return Err(prepared);
+            return Err(Box::new(prepared));
         }
         let route_id = Self::next_route_id();
         let context = create_prepared_context::<T>(
@@ -1217,7 +1164,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             context,
             self.get_current_grid_scaled_margin(),
             self.config.split_color,
-            self.config.split_active_color,
             self.config.panel,
         );
         self.contexts.push(grid);
@@ -1245,10 +1191,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
 
         let active_source = prepared[active_pane].0.route_id;
-        let source_order: Vec<_> = prepared
-            .iter()
-            .map(|(pane, _)| (pane.route_id, pane.tab_id))
-            .collect();
+        let source_order: Vec<_> =
+            prepared.iter().map(|(pane, _)| pane.route_id).collect();
         let mut panes = prepared
             .into_iter()
             .map(|(pane, prepared)| (pane.route_id, (pane, prepared)))
@@ -1256,40 +1200,37 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 u64,
                 (crate::router::window_control::PaneOffer, PreparedSession),
             >>();
-        if panes.len() != source_order.len()
-            || tabs.iter().any(|tab| {
-                let mut routes = Vec::new();
-                transfer_layout_routes(&tab.layout, &mut routes);
-                routes.iter().any(|route| {
-                    panes
-                        .get(route)
-                        .is_none_or(|(pane, _)| pane.tab_id != tab.tab_id)
-                })
-            })
-        {
+        if panes.len() != source_order.len() {
             return Err(panes.into_values().collect());
         }
+        let source_tab_routes = tabs
+            .iter()
+            .map(|tab| {
+                let mut routes = Vec::new();
+                transfer_layout_routes(&tab.layout, &mut routes);
+                if routes.is_empty()
+                    || tab.active_route == 0
+                    || !routes.contains(&tab.active_route)
+                    || routes.iter().any(|route| {
+                        panes
+                            .get(route)
+                            .is_none_or(|(pane, _)| pane.tab_id != tab.tab_id)
+                    })
+                {
+                    None
+                } else {
+                    Some(routes)
+                }
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(source_tab_routes) = source_tab_routes else {
+            return Err(panes.into_values().collect());
+        };
 
         let mut tab_routes = rustc_hash::FxHashMap::default();
         let mut new_grids = Vec::with_capacity(tabs.len());
         let mut active_grid = None;
-        for (index, tab) in tabs.iter().enumerate() {
-            let mut routes = Vec::new();
-            transfer_layout_routes(&tab.layout, &mut routes);
-            if routes.is_empty()
-                || tab.active_route == 0
-                || !routes.contains(&tab.active_route)
-                || routes.iter().any(|route| !panes.contains_key(route))
-            {
-                return Err(panes.into_values().collect());
-            }
-            if routes.iter().any(|route| {
-                panes
-                    .get(route)
-                    .is_some_and(|(pane, _)| pane.tab_id != tab.tab_id)
-            }) {
-                return Err(panes.into_values().collect());
-            }
+        for (index, (tab, routes)) in tabs.iter().zip(source_tab_routes).enumerate() {
             let pane_rects = routes
                 .iter()
                 .filter_map(|route| {
@@ -1313,17 +1254,16 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     )
                 })
                 .collect();
-            let grid = ContextGrid::from_layout_offer(
+            let grid = ContextGrid::from_layout_offer(crate::layout::LayoutOfferInput {
                 contexts,
-                &tab.layout,
-                tab.active_route,
-                &tab_routes,
-                &pane_rects,
-                self.get_current_grid_scaled_margin(),
-                self.config.split_color,
-                self.config.split_active_color,
-                self.config.panel,
-            )
+                layout: &tab.layout,
+                active_route: tab.active_route,
+                route_map: &tab_routes,
+                pane_rects: &pane_rects,
+                scaled_margin: self.get_current_grid_scaled_margin(),
+                border_color: self.config.split_color,
+                panel_config: self.config.panel,
+            })
             .unwrap_or_else(|(_, error)| {
                 panic!("validated transfer layout could not be rebuilt: {error}")
             });
@@ -1347,7 +1287,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.current_index = insert_at + active_grid.unwrap_or(0);
         Ok(source_order
             .into_iter()
-            .map(|(source, _)| {
+            .map(|source| {
                 *tab_routes
                     .get(&source)
                     .expect("validated transfer source route disappeared")
@@ -1623,7 +1563,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             // When navigation is collapsed and does not contain any color rule
             // does not make sense fetch for foreground process names
             split_color: config.colors.split,
-            split_active_color: config.colors.split_active,
             panel: config.panel,
             title: config.title,
             keyboard: config.keyboard,
@@ -1696,7 +1635,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                         new_context,
                         previous_scaled_margin,
                         self.config.split_color,
-                        self.config.split_active_color,
                         self.config.panel,
                     ));
                     if redirect {

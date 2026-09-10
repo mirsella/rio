@@ -25,8 +25,8 @@ use sugarloaf::grid::{GridRenderer, GridUniforms};
 use sugarloaf::layout::RootStyle;
 use sugarloaf::{
     kitty_image_key, Color, ColorType, Colorspace, GraphicData, GraphicDataEntry,
-    GraphicId, GraphicOverlay, Sugarloaf, SugarloafBackend, SugarloafRenderer,
-    SugarloafWindow, SugarloafWindowSize,
+    GraphicId, GraphicKey, GraphicOverlay, Sugarloaf, SugarloafBackend,
+    SugarloafRenderer, SugarloafWindow, SugarloafWindowSize,
 };
 
 /// The renderer instance, boxed and handed to the host as an opaque pointer.
@@ -197,7 +197,6 @@ pub unsafe extern "C" fn sl_new(
         };
         let renderer = SugarloafRenderer {
             backend: default_backend(),
-            font_features: None,
             colorspace: colorspace_from_u32(colorspace),
             ..Default::default()
         };
@@ -421,7 +420,7 @@ pub unsafe extern "C" fn sl_image_upload(
         transmit_time: std::time::Instant::now(),
     };
     sl.image_data.insert(
-        kitty_image_key(id),
+        GraphicKey::new(0, kitty_image_key(id)),
         GraphicDataEntry::from_graphic_data(data),
     );
 }
@@ -457,7 +456,7 @@ pub unsafe extern "C" fn sl_image_set_overlays(
         sl.push_image_overlay(
             0,
             GraphicOverlay {
-                image_id: kitty_image_key(o.id),
+                image_id: GraphicKey::new(0, kitty_image_key(o.id)),
                 x: o.x,
                 y: o.y,
                 width: o.w,
