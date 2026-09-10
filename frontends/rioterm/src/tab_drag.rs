@@ -190,7 +190,7 @@ impl<D: Copy + Eq, O: Copy + Eq> TabDrag<D, O> {
     ) -> Transition<D, O> {
         assert!(source_tab_count > 0, "a tab drag requires a source tab");
         assert!(original_index < source_tab_count, "tab index must exist");
-        Self::new(
+        Self::transition(
             token,
             source_window,
             tab_id,
@@ -249,7 +249,7 @@ impl<D: Copy + Eq, O: Copy + Eq> TabDrag<D, O> {
     ) -> Transition<D, O> {
         assert!(tab_count > 0, "a window drag requires a source tab");
         assert!(original_index < tab_count, "active tab index must exist");
-        Self::new(
+        Self::transition(
             token,
             source_window,
             tab_id,
@@ -260,7 +260,7 @@ impl<D: Copy + Eq, O: Copy + Eq> TabDrag<D, O> {
         )
     }
 
-    fn new(
+    fn transition(
         token: SessionToken,
         source_window: WindowId,
         tab_id: TabId,
@@ -366,7 +366,7 @@ impl<D: Copy + Eq, O: Copy + Eq> TabDrag<D, O> {
                         target_window,
                     });
                 } else if !self.hover.is_some_and(|hover| hover.dropped) {
-                    let changed = self.hover.map_or(true, |hover| {
+                    let changed = self.hover.is_none_or(|hover| {
                         hover.offer_id != offer_id || hover.target_window != target_window
                     });
                     self.hover = Some(Hover {

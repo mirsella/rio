@@ -750,8 +750,7 @@ pub(super) fn parse_dynamic_colors(params: &[&[u8]]) -> Option<Vec<DynamicColorE
         let spec = if *param == b"?" {
             ColorSpec::Query
         } else {
-            let c = xparse_color(param)?;
-            ColorSpec::Set(c)
+            ColorSpec::Set(xparse_color(param)?)
         };
         out.push(DynamicColorEntry {
             index,

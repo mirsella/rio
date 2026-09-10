@@ -10,7 +10,7 @@ use rio_session::{codec, SessionDescriptor};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -452,11 +452,8 @@ impl WindowControl {
 
     pub fn poll(&self) -> Vec<WindowControlEvent> {
         let mut events = Vec::new();
-        loop {
-            match self.events.try_recv() {
-                Ok(event) => events.push(event),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok(event) = self.events.try_recv() {
+            events.push(event);
         }
         events
     }

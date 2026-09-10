@@ -565,7 +565,7 @@ impl RenderState {
         self.selection = term
             .selection
             .as_ref()
-            .and_then(|selection| selection.to_range(&term))
+            .and_then(|selection| selection.to_range(term))
             .and_then(|range| {
                 let offset = term.display_offset() as i32;
                 let lines = self.rows.len() as i32;

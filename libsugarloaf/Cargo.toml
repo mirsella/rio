@@ -7,7 +7,6 @@ license.workspace = true
 keywords.workspace = true
 repository = "https://github.com/raphamorim/rio"
 description = "Embeddable GPU renderer extracted from Rio's sugarloaf: a glyph atlas + cell-grid compositor over a host window, exposed as a C ABI"
-readme = "README.md"
 publish = false
 
 [lib]

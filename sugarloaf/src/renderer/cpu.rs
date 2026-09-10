@@ -977,7 +977,7 @@ fn fill_translucent_simd(
         }
 
         // 128-bit tail.
-        let (chunks4, rest) = tail.as_chunks_mut::<4>();
+        let (chunks4, scalar_tail) = tail.as_chunks_mut::<4>();
         for chunk in chunks4 {
             let dst = u32x4::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let out = blend_over_simd_const_src_x4(src_v4, inv_v4, dst);
@@ -985,7 +985,7 @@ fn fill_translucent_simd(
             *chunk = arr;
         }
         // Scalar tail.
-        for px in rest {
+        for px in scalar_tail {
             *px = blend_over_swar(src_premul, *px);
         }
     }

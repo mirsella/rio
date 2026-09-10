@@ -146,7 +146,7 @@ pub(crate) enum Window {
     #[cfg(x11_platform)]
     X(x11::Window),
     #[cfg(wayland_platform)]
-    Wayland(wayland::Window),
+    Wayland(Box<wayland::Window>),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -318,7 +318,8 @@ impl Window {
         match *window_target {
             #[cfg(wayland_platform)]
             ActiveEventLoop::Wayland(ref window_target) => {
-                wayland::Window::new(window_target, attribs).map(Window::Wayland)
+                wayland::Window::new(window_target, attribs)
+                    .map(|window| Window::Wayland(Box::new(window)))
             }
             #[cfg(x11_platform)]
             ActiveEventLoop::X(ref window_target) => {

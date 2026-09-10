@@ -157,7 +157,7 @@ mod unix {
         ClipboardOverflow,
         Closed,
         ChildExited(Option<i32>),
-        DesktopNotification {
+        Desktop {
             title: String,
             body: String,
         },
@@ -233,9 +233,9 @@ mod unix {
                 },
             ));
             notifications.extend(
-                self.desktop_notifications.drain(..).map(|(title, body)| {
-                    Notification::DesktopNotification { title, body }
-                }),
+                self.desktop_notifications
+                    .drain(..)
+                    .map(|(title, body)| Notification::Desktop { title, body }),
             );
             notifications.extend(self.color_changes.drain(..).map(
                 |(route_id, index, color)| Notification::ColorChange {
@@ -369,7 +369,7 @@ mod unix {
                             deferred.clipboard_overflow = true;
                         }
                         Notification::Closed | Notification::ChildExited(_) => {}
-                        Notification::DesktopNotification { title, body } => {
+                        Notification::Desktop { title, body } => {
                             if deferred.desktop_notifications.len() < MAX_PENDING_REQUESTS
                             {
                                 deferred.desktop_notifications.push_back((title, body));
@@ -589,7 +589,7 @@ mod unix {
             if title.len() <= crate::protocol::MAX_STRING_BYTES
                 && body.len() <= crate::protocol::MAX_STRING_BYTES
             {
-                self.send(Notification::DesktopNotification { title, body });
+                self.send(Notification::Desktop { title, body });
             }
         }
 
@@ -1990,30 +1990,25 @@ mod unix {
         stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
         stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
 
-        let hello = match codec::read_frame_until::<ClientMessage>(
-            &mut stream,
-            Instant::now() + HANDSHAKE_TIMEOUT,
-        ) {
-            Ok(message) => {
-                message.validate()?;
-                match message {
-                    ClientMessage::Hello {
-                        version,
-                        capability,
-                        session_id,
-                        spec,
-                    } => (version, capability, session_id, spec),
-                    _ => {
-                        let _ = send_error(
-                            &mut stream,
-                            ErrorCode::BadRequest,
-                            "expected hello",
-                        );
-                        return Ok(());
-                    }
+        let hello = {
+            let message = codec::read_frame_until::<ClientMessage>(
+                &mut stream,
+                Instant::now() + HANDSHAKE_TIMEOUT,
+            )?;
+            message.validate()?;
+            match message {
+                ClientMessage::Hello {
+                    version,
+                    capability,
+                    session_id,
+                    spec,
+                } => (version, capability, session_id, spec),
+                _ => {
+                    let _ =
+                        send_error(&mut stream, ErrorCode::BadRequest, "expected hello");
+                    return Ok(());
                 }
             }
-            Err(error) => return Err(error),
         };
         if hello.0 != PROTOCOL_VERSION {
             let _ = send_error(
@@ -2064,7 +2059,7 @@ mod unix {
             detach(&shared, generation);
             return Err(error.into());
         }
-        let result = run_attachment(shared.clone(), &mut stream, generation);
+        let result = run_attachment(&shared, &mut stream, generation);
         if !shared.closing.load(Ordering::Acquire) && is_active(&shared, generation) {
             detach(&shared, generation);
         }
@@ -2077,41 +2072,37 @@ mod unix {
         connection_fd: RawFd,
         spec: Option<SessionSpec>,
     ) -> Result<u64, SessionError> {
-        let current_generation = {
-            let _gate = shared
-                .gate
-                .lock()
-                .map_err(|_| SessionError::protocol("worker state lock poisoned"))?;
-            if shared.closing.load(Ordering::Acquire)
-                || shared.close_pending.load(Ordering::Acquire)
+        let current_generation =
             {
-                return Err(SessionError::Detached);
-            }
-            let active = shared
-                .active
-                .lock()
-                .map_err(|_| SessionError::protocol("worker attachment lock poisoned"))?;
-            let mut runtime = shared
-                .runtime
-                .lock()
-                .map_err(|_| SessionError::protocol("worker runtime lock poisoned"))?;
-            if runtime.is_none() {
-                let spec = match spec {
-                    Some(spec) => spec,
-                    None => {
-                        return Err(SessionError::invalid(
-                            "first attachment needs a session spec",
-                        ));
-                    }
-                };
-                let new_runtime = match Runtime::new(spec, Arc::clone(&shared.delegate)) {
-                    Ok(runtime) => runtime,
-                    Err(error) => return Err(error),
-                };
-                *runtime = Some(new_runtime);
-            }
-            active.as_ref().map(|active| active.generation)
-        };
+                let _gate = shared
+                    .gate
+                    .lock()
+                    .map_err(|_| SessionError::protocol("worker state lock poisoned"))?;
+                if shared.closing.load(Ordering::Acquire)
+                    || shared.close_pending.load(Ordering::Acquire)
+                {
+                    return Err(SessionError::Detached);
+                }
+                let active = shared.active.lock().map_err(|_| {
+                    SessionError::protocol("worker attachment lock poisoned")
+                })?;
+                let mut runtime = shared.runtime.lock().map_err(|_| {
+                    SessionError::protocol("worker runtime lock poisoned")
+                })?;
+                if runtime.is_none() {
+                    let spec = match spec {
+                        Some(spec) => spec,
+                        None => {
+                            return Err(SessionError::invalid(
+                                "first attachment needs a session spec",
+                            ));
+                        }
+                    };
+                    let new_runtime = Runtime::new(spec, Arc::clone(&shared.delegate))?;
+                    *runtime = Some(new_runtime);
+                }
+                active.as_ref().map(|active| active.generation)
+            };
 
         if let Some(current_generation) = current_generation {
             codec::write_frame_until(
@@ -2274,17 +2265,17 @@ mod unix {
     }
 
     fn run_attachment(
-        shared: Arc<Shared>,
+        shared: &Shared,
         stream: &mut UnixStream,
         generation: u64,
     ) -> Result<(), SessionError> {
         let mut last_request_id = 0;
         loop {
-            if !is_active(&shared, generation) {
+            if !is_active(shared, generation) {
                 return Ok(());
             }
-            drain_notifications(&shared)?;
-            flush_events(&shared, stream, generation)?;
+            drain_notifications(shared)?;
+            flush_events(shared, stream, generation)?;
 
             match read_client_message(stream)? {
                 Some(message @ ClientMessage::Command { .. }) => {
@@ -2313,7 +2304,7 @@ mod unix {
                         let _gate = shared.gate.lock().map_err(|_| {
                             SessionError::protocol("worker state lock poisoned")
                         })?;
-                        if !is_active(&shared, generation)
+                        if !is_active(shared, generation)
                             || command_generation != generation
                         {
                             (Err(SessionError::protocol("stale attachment")), false, true)
@@ -2481,14 +2472,9 @@ mod unix {
             loop {
                 let notification = match critical_receiver.try_recv() {
                     Ok(notification) => Some(notification),
-                    Err(TryRecvError::Empty) => match receiver.try_recv() {
-                        Ok(notification) => Some(notification),
-                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-                    },
-                    Err(TryRecvError::Disconnected) => match receiver.try_recv() {
-                        Ok(notification) => Some(notification),
-                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-                    },
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                        receiver.try_recv().ok()
+                    }
                 };
                 let Some(notification) = notification else {
                     break;
@@ -2616,7 +2602,7 @@ mod unix {
                             },
                         );
                     }
-                    Notification::DesktopNotification { title, body } => {
+                    Notification::Desktop { title, body } => {
                         push_event(
                             runtime,
                             SessionEvent::DesktopNotification { title, body },
@@ -2717,18 +2703,19 @@ mod unix {
             SessionEvent::ChildExited { .. }
                 | SessionEvent::ClipboardOverflow
                 | SessionEvent::Closed
-        ) && runtime
-            .pending_events
-            .iter()
-            .any(|pending| match (&event, pending) {
-                (SessionEvent::ChildExited { .. }, SessionEvent::ChildExited { .. })
-                | (SessionEvent::Closed, SessionEvent::Closed)
-                | (SessionEvent::ClipboardOverflow, SessionEvent::ClipboardOverflow) => {
-                    true
-                }
-                _ => false,
-            })
-        {
+        ) && runtime.pending_events.iter().any(|pending| {
+            matches!(
+                (&event, pending),
+                (
+                    SessionEvent::ChildExited { .. },
+                    SessionEvent::ChildExited { .. }
+                ) | (SessionEvent::Closed, SessionEvent::Closed)
+                    | (
+                        SessionEvent::ClipboardOverflow,
+                        SessionEvent::ClipboardOverflow
+                    )
+            )
+        }) {
             return true;
         }
         if matches!(event, SessionEvent::FrameReady)
@@ -2925,7 +2912,7 @@ mod unix {
                     &mut length,
                 )
             };
-            return result == 0 && peer.uid == unsafe { libc::geteuid() };
+            result == 0 && peer.uid == unsafe { libc::geteuid() }
         }
         #[cfg(any(
             target_os = "macos",
@@ -2938,7 +2925,7 @@ mod unix {
             let mut egid = 0;
             let result =
                 unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) };
-            return result == 0 && euid == unsafe { libc::geteuid() };
+            result == 0 && euid == unsafe { libc::geteuid() }
         }
         #[cfg(not(any(
             target_os = "linux",
@@ -3141,7 +3128,7 @@ pub fn run() -> Result<(), crate::SessionError> {
     {
         let (endpoint, session_id) = unix::parse_args(std::env::args_os().skip(1))?;
         let capability = unix::read_capability()?;
-        return unix::run(endpoint, session_id, capability);
+        unix::run(endpoint, session_id, capability)
     }
     #[cfg(not(unix))]
     Err(crate::SessionError::unsupported(
