@@ -2062,8 +2062,11 @@ impl<U: EventListener> Crosswords<U> {
                     .iter()
                     .fold(false, |acc, c| acc | c.needs_wide_cleanup());
                 if !needs_cleanup {
-                    for (pair, &cp) in
-                        cells.chunks_exact_mut(2).zip(&cps[idx..idx + take])
+                    for (pair, &cp) in cells
+                        .as_chunks_mut::<2>()
+                        .0
+                        .iter_mut()
+                        .zip(&cps[idx..idx + take])
                     {
                         let c = char::from_u32(cp).unwrap_or('\u{FFFD}');
                         let mut wide = Square::from_template(template, c);
@@ -7905,8 +7908,12 @@ mod tests {
 
         assert_eq!(term.keyboard_mode_idx, 0);
         // All modes should be cleared to NO_MODE
-        for i in 0..KEYBOARD_MODE_STACK_MAX_DEPTH {
-            assert_eq!(term.keyboard_mode_stack[i], KeyboardModes::NO_MODE.bits());
+        for mode in term
+            .keyboard_mode_stack
+            .iter()
+            .take(KEYBOARD_MODE_STACK_MAX_DEPTH)
+        {
+            assert_eq!(*mode, KeyboardModes::NO_MODE.bits());
         }
     }
 

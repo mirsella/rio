@@ -217,7 +217,7 @@ impl SessionState {
                             | SessionEvent::GlyphProtocolQuery { .. }
                             | SessionEvent::DesktopNotification { .. }
                             | SessionEvent::ChildExited { .. }
-                            | SessionEvent::ClipboardOverflow { .. }
+                            | SessionEvent::ClipboardOverflow
                             | SessionEvent::RequestRefused { .. }
                             | SessionEvent::RequestExpired { .. }
                             | SessionEvent::ColorChange { .. }
@@ -440,12 +440,11 @@ impl SessionHandle {
         let listener = event_proxy.with_window_target(WindowTarget::dynamic(window_id));
         let state_for_thread = Arc::clone(&state);
         let client = Arc::new(client);
-        let pump_client = Arc::clone(&client);
         thread::Builder::new()
             .name(format!("rio-session-{route_id}"))
             .spawn(move || {
                 SessionPump {
-                    client: pump_client,
+                    client,
                     receiver,
                     state: state_for_thread,
                     event_proxy: listener,
@@ -803,17 +802,9 @@ impl PreparedSession {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PassiveCursor {
     pub pos: Pos,
-}
-
-impl Default for PassiveCursor {
-    fn default() -> Self {
-        Self {
-            pos: Pos::default(),
-        }
-    }
 }
 
 /// A renderer-facing row cache. Only viewport rows are available in a
@@ -832,6 +823,51 @@ pub struct PassiveGrid {
     extras_by_value: FxHashMap<Extras, u16>,
     styles_by_value: FxHashMap<Style, u16>,
     next_extra_id: usize,
+}
+
+pub(crate) struct RenderBuffers {
+    pub(crate) rows: Vec<Row<Square>>,
+    pub(crate) row_styles: Vec<Vec<Style>>,
+    pub(crate) extras: FxHashMap<u16, Extras>,
+}
+
+struct FrameDecodeState {
+    columns: usize,
+    extras: FxHashMap<u16, Extras>,
+    extras_by_value: FxHashMap<Extras, u16>,
+    styles_by_value: FxHashMap<Style, u16>,
+    next_extra_id: usize,
+}
+
+impl FrameDecodeState {
+    fn new(columns: usize) -> Self {
+        let mut styles_by_value = FxHashMap::default();
+        styles_by_value.insert(Style::default(), 0);
+        Self {
+            columns,
+            extras: FxHashMap::default(),
+            extras_by_value: FxHashMap::default(),
+            styles_by_value,
+            next_extra_id: 1,
+        }
+    }
+
+    fn from_grid(grid: &PassiveGrid) -> Self {
+        Self {
+            columns: grid.columns,
+            extras: grid.extras.clone(),
+            extras_by_value: grid.extras_by_value.clone(),
+            styles_by_value: grid.styles_by_value.clone(),
+            next_extra_id: grid.next_extra_id,
+        }
+    }
+
+    fn install_into(self, grid: &mut PassiveGrid) {
+        grid.extras = self.extras;
+        grid.extras_by_value = self.extras_by_value;
+        grid.styles_by_value = self.styles_by_value;
+        grid.next_extra_id = self.next_extra_id;
+    }
 }
 
 impl PassiveGrid {
@@ -894,25 +930,18 @@ impl PassiveGrid {
             .and_then(|extras| extras.hyperlink.clone())
     }
 
-    pub(crate) fn take_render_buffers(
-        &mut self,
-    ) -> (Vec<Row<Square>>, Vec<Vec<Style>>, FxHashMap<u16, Extras>) {
-        (
-            std::mem::take(&mut self.rows),
-            std::mem::take(&mut self.row_styles),
-            std::mem::take(&mut self.extras),
-        )
+    pub(crate) fn take_render_buffers(&mut self) -> RenderBuffers {
+        RenderBuffers {
+            rows: std::mem::take(&mut self.rows),
+            row_styles: std::mem::take(&mut self.row_styles),
+            extras: std::mem::take(&mut self.extras),
+        }
     }
 
-    pub(crate) fn restore_render_buffers(
-        &mut self,
-        rows: Vec<Row<Square>>,
-        row_styles: Vec<Vec<Style>>,
-        extras: FxHashMap<u16, Extras>,
-    ) {
-        self.rows = rows;
-        self.row_styles = row_styles;
-        self.extras = extras;
+    pub(crate) fn restore_render_buffers(&mut self, buffers: RenderBuffers) {
+        self.rows = buffers.rows;
+        self.row_styles = buffers.row_styles;
+        self.extras = buffers.extras;
     }
 }
 
@@ -1079,23 +1108,32 @@ impl RemoteView {
     }
 
     pub fn refresh(&mut self) {
-        let Some(session) = self.session.clone() else {
+        let Some((navigation, matches, (frame, updates))) =
+            self.session.as_ref().map(|session| {
+                (
+                    session.take_search_navigation(),
+                    session.take_search_matches(),
+                    session.take_frame_updates(),
+                )
+            })
+        else {
             return;
         };
-        if let Some(navigation) = session.take_search_navigation() {
+        if let Some(navigation) = navigation {
             self.search_navigation = Some(navigation);
         }
-        if let Some(matches) = session.take_search_matches() {
+        if let Some(matches) = matches {
             self.search_matches = Some(matches);
         }
-        let (frame, updates) = session.take_frame_updates();
         if let Some(frame) = frame {
             let current_sequence =
                 self.frame.as_ref().map_or(0, |current| current.sequence);
             if frame.sequence != current_sequence {
                 if let Err(error) = self.apply_frame(frame) {
                     self.decode_error = Some(error.clone());
-                    session.record_command_error(SessionError::Invalid(error));
+                    if let Some(session) = self.session.as_ref() {
+                        session.record_command_error(SessionError::Invalid(error));
+                    }
                 } else {
                     self.decode_error = None;
                     self.delta_resync_logged = false;
@@ -1117,8 +1155,10 @@ impl RemoteView {
                         );
                         self.delta_resync_logged = true;
                     }
-                    if let Err(error) = session.enqueue(SessionCommand::Snapshot) {
-                        session.record_command_error(error);
+                    if let Some(session) = self.session.as_ref() {
+                        if let Err(error) = session.enqueue(SessionCommand::Snapshot) {
+                            session.record_command_error(error);
+                        }
                     }
                     break;
                 }
@@ -1156,13 +1196,13 @@ impl RemoteView {
         let columns = frame.columns as usize;
         let lines = frame.lines as usize;
         let mut grid = PassiveGrid::new(columns, lines);
-        grid.history = frame.history_size as usize;
-        grid.display_offset = frame.display_offset as usize;
+        let mut decode_state = FrameDecodeState::new(grid.columns);
         for (row_index, source) in frame.rows.iter().enumerate() {
-            let (row, styles) = Self::decode_row(&mut grid, source)?;
+            let (row, styles) = Self::decode_row(&mut decode_state, source)?;
             grid.rows[row_index] = row;
             grid.row_styles[row_index] = styles;
         }
+        decode_state.install_into(&mut grid);
         self.grid = grid;
         self.update_frame_metadata(&frame);
         self.frame = Some(frame);
@@ -1175,10 +1215,10 @@ impl RemoteView {
     }
 
     fn decode_row(
-        grid: &mut PassiveGrid,
+        state: &mut FrameDecodeState,
         source: &RowFrame,
     ) -> Result<(Row<Square>, Vec<Style>), String> {
-        let columns = grid.columns;
+        let columns = state.columns;
         if source.cells.len() != columns
             || source.styles.len() != columns
             || source.extras.len() != columns
@@ -1193,20 +1233,20 @@ impl RemoteView {
             if is_codepoint {
                 if let Some(extra) = source.extras.get(column).and_then(Option::as_ref) {
                     let extras = decode_extras(extra);
-                    let id = if let Some(id) = grid.extras_by_value.get(&extras) {
+                    let id = if let Some(id) = state.extras_by_value.get(&extras) {
                         *id
                     } else {
-                        if grid.next_extra_id > usize::from(u16::MAX) {
+                        if state.next_extra_id > usize::from(u16::MAX) {
                             return Err(
                                 "passive frame extras table exceeds u16 capacity".into(),
                             );
                         }
-                        let id = u16::try_from(grid.next_extra_id).map_err(|_| {
+                        let id = u16::try_from(state.next_extra_id).map_err(|_| {
                             "passive frame extras ID overflow".to_string()
                         })?;
-                        grid.next_extra_id += 1;
-                        grid.extras_by_value.insert(extras.clone(), id);
-                        grid.extras.insert(id, extras);
+                        state.next_extra_id += 1;
+                        state.extras_by_value.insert(extras.clone(), id);
+                        state.extras.insert(id, extras);
                         id
                     };
                     square.set_extras_id(Some(id));
@@ -1218,17 +1258,17 @@ impl RemoteView {
                 .get(column)
                 .map(decode_style)
                 .unwrap_or_default();
-            row_styles.push(style.clone());
-            let style_id = if let Some(id) = grid.styles_by_value.get(&style) {
+            row_styles.push(style);
+            let style_id = if let Some(id) = state.styles_by_value.get(&style) {
                 *id
             } else {
-                let next_id = grid.styles_by_value.len();
+                let next_id = state.styles_by_value.len();
                 if next_id > usize::from(u16::MAX) {
                     return Err("passive frame style ID overflow".into());
                 }
                 let id = u16::try_from(next_id)
                     .map_err(|_| "passive frame style ID overflow".to_string())?;
-                grid.styles_by_value.insert(style.clone(), id);
+                state.styles_by_value.insert(style, id);
                 id
             };
             if is_codepoint {
@@ -1292,16 +1332,16 @@ impl RemoteView {
                 let old_alternate_screen = current.alternate_screen;
                 let changed_row_count = delta.rows.len();
                 let mut next = current;
-                let mut staged_grid = self.grid.clone();
+                let mut decode_state = FrameDecodeState::from_grid(&self.grid);
                 let mut decoded_rows = Vec::with_capacity(delta.rows.len());
                 for changed in &delta.rows {
                     let row_index = usize::from(changed.line);
-                    if row_index >= staged_grid.rows.len() {
+                    if row_index >= self.grid.rows.len() {
                         self.frame = Some(next);
                         return Err("frame delta row is outside the cached grid".into());
                     }
                     let (row, styles) =
-                        match Self::decode_row(&mut staged_grid, &changed.row) {
+                        match Self::decode_row(&mut decode_state, &changed.row) {
                             Ok(decoded) => decoded,
                             Err(error) => {
                                 self.frame = Some(next);
@@ -1315,7 +1355,7 @@ impl RemoteView {
                     return Err(error.to_string());
                 }
                 let alternate_changed = old_alternate_screen != next.alternate_screen;
-                self.grid = staged_grid;
+                decode_state.install_into(&mut self.grid);
                 for (row_index, row, styles) in decoded_rows {
                     self.grid.rows[row_index] = row;
                     self.grid.row_styles[row_index] = styles;
@@ -1867,6 +1907,35 @@ fn decode_colors(
         result[index] = *color;
     }
     result
+}
+
+fn wire_vi_motion(
+    motion: rio_backend::crosswords::vi_mode::ViMotion,
+) -> Option<WireViMotion> {
+    use rio_backend::crosswords::vi_mode::ViMotion as Local;
+    Some(match motion {
+        Local::Up => WireViMotion::Up,
+        Local::Down => WireViMotion::Down,
+        Local::Left => WireViMotion::Left,
+        Local::Right => WireViMotion::Right,
+        Local::First => WireViMotion::First,
+        Local::Last => WireViMotion::Last,
+        Local::FirstOccupied => WireViMotion::FirstOccupied,
+        Local::High => WireViMotion::High,
+        Local::Middle => WireViMotion::Middle,
+        Local::Low => WireViMotion::Low,
+        Local::SemanticLeft => WireViMotion::SemanticLeft,
+        Local::SemanticRight => WireViMotion::SemanticRight,
+        Local::SemanticLeftEnd => WireViMotion::SemanticLeftEnd,
+        Local::SemanticRightEnd => WireViMotion::SemanticRightEnd,
+        Local::WordLeft => WireViMotion::WordLeft,
+        Local::WordRight => WireViMotion::WordRight,
+        Local::WordLeftEnd => WireViMotion::WordLeftEnd,
+        Local::WordRightEnd => WireViMotion::WordRightEnd,
+        Local::Bracket => WireViMotion::Bracket,
+        Local::ParagraphUp => WireViMotion::ParagraphUp,
+        Local::ParagraphDown => WireViMotion::ParagraphDown,
+    })
 }
 
 #[cfg(test)]
@@ -2823,33 +2892,4 @@ mod tests {
         ));
         assert!(state.error.lock().unwrap().is_none());
     }
-}
-
-fn wire_vi_motion(
-    motion: rio_backend::crosswords::vi_mode::ViMotion,
-) -> Option<WireViMotion> {
-    use rio_backend::crosswords::vi_mode::ViMotion as Local;
-    Some(match motion {
-        Local::Up => WireViMotion::Up,
-        Local::Down => WireViMotion::Down,
-        Local::Left => WireViMotion::Left,
-        Local::Right => WireViMotion::Right,
-        Local::First => WireViMotion::First,
-        Local::Last => WireViMotion::Last,
-        Local::FirstOccupied => WireViMotion::FirstOccupied,
-        Local::High => WireViMotion::High,
-        Local::Middle => WireViMotion::Middle,
-        Local::Low => WireViMotion::Low,
-        Local::SemanticLeft => WireViMotion::SemanticLeft,
-        Local::SemanticRight => WireViMotion::SemanticRight,
-        Local::SemanticLeftEnd => WireViMotion::SemanticLeftEnd,
-        Local::SemanticRightEnd => WireViMotion::SemanticRightEnd,
-        Local::WordLeft => WireViMotion::WordLeft,
-        Local::WordRight => WireViMotion::WordRight,
-        Local::WordLeftEnd => WireViMotion::WordLeftEnd,
-        Local::WordRightEnd => WireViMotion::WordRightEnd,
-        Local::Bracket => WireViMotion::Bracket,
-        Local::ParagraphUp => WireViMotion::ParagraphUp,
-        Local::ParagraphDown => WireViMotion::ParagraphDown,
-    })
 }

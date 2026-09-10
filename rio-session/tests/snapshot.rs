@@ -30,15 +30,16 @@ fn worker_path() -> PathBuf {
 }
 
 fn session_spec() -> SessionSpec {
-    let mut spec = SessionSpec::default();
-    spec.shell = Some("/bin/sh".into());
-    spec.args = vec!["-c".into(), "stty raw -echo; cat".into()];
-    spec.environment = vec![
-        EnvVar::new("HOME", std::env::temp_dir().to_str().unwrap()),
-        EnvVar::new("PATH", "/usr/bin:/bin"),
-        EnvVar::new("TERM", "xterm-rio"),
-    ];
-    spec
+    SessionSpec {
+        shell: Some("/bin/sh".into()),
+        args: vec!["-c".into(), "stty raw -echo; cat".into()],
+        environment: vec![
+            EnvVar::new("HOME", std::env::temp_dir().to_str().unwrap()),
+            EnvVar::new("PATH", "/usr/bin:/bin"),
+            EnvVar::new("TERM", "xterm-rio"),
+        ],
+        ..Default::default()
+    }
 }
 
 fn snapshot_until(

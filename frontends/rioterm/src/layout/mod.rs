@@ -177,24 +177,40 @@ impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
     }
 }
 
-fn build_layout_node(
-    tree: &mut TaffyTree<()>,
-    node: &crate::router::window_control::LayoutNodeOffer,
-    panel_style: &Style,
-    panel_config: &rio_backend::config::layout::Panel,
+struct LayoutBuildContext<'a> {
+    tree: &'a mut TaffyTree<()>,
+    panel_style: &'a Style,
+    panel_config: &'a rio_backend::config::layout::Panel,
     scale: f32,
-    pane_rects: &FxHashMap<u64, [f32; 4]>,
+    pane_rects: &'a FxHashMap<u64, [f32; 4]>,
+    leaves: &'a mut Vec<(u64, NodeId)>,
+}
+
+pub(crate) struct LayoutOfferInput<'a, T: EventListener> {
+    pub(crate) contexts: Vec<Context<T>>,
+    pub(crate) layout: &'a crate::router::window_control::LayoutNodeOffer,
+    pub(crate) active_route: u64,
+    pub(crate) route_map: &'a FxHashMap<u64, usize>,
+    pub(crate) pane_rects: &'a FxHashMap<u64, [f32; 4]>,
+    pub(crate) scaled_margin: Margin,
+    pub(crate) border_color: [f32; 4],
+    pub(crate) panel_config: rio_backend::config::layout::Panel,
+}
+
+fn build_layout_node(
+    node: &crate::router::window_control::LayoutNodeOffer,
     parent_direction: Option<taffy::FlexDirection>,
-    leaves: &mut Vec<(u64, NodeId)>,
+    context: &mut LayoutBuildContext<'_>,
 ) -> Result<NodeId, String> {
-    let flex_grow = offered_flex_grow(node, pane_rects, parent_direction);
+    let flex_grow = offered_flex_grow(node, context.pane_rects, parent_direction);
     if node.children.is_empty() {
-        let mut style = panel_style.clone();
+        let mut style = context.panel_style.clone();
         style.flex_grow = flex_grow;
-        let panel_node = tree
+        let panel_node = context
+            .tree
             .new_leaf(style)
             .map_err(|error| format!("create transfer panel: {error}"))?;
-        leaves.push((node.route_id, panel_node));
+        context.leaves.push((node.route_id, panel_node));
         return Ok(panel_node);
     }
     let direction = match node.direction {
@@ -212,26 +228,20 @@ fn build_layout_node(
         flex_grow,
         flex_shrink: 1.0,
         gap: geometry::Size {
-            width: length(panel_config.column_gap * scale),
-            height: length(panel_config.row_gap * scale),
+            width: length(context.panel_config.column_gap * context.scale),
+            height: length(context.panel_config.row_gap * context.scale),
         },
         ..Default::default()
     };
-    let container = tree
+    let container = context
+        .tree
         .new_leaf(container_style)
         .map_err(|error| format!("create transfer split: {error}"))?;
     for child in &node.children {
-        let child = build_layout_node(
-            tree,
-            child,
-            panel_style,
-            panel_config,
-            scale,
-            pane_rects,
-            Some(direction),
-            leaves,
-        )?;
-        tree.add_child(container, child)
+        let child = build_layout_node(child, Some(direction), context)?;
+        context
+            .tree
+            .add_child(container, child)
             .map_err(|error| format!("attach transfer split: {error}"))?;
     }
     Ok(container)
@@ -290,7 +300,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         context: Context<T>,
         scaled_margin: Margin,
         border_color: [f32; 4],
-        _border_active_color: [f32; 4],
         panel_config: rio_backend::config::layout::Panel,
     ) -> Self {
         let width = context.dimension.width;
@@ -501,16 +510,18 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     }
 
     pub fn from_layout_offer(
-        contexts: Vec<Context<T>>,
-        layout: &crate::router::window_control::LayoutNodeOffer,
-        active_route: u64,
-        route_map: &FxHashMap<u64, usize>,
-        pane_rects: &FxHashMap<u64, [f32; 4]>,
-        scaled_margin: Margin,
-        border_color: [f32; 4],
-        _border_active_color: [f32; 4],
-        panel_config: rio_backend::config::layout::Panel,
+        input: LayoutOfferInput<'_, T>,
     ) -> Result<Self, (Vec<Context<T>>, String)> {
+        let LayoutOfferInput {
+            contexts,
+            layout,
+            active_route,
+            route_map,
+            pane_rects,
+            scaled_margin,
+            border_color,
+            panel_config,
+        } = input;
         let Some(first) = contexts.first() else {
             return Err((contexts, "transfer layout has no contexts".into()));
         };
@@ -557,25 +568,27 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             }
         };
         let mut leaves = Vec::new();
-        let panel_node = match build_layout_node(
-            &mut tree,
-            layout,
-            &panel_style,
-            &panel_config,
-            scale,
-            pane_rects,
-            None,
-            &mut leaves,
-        ) {
+        let build_result = {
+            let mut build_context = LayoutBuildContext {
+                tree: &mut tree,
+                panel_style: &panel_style,
+                panel_config: &panel_config,
+                scale,
+                pane_rects,
+                leaves: &mut leaves,
+            };
+            build_layout_node(layout, None, &mut build_context)
+        };
+        let panel_node = match build_result {
             Ok(node) => node,
             Err(error) => return Err((contexts, error)),
         };
         if let Err(error) = tree.add_child(root_node, panel_node) {
             return Err((contexts, format!("attach transfer layout root: {error}")));
         }
-        let mut contexts = contexts.into_iter();
+        let contexts = contexts.into_iter();
         let mut by_route = FxHashMap::default();
-        while let Some(context) = contexts.next() {
+        for context in contexts {
             by_route.insert(context.route_id, context);
         }
         let mut inner = FxHashMap::default();
@@ -1640,18 +1653,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
 
         // Always apply Taffy layout for consistent positioning
-        self.apply_taffy_layout();
-    }
-
-    /// Resize grid - always uses Taffy for consistent layout
-    pub fn resize(&mut self, new_width: f32, new_height: f32) {
-        self.width = new_width;
-        self.height = new_height;
-
-        // Update Taffy size and recompute layout
-        let _ = self.try_update_size(new_width, new_height);
-
-        // Apply layout - works for both single and multi-panel
         self.apply_taffy_layout();
     }
 

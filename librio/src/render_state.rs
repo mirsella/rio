@@ -330,22 +330,23 @@ impl RenderState {
         self.lines_evicted = term.lines_evicted();
         self.history_size = self.lines_evicted as i64 + term.history_size() as i64;
         self.alt_screen = term.mode().contains(rio_vt::crosswords::Mode::ALT_SCREEN);
-        self.kitty.clear();
+        let mut kitty = std::mem::take(&mut self.kitty);
+        kitty.clear();
         for placement in term.graphics.kitty_placements.values() {
             if let Some(image) = term.graphics.get_kitty_image(placement.image_id) {
-                self.kitty.push(KittyEntry::Direct {
+                kitty.push(KittyEntry::Direct {
                     placement: placement.clone(),
                     image_width: image.data.width,
                     image_height: image.data.height,
                 });
             }
         }
-        let virtual_runs = self.collect_virtual_runs(term);
-        self.kitty.extend(virtual_runs);
+        self.collect_virtual_runs(term, &mut kitty);
         // Under-background placements (z < i32::MIN / 2) first, then
         // under-text (z < 0), then over-text: drawing in order layers
         // correctly, and the host can split the list at those bounds.
-        self.kitty.sort_by_key(KittyEntry::z_index);
+        kitty.sort_by_key(KittyEntry::z_index);
+        self.kitty = kitty;
         self.term_colors = *term.colors();
         let cursor = term.cursor();
         self.cursor_line = cursor.pos.row.0.max(0) as usize;
@@ -357,7 +358,7 @@ impl RenderState {
         self.selection = term
             .selection
             .as_ref()
-            .and_then(|selection| selection.to_range(&term))
+            .and_then(|selection| selection.to_range(term))
             .and_then(|range| {
                 let offset = term.display_offset() as i32;
                 let lines = self.rows.len() as i32;
@@ -542,11 +543,14 @@ impl RenderState {
     /// The walk mirrors rioterm's renderer: a cell with missing
     /// diacritics inherits from its left neighbour, and consecutive cells
     /// showing sequential image columns collapse into one run.
-    fn collect_virtual_runs(&self, term: &Crosswords<Listener>) -> Vec<KittyEntry> {
-        let mut entries = Vec::new();
+    fn collect_virtual_runs(
+        &self,
+        term: &Crosswords<Listener>,
+        entries: &mut Vec<KittyEntry>,
+    ) {
         let graphics = &term.graphics;
         if graphics.kitty_virtual_placements.is_empty() {
-            return entries;
+            return;
         }
 
         let flush = |entries: &mut Vec<KittyEntry>,
@@ -580,7 +584,7 @@ impl RenderState {
             for (col, square) in row.inner.iter().enumerate() {
                 if square.c() != PLACEHOLDER {
                     if let Some((p, start_col)) = run.take() {
-                        flush(&mut entries, p.complete(), line, start_col);
+                        flush(entries, p.complete(), line, start_col);
                     }
                     continue;
                 }
@@ -603,7 +607,7 @@ impl RenderState {
                     }
                     _ => {
                         if let Some((p, start_col)) = run.take() {
-                            flush(&mut entries, p.complete(), line, start_col);
+                            flush(entries, p.complete(), line, start_col);
                         }
                         // Default missing row/col on the FIRST cell of a
                         // run, so a later cell with an explicit column can
@@ -619,10 +623,9 @@ impl RenderState {
                 }
             }
             if let Some((p, start_col)) = run {
-                flush(&mut entries, p.complete(), line, start_col);
+                flush(entries, p.complete(), line, start_col);
             }
         }
-        entries
     }
 
     /// Viewport geometry for the placement at `index`, in pixels relative

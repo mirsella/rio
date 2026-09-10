@@ -120,7 +120,7 @@ fn session_key_input(
 
     let text = key
         .text_with_all_modifiers()
-        .or_else(|| key.text.as_deref())
+        .or(key.text.as_deref())
         .filter(|text| !text.is_empty())
         .map(str::to_owned);
     let consumed_modifiers = if modifiers.alt_key() && !alt_is_meta {
@@ -538,7 +538,6 @@ impl Screen<'_> {
             working_dir,
             is_native,
             split_color: config.colors.split,
-            split_active_color: config.colors.split_active,
             panel: config.panel,
             title: config.title.clone(),
             keyboard: config.keyboard.clone(),
@@ -3299,13 +3298,15 @@ impl Screen<'_> {
         if let Some(ref mut island) = self.renderer.island {
             if island.is_color_picker_open() {
                 let consumed = island.handle_color_picker_click(
-                    mouse_x as f32,
-                    mouse_y as f32,
-                    scale_factor,
-                    window_width,
-                    num_tabs,
-                    &self.renderer.navigation,
-                    &mut self.context_manager,
+                    crate::renderer::island::ColorPickerClick {
+                        mouse_x: mouse_x as f32,
+                        mouse_y: mouse_y as f32,
+                        scale_factor,
+                        window_width,
+                        num_tabs,
+                        navigation: &self.renderer.navigation,
+                        context_manager: &mut self.context_manager,
+                    },
                 );
                 if consumed {
                     self.mark_dirty();
@@ -3838,7 +3839,6 @@ impl Screen<'_> {
                 limit,
             );
         }
-        return;
     }
 
     #[inline]
@@ -4158,13 +4158,7 @@ impl Screen<'_> {
             cell_w: f32,
             cell_h: f32,
             font_px: f32,
-            visible_rows: Vec<
-                rio_backend::crosswords::grid::row::Row<
-                    rio_backend::crosswords::square::Square,
-                >,
-            >,
-            row_styles: Vec<Vec<rio_backend::crosswords::style::Style>>,
-            extras: rustc_hash::FxHashMap<u16, rio_backend::crosswords::square::Extras>,
+            render_buffers: crate::context::session::RenderBuffers,
             term_colors: rio_backend::config::colors::term::TermColors,
             cursor_col: u16,
             cursor_row: u16,
@@ -4192,14 +4186,19 @@ impl Screen<'_> {
         }
 
         let active_route = self.context_manager.current().route_id;
-        let focused_match = self.search_state.focused_match.clone();
+        let focused_match = self.search_state.focused_match.as_ref();
         let mut panels = Vec::new();
-        for (_, item) in self.context_manager.current_grid_mut().contexts_mut() {
+        for item in self
+            .context_manager
+            .current_grid_mut()
+            .contexts_mut()
+            .values_mut()
+        {
             let context = &mut item.val;
             let content = &mut context.renderable_content;
             let mut terminal = context.terminal.lock();
             terminal.refresh_renderable(content);
-            let (visible_rows, row_styles, extras) = terminal.grid.take_render_buffers();
+            let render_buffers = terminal.grid.take_render_buffers();
             let graphics = terminal.take_render_graphics();
             let graphics_dirty = terminal.graphics_dirty();
             panels.push(PanelFrame {
@@ -4210,11 +4209,9 @@ impl Screen<'_> {
                 cell_w: context.dimension.cell.cell_width as f32,
                 cell_h: context.dimension.cell.cell_height as f32,
                 font_px: context.dimension.scaled_font_size.max(1.0),
-                visible_rows,
-                row_styles,
-                extras,
+                render_buffers,
                 term_colors: content.term_colors,
-                cursor_col: content.cursor.state.pos.col.0.max(0) as u16,
+                cursor_col: content.cursor.state.pos.col.0 as u16,
                 cursor_row: content.cursor.state.pos.row.0.max(0) as u16,
                 cursor_visible: content.cursor.state.is_visible(),
                 cursor_shape: content.cursor.state.content,
@@ -4237,7 +4234,7 @@ impl Screen<'_> {
                 graphics_dirty,
                 hint_matches: content.hint_matches.clone(),
                 focused_match: if context.route_id == active_route {
-                    focused_match.clone()
+                    focused_match.cloned()
                 } else {
                     None
                 },
@@ -4266,20 +4263,22 @@ impl Screen<'_> {
         for panel in &mut panels {
             install_frame_graphics(
                 &mut self.sugarloaf,
-                panel.route_id,
-                &panel.graphics,
-                &panel.visible_rows,
-                &panel.row_styles,
-                &panel.extras,
-                panel.history_size,
-                panel.display_offset,
-                panel.cols,
-                panel.rows,
-                panel.cell_w,
-                panel.cell_h,
-                (scaled_margin.left + panel.layout_rect[0]).round(),
-                (scaled_margin.top + panel.layout_rect[1]).round(),
-                panel.graphics_dirty,
+                FrameGraphicsInput {
+                    route_id: panel.route_id,
+                    frame: &panel.graphics,
+                    visible_rows: &panel.render_buffers.rows,
+                    styles: &panel.render_buffers.row_styles,
+                    extras: &panel.render_buffers.extras,
+                    history_size: panel.history_size,
+                    display_offset: panel.display_offset,
+                    cols: panel.cols,
+                    screen_rows: panel.rows,
+                    cell_w: panel.cell_w,
+                    cell_h: panel.cell_h,
+                    origin_x: (scaled_margin.left + panel.layout_rect[0]).round(),
+                    origin_y: (scaled_margin.top + panel.layout_rect[1]).round(),
+                    update_images: panel.graphics_dirty,
+                },
             );
             panel.graphics_dirty = false;
         }
@@ -4310,13 +4309,14 @@ impl Screen<'_> {
             for row_index in 0..panel.rows as usize {
                 let rebuild_row = rebuild_all
                     || panel
-                        .visible_rows
+                        .render_buffers
+                        .rows
                         .get(row_index)
                         .is_some_and(|row| row.dirty);
                 if !rebuild_row {
                     continue;
                 }
-                let Some(row) = panel.visible_rows.get_mut(row_index) else {
+                let Some(row) = panel.render_buffers.rows.get_mut(row_index) else {
                     break;
                 };
                 hints.clear();
@@ -4330,6 +4330,7 @@ impl Screen<'_> {
                     &mut hints,
                 );
                 let styles = panel
+                    .render_buffers
                     .row_styles
                     .get(row_index)
                     .map(Vec::as_slice)
@@ -4389,7 +4390,7 @@ impl Screen<'_> {
                     cols,
                     row_index as u16,
                     styles,
-                    &panel.extras,
+                    &panel.render_buffers.extras,
                     renderer,
                     &panel.term_colors,
                     &mut self.grid_rasterizer,
@@ -4409,7 +4410,7 @@ impl Screen<'_> {
                     &mut fg,
                 );
                 grid.write_row(row_index as u32, &bg, &fg);
-                if let Some(row) = panel.visible_rows.get_mut(row_index) {
+                if let Some(row) = panel.render_buffers.rows.get_mut(row_index) {
                     row.dirty = false;
                 }
             }
@@ -4516,18 +4517,19 @@ impl Screen<'_> {
             }
         }
 
-        for (_, item) in self.context_manager.current_grid_mut().contexts_mut() {
+        for item in self
+            .context_manager
+            .current_grid_mut()
+            .contexts_mut()
+            .values_mut()
+        {
             if let Some(index) = panels
                 .iter()
                 .position(|panel| panel.route_id == item.val.route_id)
             {
                 let panel = panels.swap_remove(index);
                 let mut terminal = item.val.terminal.lock();
-                terminal.grid.restore_render_buffers(
-                    panel.visible_rows,
-                    panel.row_styles,
-                    panel.extras,
-                );
+                terminal.grid.restore_render_buffers(panel.render_buffers);
                 terminal.restore_render_graphics(panel.graphics);
                 terminal.mark_graphics_clean();
             }
@@ -4989,15 +4991,14 @@ impl Screen<'_> {
     }
 }
 
-fn install_frame_graphics(
-    sugarloaf: &mut Sugarloaf,
+struct FrameGraphicsInput<'a> {
     route_id: usize,
-    frame: &rio_session::protocol::GraphicsFrame,
-    visible_rows: &[rio_backend::crosswords::grid::row::Row<
+    frame: &'a rio_session::protocol::GraphicsFrame,
+    visible_rows: &'a [rio_backend::crosswords::grid::row::Row<
         rio_backend::crosswords::square::Square,
     >],
-    styles: &[Vec<rio_backend::crosswords::style::Style>],
-    extras: &rustc_hash::FxHashMap<u16, rio_backend::crosswords::square::Extras>,
+    styles: &'a [Vec<rio_backend::crosswords::style::Style>],
+    extras: &'a rustc_hash::FxHashMap<u16, rio_backend::crosswords::square::Extras>,
     history_size: usize,
     display_offset: i32,
     cols: u32,
@@ -5007,7 +5008,25 @@ fn install_frame_graphics(
     origin_x: f32,
     origin_y: f32,
     update_images: bool,
-) {
+}
+
+fn install_frame_graphics(sugarloaf: &mut Sugarloaf, input: FrameGraphicsInput<'_>) {
+    let FrameGraphicsInput {
+        route_id,
+        frame,
+        visible_rows,
+        styles,
+        extras,
+        history_size,
+        display_offset,
+        cols,
+        screen_rows,
+        cell_w,
+        cell_h,
+        origin_x,
+        origin_y,
+        update_images,
+    } = input;
     use rio_backend::ansi::graphics::{
         atlas_overlay_geometry, clip_overlay_to_rect, kitty_overlay_geometry,
         AtlasPlacement, KittyPlacement, OverlayViewport,
@@ -5039,7 +5058,7 @@ fn install_frame_graphics(
                     continue;
                 }
                 let mut pixels = Vec::with_capacity(image.pixels.len() / 3 * 4);
-                for pixel in image.pixels.chunks_exact(3) {
+                for pixel in image.pixels.as_chunks::<3>().0 {
                     pixels.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
                 }
                 (pixels, ColorType::Rgba)

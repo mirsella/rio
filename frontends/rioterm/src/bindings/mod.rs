@@ -2,8 +2,6 @@
 // was originally taken from https://github.com/alacritty/alacritty/blob/e35e5ad14fce8456afdd89f2b392b9924bb27471/alacritty/src/config/bindings.rs
 // which is licensed under Apache 2.0 license.
 
-pub mod kitty_keyboard;
-
 use crate::crosswords::vi_mode::ViMotion;
 use crate::crosswords::Mode;
 use bitflags::bitflags;
@@ -933,77 +931,6 @@ fn convert(config_key_binding: ConfigKeyBinding) -> Result<KeyBinding, String> {
     })
 }
 
-/// Legacy (non-kitty) C0 byte for a ctrl+character combo, using the
-/// same table and modifier discipline as kitty. The platform is
-/// inconsistent about synthesizing these (ctrl+6, ctrl+/), so the byte
-/// is computed here instead of trusting the reported text. Returns
-/// `None` when the combo has no C0 identity or carries modifiers
-/// beyond ctrl (plus alt, which the caller encodes as an ESC prefix,
-/// and shift when it only serves to produce the character itself).
-///
-/// `i`, `m` and `[` are intentionally absent per fixterms: their C0
-/// bytes collide with Tab, Enter and Escape, and the platform text
-/// already carries them in legacy mode.
-pub fn ctrl_seq(key: &Key, text: &str, mods: ModifiersState) -> Option<u8> {
-    if !mods.control_key() {
-        return None;
-    }
-
-    let mut c = {
-        let mut it = text.chars();
-        match (it.next(), it.next()) {
-            (Some(c), None) if c.is_ascii() => c,
-            _ => {
-                // No single-byte text: fall back to the logical key.
-                // Covers layouts whose key produces a non-ASCII char
-                // (cyrillic) and platforms reporting no text at all.
-                let Key::Character(ch) = key else {
-                    return None;
-                };
-                let mut it = ch.chars();
-                let (Some(c), None) = (it.next(), it.next()) else {
-                    return None;
-                };
-                if !c.is_ascii() {
-                    return None;
-                }
-                c
-            }
-        }
-    };
-
-    let mut rest = mods & !(ModifiersState::CONTROL | ModifiersState::ALT);
-    // Shift is consumed when it only produced the character itself
-    // (ctrl+shift+6 arrives as '^'); for letters it stays, so
-    // ctrl+shift+a remains distinguishable from ctrl+a.
-    if rest.shift_key() && !c.is_ascii_uppercase() && c != '@' {
-        rest &= !ModifiersState::SHIFT;
-    }
-    if c.is_ascii_uppercase() && !rest.shift_key() {
-        // Caps lock without shift.
-        c = c.to_ascii_lowercase();
-    }
-    if !rest.is_empty() {
-        return None;
-    }
-
-    Some(match c {
-        ' ' | '2' | '@' => 0x00,
-        '3' => 0x1b,
-        '4' | '\\' => 0x1c,
-        '5' | ']' => 0x1d,
-        '6' | '^' | '~' => 0x1e,
-        '7' | '/' | '_' => 0x1f,
-        '8' | '?' => 0x7f,
-        '0' => b'0',
-        '1' => b'1',
-        '9' => b'9',
-        'i' | 'm' => return None,
-        c @ 'a'..='z' => (c as u8) - b'a' + 1,
-        _ => return None,
-    })
-}
-
 pub fn config_key_bindings(
     config_key_bindings: Vec<ConfigKeyBinding>,
     mut bindings: Vec<KeyBinding>,
@@ -1667,36 +1594,6 @@ mod tests {
             .iter()
             .any(|b| matches!(b.action, Action::Scroll(_)));
         assert!(has_scroll_actions);
-    }
-
-    #[test]
-    fn ctrl_seq_map() {
-        let ctrl = ModifiersState::CONTROL;
-        let shift = ModifiersState::SHIFT;
-        let alt = ModifiersState::ALT;
-        let key = |s: &str| Key::Character(s.into());
-
-        // macOS shape: the platform reports the plain char as text.
-        assert_eq!(ctrl_seq(&key("6"), "6", ctrl), Some(0x1e));
-        assert_eq!(ctrl_seq(&key("/"), "/", ctrl), Some(0x1f));
-        // Windows shape: no text at all.
-        assert_eq!(ctrl_seq(&key("6"), "", ctrl), Some(0x1e));
-        // ctrl+shift+6 arrives as '^': shift is consumed.
-        assert_eq!(ctrl_seq(&key("^"), "^", ctrl | shift), Some(0x1e));
-        // Alt passes through; the caller adds the ESC prefix.
-        assert_eq!(ctrl_seq(&key("6"), "6", ctrl | alt), Some(0x1e));
-        // Letters map, except the fixterms exclusions.
-        assert_eq!(ctrl_seq(&key("q"), "q", ctrl), Some(0x11));
-        assert_eq!(ctrl_seq(&key("i"), "i", ctrl), None);
-        assert_eq!(ctrl_seq(&key("m"), "m", ctrl), None);
-        // ctrl+shift+letter stays distinguishable: no C0 collapse.
-        assert_eq!(ctrl_seq(&key("A"), "A", ctrl | shift), None);
-        // Digit passthrough per kitty.
-        assert_eq!(ctrl_seq(&key("1"), "1", ctrl), Some(b'1'));
-        // Super combos never collapse to C0.
-        assert_eq!(ctrl_seq(&key("6"), "6", ctrl | ModifiersState::SUPER), None);
-        assert_eq!(ctrl_seq(&key("6"), "6", ModifiersState::empty()), None);
-        assert_eq!(ctrl_seq(&Key::Named(Enter), "", ctrl), None);
     }
 
     #[test]
