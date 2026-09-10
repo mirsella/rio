@@ -300,9 +300,38 @@ impl ProcessReadWrite for Pty {
 // From alacritty: https://github.com/alacritty/alacritty/blob/2df8f860b960d7c96efaf4f059fe2fbbdce82bcc/alacritty_terminal/src/tty/mod.rs#L83
 /// Check if a terminfo entry exists on the system.
 pub fn terminfo_exists(terminfo: &str) -> bool {
+    terminfo_exists_with_environment(terminfo, None, false)
+}
+
+/// Check terminfo using launch-time environment overrides without changing
+/// the process environment. `clear_environment` makes the supplied entries
+/// authoritative and avoids consulting the worker's unrelated environment.
+pub fn terminfo_exists_with_environment(
+    terminfo: &str,
+    environment: Option<&[(String, String)]>,
+    clear_environment: bool,
+) -> bool {
     // Get first terminfo character for the parent directory.
     let first = terminfo.get(..1).unwrap_or_default();
     let first_hex = format!("{:x}", first.chars().next().unwrap_or_default() as usize);
+
+    let value = |name: &str| {
+        environment
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .rev()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            })
+            .or_else(|| {
+                if clear_environment {
+                    None
+                } else {
+                    std::env::var(name).ok()
+                }
+            })
+    };
 
     // Return true if the terminfo file exists at the specified location.
     macro_rules! check_path {
@@ -315,19 +344,22 @@ pub fn terminfo_exists(terminfo: &str) -> bool {
         };
     }
 
-    if let Some(dir) = std::env::var_os("TERMINFO") {
+    if let Some(dir) = value("TERMINFO") {
         check_path!(PathBuf::from(&dir));
-    } else if let Some(home) = dirs::home_dir() {
+    } else if let Some(home) = value("HOME")
+        .map(PathBuf::from)
+        .or_else(|| (!clear_environment).then(dirs::home_dir).flatten())
+    {
         check_path!(home.join(".terminfo"));
     }
 
-    if let Ok(dirs) = std::env::var("TERMINFO_DIRS") {
+    if let Some(dirs) = value("TERMINFO_DIRS") {
         for dir in dirs.split(':') {
             check_path!(PathBuf::from(dir));
         }
     }
 
-    if let Ok(prefix) = std::env::var("PREFIX") {
+    if let Some(prefix) = value("PREFIX") {
         let path = PathBuf::from(prefix);
         check_path!(path.join("etc/terminfo"));
         check_path!(path.join("lib/terminfo"));
@@ -452,28 +484,48 @@ impl ShellUser {
     /// before falling back on looking in to `passwd`.
     #[allow(clippy::question_mark)]
     fn from_env() -> Result<Self, Error> {
+        Self::from_sources(None, false)
+    }
+
+    fn from_sources(
+        overrides: Option<&[(String, String)]>,
+        clear_environment: bool,
+    ) -> Result<Self, Error> {
         let mut buf = [0; 1024];
         let pw = get_pw_entry(&mut buf);
+        let value = |name: &str| {
+            overrides
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .rev()
+                        .find(|(key, _)| key == name)
+                        .map(|(_, value)| value.clone())
+                })
+                .or_else(|| {
+                    (!clear_environment)
+                        .then(|| std::env::var(name).ok())
+                        .flatten()
+                })
+        };
 
-        let user = match std::env::var("USER") {
-            Ok(user) => user,
-            Err(_) => match pw {
+        let user = match value("USER") {
+            Some(user) => user,
+            None => match pw {
                 Ok(ref pw) => pw.name.to_owned(),
                 Err(err) => return Err(err),
             },
         };
-
-        let home = match std::env::var("HOME") {
-            Ok(home) => home,
-            Err(_) => match pw {
+        let home = match value("HOME") {
+            Some(home) => home,
+            None => match pw {
                 Ok(ref pw) => pw.dir.to_owned(),
                 Err(err) => return Err(err),
             },
         };
-
-        let shell = match std::env::var("SHELL") {
-            Ok(env_shell) => env_shell,
-            Err(_) => match pw {
+        let shell = match value("SHELL") {
+            Some(shell) => shell,
+            None => match pw {
                 Ok(ref pw) => pw.shell.to_owned(),
                 Err(err) => return Err(err),
             },
@@ -541,6 +593,59 @@ pub fn create_pty_with_spawn(
     width: u16,
     height: u16,
 ) -> Result<Pty, Error> {
+    create_pty_with_spawn_inner(
+        shell,
+        args,
+        working_directory,
+        env,
+        false,
+        columns,
+        rows,
+        width,
+        height,
+    )
+}
+
+/// Spawn a PTY with an explicitly supplied environment. Unlike
+/// `create_pty_with_spawn`, this clears the worker's inherited environment
+/// before applying `env`. The caller is responsible for supplying any
+/// variables it needs, including PATH.
+#[allow(clippy::too_many_arguments)]
+pub fn create_pty_with_spawn_clear_env(
+    shell: Option<&str>,
+    args: Vec<String>,
+    working_directory: &Option<String>,
+    env: Vec<(String, String)>,
+    columns: u16,
+    rows: u16,
+    width: u16,
+    height: u16,
+) -> Result<Pty, Error> {
+    create_pty_with_spawn_inner(
+        shell,
+        args,
+        working_directory,
+        Some(env),
+        true,
+        columns,
+        rows,
+        width,
+        height,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_pty_with_spawn_inner(
+    shell: Option<&str>,
+    args: Vec<String>,
+    working_directory: &Option<String>,
+    env: Option<Vec<(String, String)>>,
+    clear_environment: bool,
+    columns: u16,
+    rows: u16,
+    width: u16,
+    height: u16,
+) -> Result<Pty, Error> {
     // Only expanded here: the flatpak branch below hands the path to
     // the host, which may see directories this sandbox cannot, so
     // existence is validated at the local use site instead.
@@ -552,6 +657,14 @@ pub fn create_pty_with_spawn(
         return Err(Error::new(
             io::ErrorKind::InvalidInput,
             "working-dir contains a NUL byte",
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    if clear_environment && Path::new("/.flatpak-info").exists() {
+        return Err(Error::new(
+            io::ErrorKind::Unsupported,
+            "exact PTY environment is unsupported through flatpak-spawn",
         ));
     }
 
@@ -599,14 +712,12 @@ pub fn create_pty_with_spawn(
             Error::last_os_error()
         )));
     }
-    // Own both descriptors before any fallible setup so every error path
-    // closes them, including command and signal registration failures.
     let file = unsafe { File::from_raw_fd(main) };
     let owned_child = unsafe { OwnedFd::from_raw_fd(child) };
-    set_cloexec(main)?;
-    set_cloexec(child)?;
+    set_cloexec(file.as_raw_fd())?;
+    set_cloexec(owned_child.as_raw_fd())?;
 
-    let user = match ShellUser::from_env() {
+    let user = match ShellUser::from_sources(env.as_deref(), clear_environment) {
         Ok(data) => data,
         Err(..) => ShellUser {
             shell: shell.unwrap_or_default().to_string(),
@@ -686,6 +797,9 @@ pub fn create_pty_with_spawn(
     builder.stderr(owned_child.try_clone()?);
     builder.stdout(owned_child);
 
+    if clear_environment {
+        builder.env_clear();
+    }
     builder.env("USER", user.user);
     builder.env("HOME", user.home);
     if let Some(env) = env {
@@ -727,17 +841,11 @@ pub fn create_pty_with_spawn(
     match builder.spawn() {
         Ok(child_process) => {
             // Establish lifecycle ownership before any fallible parent-side setup.
-            let child_unix = Child::new(
-                main,
-                child_process.id() as libc::pid_t,
-                String::new(),
-                Some(child_process),
-            );
+            let child = Child::new(main, child_process.id() as libc::pid_t);
             set_nonblocking(main)?;
 
             Ok(Pty {
-                child: child_unix,
-                child_event_emitted: false,
+                child,
                 file,
                 token: corcovado::Token::from(0),
                 signals,
@@ -756,17 +864,6 @@ pub fn create_pty_with_spawn(
 }
 
 /// Creates a pseudoterminal using `forkpty`.
-/// The shell a spawn falls back to when none is configured: `$SHELL`,
-/// else the passwd entry. Public so per-shell decisions made before
-/// spawning (title program name, shell integration) match what
-/// actually spawns.
-pub fn default_shell_program() -> String {
-    ShellUser::from_env()
-        .map(|user| user.shell)
-        .unwrap_or_default()
-}
-
-
 pub fn create_pty_with_fork(
     shell: Option<&str>,
     args: &[String],
@@ -833,15 +930,10 @@ pub fn create_pty_with_fork(
         }
         id if id > 0 => {
             let file = unsafe { File::from_raw_fd(main) };
-            if let Err(err) = set_cloexec(main) {
-                tracing::warn!("failed to set close-on-exec on the pty: {err}");
-            }
-            // TODO: Currently we fork the process and don't wait to know if led to failure
-            // Whenever it happens it will just simply shut down the teletyperwriter
-            // In the future add an option to check before release the method
-            let child = Child::new(main, id, String::new(), None);
+            // Establish lifecycle ownership before any fallible parent-side setup.
+            let child = Child::new(main, id);
+            set_cloexec(main)?;
             set_nonblocking(main)?;
-
             Ok(Pty {
                 child,
                 child_event_emitted: false,
@@ -878,40 +970,141 @@ fn set_controlling_terminal(fd: libc::c_int) -> Result<(), Error> {
 /// Marks `fd` close-on-exec. openpty and forkpty return descriptors
 /// without it, so every shell spawned later would inherit the pty of
 /// each terminal already open and keep it from hanging up on close.
-fn set_cloexec(fd: libc::c_int) -> Result<(), Error> {
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-    if flags < 0
-        || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+    if flags == -1
+        || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
     {
-        return Err(Error::last_os_error());
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
-// https://man7.org/linux/man-pages/man2/fcntl.2.html
-fn set_nonblocking(fd: libc::c_int) -> Result<(), Error> {
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0
-        || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    if flags == -1
+        || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
     {
-        return Err(Error::last_os_error());
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
-pub fn command_per_pid(pid: libc::pid_t) -> String {
-    let current_process_name = Command::new("ps")
-        .arg("-p")
-        .arg(format!("{pid:}"))
-        .arg("-o")
-        .arg("comm=")
-        .output()
-        .expect("failed to execute process")
-        .stdout;
+#[derive(Debug)]
+pub struct Child {
+    pub id: libc::c_int,
+    pub pid: libc::pid_t,
+    exited: bool,
+}
 
-    std::str::from_utf8(&current_process_name)
-        .unwrap_or("")
-        .to_string()
+impl Child {
+    fn new(id: RawFd, pid: libc::pid_t) -> Self {
+        Self {
+            id,
+            pid,
+            exited: false,
+        }
+    }
+
+    fn set_winsize(&self, winsize_builder: WinsizeBuilder) -> io::Result<()> {
+        let winsize: Winsize = winsize_builder.build();
+        match unsafe { libc::ioctl(self.id, TIOCSWINSZ, &winsize as *const _) } {
+            -1 => Err(io::Error::last_os_error()),
+            _ => Ok(()),
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<i32>> {
+        let result = wait_for_child_status(self.pid, libc::WNOHANG);
+        if matches!(&result, Ok(Some(_)))
+            || matches!(&result, Err(error) if error.raw_os_error() == Some(libc::ECHILD))
+        {
+            self.exited = true;
+        }
+        result
+    }
+}
+
+fn wait_for_child_status(
+    pid: libc::pid_t,
+    options: libc::c_int,
+) -> io::Result<Option<i32>> {
+    loop {
+        let mut status = 0;
+        match unsafe { libc::waitpid(pid, &mut status, options) } {
+            -1 => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            0 => return Ok(None),
+            _ => return Ok(Some(status)),
+        }
+    }
+}
+
+/// Reap a child owned by this process. This deliberately never sends a
+/// signal; callers must only pass a direct child PID they still own.
+pub fn reap_child(pid: libc::pid_t) -> io::Result<()> {
+    if pid <= 1 || pid == std::process::id() as libc::pid_t {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to reap an unsafe process ID",
+        ));
+    }
+    match wait_for_child_status(pid, 0) {
+        Ok(_) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn reap_child_unchecked(pid: libc::pid_t) {
+    let _ = reap_child(pid);
+}
+
+fn terminate_and_reap_child(pid: libc::pid_t) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match wait_for_child_status(pid, libc::WNOHANG) {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if std::time::Instant::now() >= deadline => break,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    reap_child_unchecked(pid);
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        if self.exited {
+            return;
+        }
+
+        match self.try_wait() {
+            Ok(Some(_)) => return,
+            Err(_) if self.exited => return,
+            Err(error) => {
+                tracing::warn!("failed to inspect PTY child before shutdown: {error}");
+                return;
+            }
+            Ok(None) => {}
+        }
+
+        let pid = self.pid;
+        unsafe { libc::kill(pid, libc::SIGHUP) };
+        if let Err(error) = std::thread::Builder::new()
+            .name("pty-reaper".into())
+            .spawn(move || terminate_and_reap_child(pid))
+        {
+            tracing::error!("failed to start PTY child reaper: {error}");
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            reap_child_unchecked(pid);
+        }
+    }
 }
 
 impl EventedPty for Pty {
@@ -929,9 +1122,15 @@ impl EventedPty for Pty {
                 return None;
             }
 
-            let event = self.child.poll_exit().ok().flatten()?;
-            self.child_event_emitted = true;
-            Some(event)
+            match self.child.try_wait() {
+                Err(_) if self.child.exited => Some(ChildEvent::Exited(None)),
+                Err(error) => {
+                    tracing::warn!("failed to collect PTY child status: {error}");
+                    None
+                }
+                Ok(None) => None,
+                Ok(Some(status)) => Some(ChildEvent::Exited(Some(status))),
+            }
         })
     }
 
@@ -1106,6 +1305,142 @@ mod resolve_working_dir_tests {
 }
 
 #[cfg(test)]
+mod child_wait_tests {
+    use super::Child;
+
+    fn exited_child(code: libc::c_int) -> libc::pid_t {
+        match unsafe { libc::fork() } {
+            0 => unsafe { libc::_exit(code) },
+            pid if pid > 0 => pid,
+            _ => panic!("fork failed: {}", std::io::Error::last_os_error()),
+        }
+    }
+
+    fn live_child(ignore_hangup: bool) -> libc::pid_t {
+        let mut ready = [0; 2];
+        if unsafe { libc::pipe(ready.as_mut_ptr()) } == -1 {
+            panic!("pipe failed: {}", std::io::Error::last_os_error());
+        }
+
+        match unsafe { libc::fork() } {
+            0 => unsafe {
+                libc::close(ready[0]);
+                libc::signal(
+                    libc::SIGHUP,
+                    if ignore_hangup {
+                        libc::SIG_IGN
+                    } else {
+                        libc::SIG_DFL
+                    },
+                );
+                let ready_byte = 1_u8;
+                if libc::write(ready[1], &ready_byte as *const u8 as *const _, 1) != 1 {
+                    libc::_exit(127);
+                }
+                libc::close(ready[1]);
+                loop {
+                    libc::pause();
+                }
+            },
+            pid if pid > 0 => {
+                unsafe {
+                    libc::close(ready[1]);
+                }
+                let mut ready_byte = 0_u8;
+                loop {
+                    match unsafe {
+                        libc::read(ready[0], &mut ready_byte as *mut u8 as *mut _, 1)
+                    } {
+                        1 => break,
+                        -1 if std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::Interrupted => {}
+                        result => panic!("child readiness failed: read={result}"),
+                    }
+                }
+                unsafe {
+                    libc::close(ready[0]);
+                }
+                pid
+            }
+            _ => {
+                unsafe {
+                    libc::close(ready[0]);
+                    libc::close(ready[1]);
+                }
+                panic!("fork failed: {}", std::io::Error::last_os_error());
+            }
+        }
+    }
+
+    fn assert_drop_reaps_child(pid: libc::pid_t, timeout: std::time::Duration) {
+        drop(Child::new(-1, pid));
+
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let mut status = 0;
+            match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
+                child if child == pid => break,
+                -1 if std::io::Error::last_os_error().raw_os_error()
+                    == Some(libc::ECHILD) =>
+                {
+                    break;
+                }
+                0 if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => panic!("child was not reaped before timeout: waitpid={result}"),
+            }
+        }
+    }
+
+    #[test]
+    fn waitpid_reports_normal_exit() {
+        let pid = exited_child(7);
+        let mut child = Child::new(-1, pid);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "child did not exit");
+            std::thread::yield_now();
+        };
+
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 7);
+    }
+
+    #[test]
+    fn waitpid_marks_externally_reaped_child_exited() {
+        let pid = exited_child(0);
+        let mut status = 0;
+        while unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::Interrupted
+            );
+        }
+
+        let mut child = Child::new(-1, pid);
+        let error = child.try_wait().unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
+        assert!(child.exited);
+    }
+
+    #[test]
+    fn dropping_live_child_terminates_and_reaps_it() {
+        assert_drop_reaps_child(live_child(false), std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn dropping_child_that_ignores_hangup_escalates_and_reaps_it() {
+        assert_drop_reaps_child(live_child(true), std::time::Duration::from_secs(3));
+    }
+}
+
+#[cfg(test)]
 mod login_argv_tests {
     use super::login_argv;
 
@@ -1177,5 +1512,34 @@ mod termp_tests {
         let term = create_termp(true);
         assert_eq!(term.c_ospeed, libc::B230400);
         assert_eq!(term.c_ispeed, libc::B230400);
+    }
+}
+
+#[cfg(test)]
+mod terminfo_tests {
+    use super::terminfo_exists_with_environment;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn terminfo_lookup_uses_explicit_cleared_environment() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir()
+            .join(format!("rio-terminfo-{}-{suffix}", std::process::id()));
+        let entry = "rio-session-test";
+        let directory = root.join("72");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(entry), []).unwrap();
+
+        let environment =
+            vec![("TERMINFO".to_string(), root.to_string_lossy().into_owned())];
+        assert!(terminfo_exists_with_environment(
+            entry,
+            Some(&environment),
+            true
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -3971,6 +3971,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-session"
+version = "0.5.32"
+dependencies = [
+ "bincode",
+ "getrandom 0.3.4",
+ "libc",
+ "librio",
+ "rio-graphics",
+ "rio-vt",
+]
+
+[[package]]
 name = "rio-unicode"
 version = "0.5.32"
 dependencies = [
