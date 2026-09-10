@@ -1,5 +1,5 @@
 // Shared premultiplied-ARGB pixel helpers for the CPU paths, which all
-// write `0xAARRGGBB` into softbuffer's framebuffer. The alpha byte is
+// write logical `0xAARRGGBB` values into a CPU framebuffer. The alpha byte is
 // meaningful: Windows DWM reads it for per-pixel window transparency
 // (softbuffer's other presenters ignore it), so every store must keep
 // the premultiplied invariant, each color channel <= alpha.

@@ -1191,12 +1191,7 @@ impl Surface {
     /// this leaves the view and the selection alone; losing focus must not
     /// scroll or deselect.
     pub fn set_focus(&self, focused: bool) {
-        // Written under the lock, like the reply to a program enabling
-        // focus events, so the two cannot cross.
-        let mut terminal = self.terminal.lock();
-        if let Some(report) = terminal.set_focus(focused) {
-            let _ = self.try_write_response(report.as_bytes());
-        }
+        let _ = self.try_focus(focused);
     }
     /// Apply host cursor defaults without exposing the authoritative terminal
     /// to the embedder. Parser-issued cursor modes can still override these
@@ -1245,11 +1240,16 @@ impl Surface {
 
     /// Report a host focus transition only when the application enabled DEC
     /// mode 1004. The bytes use the same bounded input path as key reports.
+    /// [`Surface::set_focus`] that reports whether a focus report was
+    /// queued and surfaces a full or closed input queue.
     pub fn try_focus(&self, focused: bool) -> Result<bool, InputError> {
-        if !self.terminal.lock().mode().contains(Mode::FOCUS_IN_OUT) {
+        // Under the lock, like the reply to a program enabling focus
+        // events, so the two cannot cross.
+        let mut terminal = self.terminal.lock();
+        let Some(report) = terminal.set_focus(focused) else {
             return Ok(false);
-        }
-        self.try_write_response(if focused { b"\x1b[I" } else { b"\x1b[O" }.to_vec())?;
+        };
+        self.try_write_response(report.as_bytes())?;
         Ok(true)
     }
 

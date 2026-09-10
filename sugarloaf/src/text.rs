@@ -771,11 +771,22 @@ impl Text {
     }
 
     /// Paint the queued UI text instances into the caller-supplied
-    /// `0x00RRGGBB` u32 buffer. Mirrors `text_vertex` /
+    /// `0xAARRGGBB` u32 buffer (little-endian BGRA8 premultiplied bytes).
+    /// Mirrors `text_vertex` /
     /// `grid_text_fragment`: glyph origin = `pos + bearings`; mask
     /// glyphs use `instance.color`, color glyphs sample directly.
     /// No-op when CPU state is absent or no instances were queued.
     pub fn render_cpu(&self, buf: &mut [u32], buf_w: u32, buf_h: u32) {
+        self.render_cpu_strided(buf, buf_w, buf_h, buf_w);
+    }
+
+    pub(crate) fn render_cpu_strided(
+        &self,
+        buf: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        stride_pixels: u32,
+    ) {
         if self.instances.is_empty() {
             return;
         }
@@ -805,6 +816,7 @@ impl Text {
                     buf,
                     buf_w_i,
                     buf_h_i,
+                    stride_pixels as usize,
                     glyph_x,
                     glyph_y,
                     gw,
@@ -816,8 +828,19 @@ impl Text {
                 );
             } else {
                 blit_text_mask(
-                    buf, buf_w_i, buf_h_i, glyph_x, glyph_y, gw, gh, mask, mask_side, ax,
-                    ay, inst.color,
+                    buf,
+                    buf_w_i,
+                    buf_h_i,
+                    stride_pixels as usize,
+                    glyph_x,
+                    glyph_y,
+                    gw,
+                    gh,
+                    mask,
+                    mask_side,
+                    ax,
+                    ay,
+                    inst.color,
                 );
             }
         }
@@ -1814,6 +1837,7 @@ fn blit_text_mask(
     buf: &mut [u32],
     buf_w: i32,
     buf_h: i32,
+    stride: usize,
     glyph_x: i32,
     glyph_y: i32,
     gw: i32,
@@ -1827,7 +1851,6 @@ fn blit_text_mask(
     if color[3] == 0 {
         return;
     }
-    let stride = buf_w as usize;
     let x_start = glyph_x.max(0);
     let y_start = glyph_y.max(0);
     let x_end = (glyph_x + gw).min(buf_w);
@@ -1875,6 +1898,7 @@ fn blit_text_color(
     buf: &mut [u32],
     buf_w: i32,
     buf_h: i32,
+    stride: usize,
     glyph_x: i32,
     glyph_y: i32,
     gw: i32,
@@ -1884,7 +1908,6 @@ fn blit_text_color(
     ax: usize,
     ay: usize,
 ) {
-    let stride = buf_w as usize;
     let x_start = glyph_x.max(0);
     let y_start = glyph_y.max(0);
     let x_end = (glyph_x + gw).min(buf_w);

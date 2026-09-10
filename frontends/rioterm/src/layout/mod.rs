@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod compute_tests;
 
+use crate::context::session::SessionHandle;
 use crate::context::Context;
 use crate::mouse::Mouse;
 use rio_backend::config::layout::Margin;
@@ -30,6 +31,10 @@ impl TabId {
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .expect("TabId counter exhausted");
         Self(id)
+    }
+
+    pub fn value(self) -> usize {
+        self.0
     }
 
     #[cfg(test)]
@@ -285,7 +290,7 @@ impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
         let reflowed = self.applied_grid != Some(key);
         if moved || reflowed {
             // The present gate reads `pending_update.is_dirty()` before
-            // it looks at the terminal, so a panel that moved or was
+            // it looks at the frame, so a panel that moved or was
             // reflowed in place (a font size change keeps the rect) has
             // to be marked or an idle terminal would not present.
             self.val.renderable_content.pending_update.set_dirty();
@@ -293,12 +298,6 @@ impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
 
         if reflowed {
             self.applied_grid = Some(key);
-            // The terminal ends a synchronized update itself when its
-            // grid or cell size changes.
-            self.val
-                .terminal
-                .lock()
-                .resize::<ContextDimension>(self.val.dimension);
             self.send_winsize();
         } else if resized || self.winsize_pending {
             if mid_drag {
@@ -309,9 +308,15 @@ impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
         }
     }
 
+    /// The worker reflows its terminal and tells the child; it publishes
+    /// a replacement frame, so the panel stays eligible for it.
     fn send_winsize(&mut self) {
         let winsize = crate::renderer::utils::terminal_dimensions(&self.val.dimension);
-        let _ = self.val.messenger.send_resize(winsize);
+        self.val.terminal.lock().resize_to(winsize);
+        self.val
+            .renderable_content
+            .pending_update
+            .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
         self.winsize_pending = false;
     }
 
@@ -330,6 +335,114 @@ impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
     #[inline]
     pub fn context_mut(&mut self) -> &mut Context<T> {
         &mut self.val
+    }
+}
+
+fn build_layout_node(
+    tree: &mut TaffyTree<()>,
+    node: &crate::router::window_control::LayoutNodeOffer,
+    panel_style: &Style,
+    panel_config: &rio_backend::config::layout::Panel,
+    scale: f32,
+    pane_rects: &FxHashMap<u64, [f32; 4]>,
+    parent_direction: Option<taffy::FlexDirection>,
+    leaves: &mut Vec<(u64, NodeId)>,
+) -> Result<NodeId, String> {
+    let flex_grow = offered_flex_grow(node, pane_rects, parent_direction);
+    if node.children.is_empty() {
+        let mut style = panel_style.clone();
+        style.flex_grow = flex_grow;
+        let panel_node = tree
+            .new_leaf(style)
+            .map_err(|error| format!("create transfer panel: {error}"))?;
+        leaves.push((node.route_id, panel_node));
+        return Ok(panel_node);
+    }
+    let direction = match node.direction {
+        Some(crate::router::window_control::LayoutDirection::Horizontal) => {
+            taffy::FlexDirection::Row
+        }
+        Some(crate::router::window_control::LayoutDirection::Vertical) => {
+            taffy::FlexDirection::Column
+        }
+        None => return Err("transfer layout container has no direction".into()),
+    };
+    let container_style = Style {
+        display: Display::Flex,
+        flex_direction: direction,
+        flex_grow,
+        flex_shrink: 1.0,
+        gap: geometry::Size {
+            width: length(panel_config.column_gap * scale),
+            height: length(panel_config.row_gap * scale),
+        },
+        ..Default::default()
+    };
+    let container = tree
+        .new_leaf(container_style)
+        .map_err(|error| format!("create transfer split: {error}"))?;
+    for child in &node.children {
+        let child = build_layout_node(
+            tree,
+            child,
+            panel_style,
+            panel_config,
+            scale,
+            pane_rects,
+            Some(direction),
+            leaves,
+        )?;
+        tree.add_child(container, child)
+            .map_err(|error| format!("attach transfer split: {error}"))?;
+    }
+    Ok(container)
+}
+
+fn offered_bounds(
+    node: &crate::router::window_control::LayoutNodeOffer,
+    pane_rects: &FxHashMap<u64, [f32; 4]>,
+) -> Option<[f32; 4]> {
+    if node.children.is_empty() {
+        return pane_rects.get(&node.route_id).copied();
+    }
+
+    let mut bounds: Option<[f32; 4]> = None;
+    for child in &node.children {
+        let [left, top, width, height] = offered_bounds(child, pane_rects)?;
+        let right = left + width;
+        let bottom = top + height;
+        bounds = Some(match bounds {
+            Some([min_left, min_top, max_right, max_bottom]) => [
+                min_left.min(left),
+                min_top.min(top),
+                max_right.max(right),
+                max_bottom.max(bottom),
+            ],
+            None => [left, top, right, bottom],
+        });
+    }
+    bounds.map(|[left, top, right, bottom]| [left, top, right - left, bottom - top])
+}
+
+fn offered_flex_grow(
+    node: &crate::router::window_control::LayoutNodeOffer,
+    pane_rects: &FxHashMap<u64, [f32; 4]>,
+    parent_direction: Option<taffy::FlexDirection>,
+) -> f32 {
+    let Some(direction) = parent_direction else {
+        return node.flex_grow;
+    };
+    let Some([_, _, width, height]) = offered_bounds(node, pane_rects) else {
+        return node.flex_grow;
+    };
+    let size = match direction {
+        taffy::FlexDirection::Row | taffy::FlexDirection::RowReverse => width,
+        taffy::FlexDirection::Column | taffy::FlexDirection::ColumnReverse => height,
+    };
+    if size.is_finite() && size > 0.0 {
+        size
+    } else {
+        node.flex_grow
     }
 }
 
@@ -450,6 +563,253 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             self.inner.values().map(|item| item.val.route_id).collect();
         route_ids.sort_unstable();
         route_ids
+    }
+
+    pub fn owns_session_id(&self, session_id: rio_session::protocol::SessionId) -> bool {
+        self.inner.values().any(|item| {
+            item.val
+                .terminal
+                .lock()
+                .session()
+                .and_then(crate::context::session::SessionHandle::descriptor)
+                .is_some_and(|descriptor| descriptor.session_id == session_id)
+        })
+    }
+
+    pub fn transfer_parts(
+        &self,
+    ) -> Result<
+        (
+            Vec<crate::router::window_control::PaneOffer>,
+            crate::router::window_control::TabOffer,
+        ),
+        String,
+    > {
+        let panes = self
+            .get_ordered_keys()
+            .into_iter()
+            .filter_map(|node| self.inner.get(&node))
+            .map(|item| {
+                let session = item
+                    .val
+                    .terminal
+                    .lock()
+                    .session()
+                    .and_then(crate::context::session::SessionHandle::descriptor)
+                    .ok_or_else(|| "session is not ready for transfer".to_string())?;
+                Ok::<_, String>(crate::router::window_control::PaneOffer {
+                    route_id: item.val.route_id as u64,
+                    tab_id: self.id.value() as u64,
+                    layout_rect: item.layout_rect,
+                    session,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((
+            panes,
+            crate::router::window_control::TabOffer {
+                tab_id: self.id.value() as u64,
+                layout: self.layout_offer()?,
+                active_route: self.current().route_id as u64,
+            },
+        ))
+    }
+
+    pub fn layout_offer(
+        &self,
+    ) -> Result<crate::router::window_control::LayoutNodeOffer, String> {
+        let children = self
+            .tree
+            .children(self.root_node)
+            .map_err(|error| format!("read transfer layout root: {error}"))?;
+        let root = children
+            .first()
+            .copied()
+            .ok_or_else(|| "transfer layout root has no panel".to_string())?;
+        self.layout_offer_node(root)
+    }
+
+    fn layout_offer_node(
+        &self,
+        node: NodeId,
+    ) -> Result<crate::router::window_control::LayoutNodeOffer, String> {
+        let children = self
+            .tree
+            .children(node)
+            .map_err(|error| format!("read transfer layout node: {error}"))?;
+        let style = self
+            .tree
+            .style(node)
+            .map_err(|error| format!("read transfer layout style: {error}"))?;
+        if children.is_empty() {
+            let route_id = self
+                .inner
+                .get(&node)
+                .map(|item| item.val.route_id as u64)
+                .ok_or_else(|| "transfer layout leaf is not a pane".to_string())?;
+            return Ok(crate::router::window_control::LayoutNodeOffer {
+                route_id,
+                direction: None,
+                flex_grow: style.flex_grow,
+                children: Vec::new(),
+            });
+        }
+
+        let direction = match style.flex_direction {
+            taffy::FlexDirection::Row | taffy::FlexDirection::RowReverse => {
+                crate::router::window_control::LayoutDirection::Horizontal
+            }
+            taffy::FlexDirection::Column | taffy::FlexDirection::ColumnReverse => {
+                crate::router::window_control::LayoutDirection::Vertical
+            }
+        };
+        let children = children
+            .into_iter()
+            .map(|child| self.layout_offer_node(child))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::router::window_control::LayoutNodeOffer {
+            route_id: 0,
+            direction: Some(direction),
+            flex_grow: style.flex_grow,
+            children,
+        })
+    }
+
+    pub fn from_layout_offer(
+        contexts: Vec<Context<T>>,
+        layout: &crate::router::window_control::LayoutNodeOffer,
+        active_route: u64,
+        route_map: &FxHashMap<u64, usize>,
+        pane_rects: &FxHashMap<u64, [f32; 4]>,
+        scaled_margin: Margin,
+        border_color: [f32; 4],
+        _border_active_color: [f32; 4],
+        panel_config: rio_backend::config::layout::Panel,
+    ) -> Result<Self, (Vec<Context<T>>, String)> {
+        let Some(first) = contexts.first() else {
+            return Err((contexts, "transfer layout has no contexts".into()));
+        };
+        let width = first.dimension.width;
+        let height = first.dimension.height;
+        let scale = first.dimension.dimension.scale;
+        let available_width = width - scaled_margin.left - scaled_margin.right;
+        let available_height = height - scaled_margin.top - scaled_margin.bottom;
+        let root_style = Style {
+            display: Display::Flex,
+            gap: geometry::Size {
+                width: length(panel_config.column_gap * scale),
+                height: length(panel_config.row_gap * scale),
+            },
+            size: geometry::Size {
+                width: length(available_width),
+                height: length(available_height),
+            },
+            ..Default::default()
+        };
+        let panel_style = Style {
+            display: Display::Flex,
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            padding: geometry::Rect {
+                left: length(panel_config.padding.left * scale),
+                right: length(panel_config.padding.right * scale),
+                top: length(panel_config.padding.top * scale),
+                bottom: length(panel_config.padding.bottom * scale),
+            },
+            margin: geometry::Rect {
+                left: length(panel_config.margin.left * scale),
+                right: length(panel_config.margin.right * scale),
+                top: length(panel_config.margin.top * scale),
+                bottom: length(panel_config.margin.bottom * scale),
+            },
+            ..Default::default()
+        };
+        let mut tree = TaffyTree::new();
+        let root_node = match tree.new_leaf(root_style) {
+            Ok(node) => node,
+            Err(error) => {
+                return Err((contexts, format!("create transfer layout root: {error}")))
+            }
+        };
+        let mut leaves = Vec::new();
+        let panel_node = match build_layout_node(
+            &mut tree,
+            layout,
+            &panel_style,
+            &panel_config,
+            scale,
+            pane_rects,
+            None,
+            &mut leaves,
+        ) {
+            Ok(node) => node,
+            Err(error) => return Err((contexts, error)),
+        };
+        if let Err(error) = tree.add_child(root_node, panel_node) {
+            return Err((contexts, format!("attach transfer layout root: {error}")));
+        }
+        let mut contexts = contexts.into_iter();
+        let mut by_route = FxHashMap::default();
+        while let Some(context) = contexts.next() {
+            by_route.insert(context.route_id, context);
+        }
+        let mut inner = FxHashMap::default();
+        for (route_id, node) in leaves {
+            let Some(target_route) = route_map.get(&route_id).copied() else {
+                return Err((
+                    by_route.into_values().collect(),
+                    format!("transfer layout has no target route for {route_id}"),
+                ));
+            };
+            let Some(context) = by_route.remove(&target_route) else {
+                return Err((
+                    by_route.into_values().collect(),
+                    format!("transfer layout has no context for route {route_id}"),
+                ));
+            };
+            inner.insert(node, ContextGridItem::new(context));
+        }
+        if !by_route.is_empty() {
+            return Err((
+                by_route.into_values().collect(),
+                "transfer layout has unused contexts".into(),
+            ));
+        }
+        let Some(current) = inner.iter().find_map(|(node, item)| {
+            route_map
+                .get(&active_route)
+                .is_some_and(|route| item.val.route_id == *route)
+                .then_some(*node)
+        }) else {
+            let contexts = inner.into_values().map(|item| item.val).collect();
+            return Err((contexts, "transfer layout active route is missing".into()));
+        };
+        let root = inner.keys().next().copied();
+        let border_config = BorderConfig {
+            width: panel_config.border_width,
+            color: border_color,
+        };
+        let mut grid = Self {
+            id: TabId::next(),
+            width,
+            height,
+            current,
+            scaled_margin,
+            custom_title: None,
+            custom_color: None,
+            scale,
+            inner,
+            root,
+            panel_config,
+            tree,
+            root_node,
+            border_config,
+        };
+        if !grid.apply_taffy_layout() {
+            let contexts = grid.inner.into_values().map(|item| item.val).collect();
+            return Err((contexts, "apply transfer layout failed".into()));
+        }
+        Ok(grid)
     }
 
     /// Reassign every split in this grid to a new owning window.
@@ -1298,6 +1658,12 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         &mut self.inner
     }
 
+    pub fn session_handles(&self) -> impl Iterator<Item = SessionHandle> + '_ {
+        self.inner
+            .values()
+            .filter_map(|item| item.val.terminal.lock().session().cloned())
+    }
+
     /// Get contexts ordered by visual position (top-to-bottom, left-to-right)
     pub fn get_ordered_keys(&self) -> Vec<NodeId> {
         let mut panels: Vec<(NodeId, f32, f32)> = self
@@ -1804,11 +2170,15 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
     }
 
-    /// Drop image overlays for every panel in the grid. Used on tab
-    /// teardown — the panels themselves go away with the
-    /// `ContextManager`; only the kitty graphics state needs an
-    /// explicit cleanup signal.
+    /// Clear image overlays without dropping the image data, used when a
+    /// tab or split is hidden.
     #[inline]
+    pub fn clear_image_overlays(&self, images: &mut impl PanelImages) {
+        for item in self.inner.values() {
+            images.clear_image_overlays_for(item.val.rich_text_id);
+        }
+    }
+
     /// Release everything this grid's panels hold in sugarloaf: image
     /// overlays and the images they drew.
     pub fn remove_from_sugarloaf(&self, images: &mut impl PanelImages) {

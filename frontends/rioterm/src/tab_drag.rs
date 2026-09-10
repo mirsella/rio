@@ -19,6 +19,10 @@ impl SessionToken {
         Ok(Self(bytes))
     }
 
+    pub fn as_bytes(self) -> [u8; 16] {
+        self.0
+    }
+
     #[cfg(test)]
     const fn for_test(byte: u8) -> Self {
         Self([byte; 16])

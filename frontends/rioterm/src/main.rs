@@ -13,7 +13,6 @@ mod global_hotkey;
 mod hints;
 mod ime;
 mod layout;
-mod messenger;
 mod mouse;
 #[cfg(windows)]
 mod panic;
@@ -29,7 +28,7 @@ mod watcher;
 use clap::Parser;
 use rio_backend::config::config_dir_path;
 use rio_backend::event::EventPayload;
-use rio_backend::{ansi, crosswords, event, performer, selection};
+use rio_backend::{crosswords, event, selection};
 use std::path::PathBuf;
 use std::str::FromStr;
 use tracing::level_filters::LevelFilter;
@@ -43,6 +42,10 @@ use windows_sys::Win32::System::Console::{
 };
 
 const LOG_LEVEL_ENV: &str = "RIO_LOG_LEVEL";
+
+// Consumed by the first context manager only. The transfer identity arrives
+// over inherited stdin, not argv or a discoverable global rendezvous.
+static WINDOW_BOOTSTRAP: std::sync::Mutex<Option<[u8; 16]>> = std::sync::Mutex::new(None);
 
 pub fn setup_environment_variables(config: &rio_backend::config::Config) {
     #[cfg(unix)]
@@ -135,6 +138,18 @@ fn setup_logs_by_filter_level(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `rio-session` can use the packaged executable as its worker.  Dispatch
+    // before clap sees the private worker arguments; they contain the endpoint
+    // and session id, while the capability itself is read from stdin by the
+    // worker and is never present in argv.
+    #[cfg(unix)]
+    if std::env::args_os()
+        .skip(1)
+        .any(|argument| argument == "--endpoint")
+    {
+        return rio_session::worker::run().map_err(Into::into);
+    }
+
     #[cfg(windows)]
     panic::attach_handler();
 
@@ -147,7 +162,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Load command line options.
-    let args = cli::Cli::parse();
+    let mut arguments: Vec<_> = std::env::args_os().collect();
+    if arguments
+        .get(1)
+        .is_some_and(|arg| arg == "--window-bootstrap")
+    {
+        use std::io::Read;
+        let mut transfer = [0; 16];
+        std::io::stdin().read_exact(&mut transfer)?;
+        if transfer == [0; 16] {
+            return Err("invalid window bootstrap identity".into());
+        }
+        *WINDOW_BOOTSTRAP.lock().unwrap() = Some(transfer);
+        arguments.remove(1);
+    }
+    let args = cli::Cli::parse_from(arguments);
 
     let write_config_path = args.window_options.terminal_options.write_config.clone();
     if let Some(config_path) = write_config_path {

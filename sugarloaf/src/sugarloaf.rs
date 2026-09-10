@@ -9,7 +9,7 @@ use crate::font::{fonts::SugarloafFont, FontLibrary};
 use crate::font_cache::{compute_advance, resolve_with, FontCache, ResolvedGlyph};
 use crate::layout::RootStyle;
 use crate::renderer::Renderer;
-use crate::sugarloaf::graphics::{image_key_route, GraphicDataEntry, GraphicKey};
+use crate::sugarloaf::graphics::{GraphicDataEntry, GraphicKey};
 use swash::Attributes;
 
 use crate::context::Context;
@@ -211,7 +211,7 @@ pub enum SugarloafBackend {
     /// Mirrors the Metal backend in scope: no librashader filters.
     #[cfg(target_os = "linux")]
     Vulkan,
-    /// CPU rendering via tiny-skia + softbuffer.
+    /// CPU rendering via tiny-skia and native softbuffer presentation.
     Cpu,
 }
 
@@ -630,7 +630,7 @@ impl Sugarloaf<'_> {
                 height: img_h,
                 pixels: decoded.into_raw(),
             },
-        ));
+        ))?;
         self.background_image = Some(image.clone());
         Ok(())
     }
@@ -641,7 +641,7 @@ impl Sugarloaf<'_> {
         if self.background_image.is_none() {
             return;
         }
-        self.renderer.set_background_image_pixels(None);
+        let _ = self.renderer.set_background_image_pixels(None);
         self.background_image = None;
     }
 
@@ -978,8 +978,7 @@ impl Sugarloaf<'_> {
     /// Drop every image a closed terminal uploaded (keys namespaced
     /// with `graphics::route_image_key`), pixel store and GPU textures.
     pub fn remove_route_images(&mut self, route_id: usize) {
-        self.image_data
-            .retain(|key, _| image_key_route(*key) != route_id);
+        self.image_data.retain(|key, _| key.route_id != route_id);
         self.renderer.evict_route_textures(route_id);
     }
 
