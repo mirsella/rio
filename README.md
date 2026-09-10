@@ -21,6 +21,90 @@
 
 Documentation: [rioterm.com](https://rioterm.com).
 
+## Isolated Linux Runtime
+
+This branch runs each terminal in a session worker and renders its immutable
+passive snapshots through resident Sugarloaf grids owned by the window. The
+configured `renderer.use-cpu` and backend settings select the normal window
+renderer path; terminal cells are not copied through a renderer subprocess or
+pixel readback path. The GUI owns native windows and input, not the PTY or
+terminal parser. A window/compositor failure can take the GUI process down, but
+the session worker remains the PTY/parser owner and can be recovered while its
+retention period lasts. Windows is currently explicitly unsupported by this
+runtime; there is no in-process fallback.
+
+On Linux, open the command palette with `Ctrl+Shift+P`:
+
+- **Merge Tab** immediately arms authenticated live Rio windows for pointer
+  targeting. Move onto a target window and click to commit the selected tab and
+  its splits; no live-window list is shown, and the source keeps its other tabs.
+- **Recover Saved Session** is the separate saved-session picker. Committing a
+  transfer preserves the original shell; the source GUI exits if no windows or
+  pending transfers remain.
+- **Move Current Tab to New Window** launches a separate GUI and transfers the
+  existing sessions without creating an extra shell.
+- Recovery after GUI death is explicit, not automatic shell respawning. Select
+  the saved session; its original worker must still be alive within its retention
+  period. Ordinary context/window close explicitly closes its sessions.
+
+Repeatable private Xvfb acceptance is provided by
+`scripts/session-isolation-acceptance.sh`. It exercises palette merge/detach,
+multi-tab and nested-split transfer, target cancellation, direct resident-grid
+repaint, dynamic resize, hint repaint, and shell PID/ACK continuity.
+`scripts/session-isolation-visual-parity.sh` is a smaller current-versus-upstream
+CPU/Xvfb fixture. It captures deterministic colors/underline, alternate-screen,
+cursor, configured selection, and hint states, and records same-variant deltas
+plus cross-variant image metrics. IME, Kitty/Sixel, and GPU-filter parity remain
+unverified by that fixture.
+`scripts/session-isolation-wayland-acceptance.sh` separately starts a private
+nested KWin Wayland compositor and verifies direct Sugarloaf GPU window startup
+with an AMD/Vulkan hardware summary. It does not claim native Wayland pointer
+or drag input. Native Wayland drag remains a separate capability check requiring
+a private nested compositor and a native Wayland input/drag driver; X11 tools
+are not evidence for that path.
+`scripts/session-isolation-wayland-x11-pointer-acceptance.sh` is a stricter
+pointer probe: it hosts KWin's X11 backend on a private Xvfb display, applies the
+known private keymap, and injects global XTest events only into that display. It
+requires target-local arm, highlight, click, and source-exit evidence. A failed
+probe is not a Wayland input claim; native Wayland DnD still requires a native
+Wayland injector.
+`scripts/session-isolation-wayland-dnd-acceptance.sh` separately exercises the
+current native Wayland drag path through that private KWin/Xvfb setup. It records
+target-local drag events, direct-frame readiness, authenticated opaque-token
+commit, source GUI exit, and survival of the transferred worker and shell. It
+does not claim post-drop keyboard ACK delivery because this compositor setup has
+no reliable native keyboard injector.
+`scripts/session-isolation-worker-kill-acceptance.sh` kills one recorded
+session-worker in a private two-tab GUI and verifies the other pane's fresh ACK
+and GUI continuity. It then closes the killed tab and the remaining tab through
+the public paths, waiting for the asynchronous session pumps and GUI to cleanly
+exit before reporting a pass.
+
+For a bounded comparison against an `upstream/main` build, use
+`scripts/session-isolation-direct-benchmark.sh` with private Xvfb binaries. It
+records five fresh shell-ACK probes, interval process-tree CPU/RSS samples at
+250 ms, and equal PTY workload bytes for 2.0 s idle, 3.5 s scroll, and 2.5 s
+cursor phases. Both variants use the same 800x490 CPU/Xvfb path. ACK probes
+inject one command with per-character `xdotool` events and a 100 ms marker poll;
+their elapsed time includes injector, focus, event-loop, worker, and file-poll
+overhead. It is not actual keystroke latency, frame/present latency, or a
+throughput measurement. PTY bytes are workload accounting only; do not infer
+instantaneous behavior or performance dominance from one bounded run.
+
+A separate saved private KWin/Xvfb run recorded native Wayland DnD with an
+opaque 16-byte payload and a fresh destination shell ACK
+(`~/dev/rio-agent-artifacts/native-foreign-dnd-results.md`). The historical
+record is protocol/transport evidence only; use the current DnD harness for
+direct-render acceptance and the pointer harness for merge click-target input.
+
+Panes render from immutable worker-published frames into resident Sugarloaf
+grids owned by the window. The configured backend selects Sugarloaf's normal
+CPU/native/WGPU window path; on Linux WGPU normally reports a Vulkan adapter
+such as RADV, not a separate native Vulkan or Metal effect implementation.
+Filter and advanced shader effect parity remains explicitly scoped. See
+[Session Isolation](specs/session-isolation.md) for protocol, bootstrap,
+recovery, testing, and platform details.
+
 ## Supporting the Project
 
 If you use and like Rio, please consider sponsoring it: your support helps to cover the fees required to maintain the project and to validate the time spent working on it!
