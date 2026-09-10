@@ -647,3 +647,105 @@ fn test_split_inside_resized_panel_preserves_proportions() {
         "Bottom (bottom half) should be ~400px tall, got {bottom_h}"
     );
 }
+
+#[test]
+fn transfer_layout_uses_offered_pane_widths() {
+    use taffy::{AvailableSpace, FlexDirection, TaffyTree};
+
+    let layout = crate::router::window_control::LayoutNodeOffer {
+        route_id: 0,
+        direction: Some(crate::router::window_control::LayoutDirection::Horizontal),
+        flex_grow: 1.0,
+        children: vec![
+            crate::router::window_control::LayoutNodeOffer {
+                route_id: 1,
+                direction: None,
+                flex_grow: 1.0,
+                children: Vec::new(),
+            },
+            crate::router::window_control::LayoutNodeOffer {
+                route_id: 2,
+                direction: None,
+                flex_grow: 1.0,
+                children: Vec::new(),
+            },
+        ],
+    };
+    let pane_rects = FxHashMap::from_iter([
+        (1, [0.0, 0.0, 200.0, 100.0]),
+        (2, [200.0, 0.0, 800.0, 100.0]),
+    ]);
+
+    assert_eq!(
+        offered_flex_grow(
+            &layout.children[0],
+            &pane_rects,
+            Some(taffy::FlexDirection::Row)
+        ),
+        200.0
+    );
+    assert_eq!(
+        offered_flex_grow(
+            &layout.children[1],
+            &pane_rects,
+            Some(taffy::FlexDirection::Row)
+        ),
+        800.0
+    );
+
+    let mut tree: TaffyTree<()> = TaffyTree::new();
+    let root = tree
+        .new_leaf(Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Row,
+            size: geometry::Size {
+                width: length(1000.0_f32),
+                height: length(100.0_f32),
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    let panel_style = Style {
+        display: Display::Flex,
+        flex_grow: 1.0,
+        flex_shrink: 1.0,
+        ..Default::default()
+    };
+    let panel_config = rio_backend::config::layout::Panel {
+        column_gap: 0.0,
+        row_gap: 0.0,
+        ..Default::default()
+    };
+    let mut leaves = Vec::new();
+    let split = build_layout_node(
+        &mut tree,
+        &layout,
+        &panel_style,
+        &panel_config,
+        1.0,
+        &pane_rects,
+        Some(FlexDirection::Row),
+        &mut leaves,
+    )
+    .unwrap();
+    tree.add_child(root, split).unwrap();
+    tree.compute_layout(
+        root,
+        geometry::Size {
+            width: AvailableSpace::MaxContent,
+            height: AvailableSpace::MaxContent,
+        },
+    )
+    .unwrap();
+
+    let first_width = tree.layout(leaves[0].1).unwrap().size.width;
+    let second_width = tree.layout(leaves[1].1).unwrap().size.width;
+    assert!(
+        (first_width - 200.0).abs() < 1.0,
+        "first pane width: {first_width}"
+    );
+    assert!(
+        (second_width - 800.0).abs() < 1.0,
+        "second pane width: {second_width}"
+    );
+}

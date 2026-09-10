@@ -277,6 +277,21 @@ impl ImageCache {
         &self.mask_atlas.buffer
     }
 
+    /// Return a CPU color atlas buffer by its zero-based layer index. The
+    /// renderer's vertex stream uses one-based color-layer IDs; the CPU path
+    /// performs that conversion at the call site to keep the wire/GPU
+    /// convention explicit.
+    #[inline]
+    pub fn cpu_color_atlas_buffer(&self, index: usize) -> Option<&[u8]> {
+        self.color_atlases.get(index).and_then(|atlas| {
+            if matches!(atlas.texture, ColorAtlasTexture::Cpu) {
+                Some(atlas.atlas.buffer.as_slice())
+            } else {
+                None
+            }
+        })
+    }
+
     /// Allocates a new image and optionally fills it with the specified data.
     /// For color images: tries all existing color atlases, creates new one if all full
     /// For mask images: uses the single mask atlas

@@ -1,12 +1,103 @@
 use rio_backend::config::hints::Hint;
 use rio_backend::crosswords::grid::Dimensions;
 use rio_backend::crosswords::pos::{Column, Line, Pos};
-use rio_backend::crosswords::square::Wide;
+use rio_backend::crosswords::square::{Hyperlink, Square, Wide};
 use rio_backend::crosswords::Crosswords;
 use rio_backend::event::EventListener;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+pub(crate) trait HintGrid {
+    fn columns(&self) -> usize;
+    fn screen_lines(&self) -> usize;
+    fn history_size(&self) -> usize;
+    fn bottommost_line(&self) -> Line;
+    fn display_offset(&self) -> usize;
+    fn cell(&self, pos: Pos) -> Option<&Square>;
+    fn cell_text(&self, pos: Pos) -> Vec<char>;
+    fn cell_hyperlink(&self, pos: Pos) -> Option<Hyperlink>;
+}
+
+impl<T: EventListener> HintGrid for Crosswords<T> {
+    fn columns(&self) -> usize {
+        self.columns()
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.grid.screen_lines()
+    }
+
+    fn history_size(&self) -> usize {
+        self.history_size()
+    }
+
+    fn bottommost_line(&self) -> Line {
+        self.bottommost_line()
+    }
+
+    fn display_offset(&self) -> usize {
+        self.display_offset()
+    }
+
+    fn cell(&self, pos: Pos) -> Option<&Square> {
+        if pos.row.0 < -(self.history_size() as i32)
+            || pos.row > self.bottommost_line()
+            || pos.col.0 >= self.columns()
+        {
+            return None;
+        }
+        Some(&self.grid[pos.row][pos.col])
+    }
+
+    fn cell_text(&self, pos: Pos) -> Vec<char> {
+        self.grid.cell_text(pos).collect()
+    }
+
+    fn cell_hyperlink(&self, pos: Pos) -> Option<Hyperlink> {
+        self.cell_hyperlink(pos.row, pos.col)
+    }
+}
+
+impl HintGrid for crate::context::session::RemoteView {
+    fn columns(&self) -> usize {
+        self.columns()
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.screen_lines()
+    }
+
+    fn history_size(&self) -> usize {
+        self.history_size()
+    }
+
+    fn bottommost_line(&self) -> Line {
+        self.bottommost_line()
+    }
+
+    fn display_offset(&self) -> usize {
+        self.display_offset()
+    }
+
+    fn cell(&self, pos: Pos) -> Option<&Square> {
+        if pos.row.0 < -(self.history_size() as i32)
+            || pos.row > self.bottommost_line()
+            || pos.col.0 >= self.columns()
+        {
+            return None;
+        }
+        Some(&self.grid[pos.row][pos.col])
+    }
+
+    fn cell_text(&self, pos: Pos) -> Vec<char> {
+        self.grid.cell_text(pos).collect()
+    }
+
+    fn cell_hyperlink(&self, pos: Pos) -> Option<Hyperlink> {
+        self.cell_hyperlink(pos)
+    }
+}
 
 /// Extract the visible text of `line` together with a byte-offset → grid
 /// column mapping. Spacer cells (the trailing half of a wide glyph, and
@@ -22,22 +113,25 @@ use std::rc::Rc;
 /// Used by the regex hint pipeline to convert onig's byte offsets
 /// (which would otherwise mis-locate the click target when emoji or
 /// CJK glyphs precede a URL) back into grid columns.
-pub(crate) fn extract_line_text_with_cols<T: EventListener>(
-    term: &rio_backend::crosswords::Crosswords<T>,
+pub(crate) fn extract_line_text_with_cols<T: HintGrid>(
+    term: &T,
     line: Line,
 ) -> (String, Vec<Column>) {
-    let grid = &term.grid;
-    let mut text = String::with_capacity(grid.columns());
-    let mut byte_to_col = Vec::with_capacity(grid.columns());
+    let mut text = String::with_capacity(term.columns());
+    let mut byte_to_col = Vec::with_capacity(term.columns());
 
-    for col in (0..grid.columns()).map(Column) {
+    for col in (0..term.columns()).map(Column) {
         let pos = Pos::new(line, col);
-        let cell = &grid[pos];
+        let Some(cell) = term.cell(pos) else { continue };
         if cell.is_spacer() || cell.is_leading_spacer() {
             continue;
         }
 
-        for c in grid.cell_text(pos).map(|c| if c == '\0' { ' ' } else { c }) {
+        for c in term
+            .cell_text(pos)
+            .into_iter()
+            .map(|c| if c == '\0' { ' ' } else { c })
+        {
             text.push(c);
             byte_to_col.extend(std::iter::repeat_n(col, c.len_utf8()));
         }
@@ -46,8 +140,8 @@ pub(crate) fn extract_line_text_with_cols<T: EventListener>(
     (text, byte_to_col)
 }
 
-pub(crate) fn regex_match<T: EventListener>(
-    term: &rio_backend::crosswords::Crosswords<T>,
+pub(crate) fn regex_match<T: HintGrid>(
+    term: &T,
     line: Line,
     line_text: &str,
     byte_to_col: &[Column],
@@ -69,7 +163,10 @@ pub(crate) fn regex_match<T: EventListener>(
 
     let start_col = byte_to_col[start];
     let mut end_col = byte_to_col[start + text.len() - 1];
-    if term.grid[line][end_col].is_wide() {
+    if term
+        .cell(Pos::new(line, end_col))
+        .is_some_and(|square| square.is_wide())
+    {
         end_col += 1;
     }
 
@@ -147,10 +244,7 @@ impl HintState {
     }
 
     /// Update visible matches for the current hint
-    pub fn update_matches<T: EventListener>(
-        &mut self,
-        term: &rio_backend::crosswords::Crosswords<T>,
-    ) {
+    pub fn update_matches<T: HintGrid>(&mut self, term: &T) {
         self.rebuild_matches(term);
         if self.matches.is_empty() {
             self.stop();
@@ -158,18 +252,12 @@ impl HintState {
     }
 
     /// Refresh matches without leaving hint mode when none are visible.
-    pub fn refresh_matches<T: EventListener>(
-        &mut self,
-        term: &rio_backend::crosswords::Crosswords<T>,
-    ) {
+    pub fn refresh_matches<T: HintGrid>(&mut self, term: &T) {
         self.keys.clear();
         self.rebuild_matches(term);
     }
 
-    fn rebuild_matches<T: EventListener>(
-        &mut self,
-        term: &rio_backend::crosswords::Crosswords<T>,
-    ) {
+    fn rebuild_matches<T: HintGrid>(&mut self, term: &T) {
         self.matches.clear();
 
         let hint = match &self.active_hint {
@@ -206,9 +294,9 @@ impl HintState {
     }
 
     /// Handle keyboard input during hint selection
-    pub fn keyboard_input<T: EventListener>(
+    pub fn keyboard_input<T: HintGrid>(
         &mut self,
-        term: &rio_backend::crosswords::Crosswords<T>,
+        term: &T,
         c: char,
     ) -> Option<(HintMatch, bool)> {
         match c {
@@ -290,16 +378,15 @@ impl HintState {
             })
     }
 
-    fn find_regex_matches<T: EventListener>(
+    fn find_regex_matches<T: HintGrid>(
         &mut self,
-        term: &rio_backend::crosswords::Crosswords<T>,
+        term: &T,
         regex: &onig::Regex,
         hint: Rc<Hint>,
     ) {
         // Get the visible area of the terminal
-        let grid = &term.grid;
-        let display_offset = grid.display_offset();
-        let visible_lines = grid.screen_lines();
+        let display_offset = term.display_offset();
+        let visible_lines = term.screen_lines();
 
         // Scan each visible line for matches
         for line_idx in 0..visible_lines {
@@ -326,11 +413,7 @@ impl HintState {
         }
     }
 
-    fn find_hyperlink_matches<T: EventListener>(
-        &mut self,
-        term: &rio_backend::crosswords::Crosswords<T>,
-        hint: Rc<Hint>,
-    ) {
+    fn find_hyperlink_matches<T: HintGrid>(&mut self, term: &T, hint: Rc<Hint>) {
         // Walk the visible region looking for OSC 8 hyperlink spans.
         //
         // Spans are found by comparing the hyperlink itself, not the
@@ -339,16 +422,15 @@ impl HintState {
         // slot than its neighbors while belonging to the same link.
         // `Hyperlink` is an `Arc` around (id, uri); the comparison is
         // content equality, matching the OSC 8 `id=` semantics.
-        let grid = &term.grid;
-        let display_offset = grid.display_offset();
-        let visible_lines = grid.screen_lines();
+        let display_offset = term.display_offset();
+        let visible_lines = term.screen_lines();
 
         for line_idx in 0..visible_lines {
             let line = Line(line_idx as i32 - display_offset as i32);
             let mut col = 0usize;
-            let cols = grid.columns();
+            let cols = term.columns();
             while col < cols {
-                let link = match term.cell_hyperlink(line, Column(col)) {
+                let link = match term.cell_hyperlink(Pos::new(line, Column(col))) {
                     Some(link) => link,
                     None => {
                         col += 1;
@@ -361,13 +443,18 @@ impl HintState {
                 let start_col = col;
                 let mut end_col = col;
                 while end_col < cols
-                    && term.cell_hyperlink(line, Column(end_col)).as_ref() == Some(&link)
+                    && term
+                        .cell_hyperlink(Pos::new(line, Column(end_col)))
+                        .as_ref()
+                        == Some(&link)
                 {
                     end_col += 1;
                 }
 
                 // Look up the URI once for the whole span.
-                if let Some(hyperlink) = term.cell_hyperlink(line, Column(start_col)) {
+                if let Some(hyperlink) =
+                    term.cell_hyperlink(Pos::new(line, Column(start_col)))
+                {
                     let mut uri = hyperlink.uri().to_string();
                     if hint.post_processing {
                         uri = post_process_hyperlink_uri(&uri);
@@ -496,7 +583,7 @@ pub struct LogicalLine {
 impl LogicalLine {
     /// Extract the logical line containing `point`, following soft
     /// wraps in both directions.
-    pub fn extract<T: EventListener>(term: &Crosswords<T>, point: Pos) -> Option<Self> {
+    pub fn extract<T: HintGrid>(term: &T, point: Pos) -> Option<Self> {
         /// How many cells of the logical line are followed across soft
         /// wraps on each side of the hovered row. Only matches
         /// containing the hovered cell matter, so nothing hoverable is
@@ -517,7 +604,10 @@ impl LogicalLine {
             return None;
         }
 
-        let wraps = |line: i32| term.grid[Line(line)][Column(cols - 1)].wrapline();
+        let wraps = |line: i32| {
+            term.cell(Pos::new(Line(line), Column(cols - 1)))
+                .is_some_and(|square| square.wrapline())
+        };
         let max_rows = (SCAN_CELLS / cols).max(1) as i32;
 
         let mut start_line = point.row.0;
@@ -548,11 +638,13 @@ impl LogicalLine {
             for c in 0..cols {
                 let col = Column(c);
                 let pos = Pos::new(line, col);
-                let square = &term.grid[line][col];
+                let Some(square) = term.cell(pos) else {
+                    continue;
+                };
                 if matches!(square.wide(), Wide::Spacer | Wide::LeadingSpacer) {
                     continue;
                 }
-                for (i, ch) in term.grid.cell_text(pos).enumerate() {
+                for (i, ch) in term.cell_text(pos).into_iter().enumerate() {
                     let ch = if i == 0 && ch == '\0' { ' ' } else { ch };
                     text.push(ch);
                     for _ in 0..ch.len_utf8() {
@@ -577,9 +669,9 @@ impl LogicalLine {
     /// prefix, CJK, emoji) dragged the hover underline that many bytes
     /// to the right, and its single-row search matched soft-wrapped
     /// URLs truncated or not at all.
-    pub fn match_at<T: EventListener>(
+    pub fn match_at<T: HintGrid>(
         &self,
-        term: &Crosswords<T>,
+        term: &T,
         point: Pos,
         regex: &onig::Regex,
         post_processing: bool,
@@ -654,7 +746,11 @@ impl LogicalLine {
 
             // A match ending on a wide character owns its spacer cell
             // too, so the hover underline covers the full glyph.
-            if end.col.0 + 1 < cols && term.grid[end.row][end.col].wide() == Wide::Wide {
+            if end.col.0 + 1 < cols
+                && term
+                    .cell(end)
+                    .is_some_and(|square| square.wide() == Wide::Wide)
+            {
                 end.col = Column(end.col.0 + 1);
             }
 
@@ -1093,7 +1189,7 @@ mod tests {
     use rio_backend::crosswords::Crosswords;
     use rio_backend::crosswords::CrosswordsSize;
     use rio_backend::event::{VoidListener, WindowId};
-    use unicode_width::UnicodeWidthChar;
+    use rio_unicode::UnicodeWidthChar;
 
     /// Build a tiny `Crosswords` whose first row contains `content`.
     /// Mirrors `rio_backend::crosswords::search::tests::mock_term` —
@@ -1255,12 +1351,6 @@ mod tests {
             std::env::remove_var("RIO_TEST_PATH_VAR");
         }
     }
-
-    use rio_backend::ansi::CursorShape;
-    use rio_backend::config::hints::DEFAULT_URL_REGEX;
-    use rio_backend::crosswords::CrosswordsSize;
-    use rio_backend::event::{VoidListener, WindowId};
-    use rio_unicode::UnicodeWidthChar;
 
     /// Build a terminal from literal content, the same way rio-vt's
     /// search tests do: `\n` continues a soft-wrapped line, `\r\n` is a

@@ -855,7 +855,8 @@ impl VulkanImageDraws {
     }
 }
 
-/// Decoded background image pixels (RGBA8) waiting to be uploaded to the GPU.
+/// Decoded background image pixels (RGBA8).
+#[derive(Clone, Debug)]
 pub struct BackgroundImagePixels {
     pub width: u32,
     pub height: u32,
@@ -882,8 +883,14 @@ pub struct Renderer {
     image_frame_counter: u64,
     /// Image draw commands for the current frame.
     image_draws: Vec<ImageDraw>,
-    /// Pending background image upload (consumed by `prepare`).
-    background_image_dirty: Option<BackgroundImagePixels>,
+    /// Retained background pixels. CPU rendering samples this directly;
+    /// native GPU backends upload it during `prepare`.
+    background_image_pixels: Option<BackgroundImagePixels>,
+    /// Whether the native GPU texture needs to be rebuilt.
+    background_image_dirty: bool,
+    /// Changes whenever the retained background image changes, so the CPU
+    /// frame-skip cache cannot reuse a frame painted with another image.
+    background_image_generation: u64,
     /// Dedicated GPU texture for the background image, sized to the
     /// image dimensions instead of going through the glyph atlas.
     background_image_texture: Option<ImageTextureEntry>,
@@ -1060,7 +1067,9 @@ impl Renderer {
             image_texture_bytes: 0,
             image_frame_counter: 0,
             image_draws: Vec::new(),
-            background_image_dirty: None,
+            background_image_pixels: None,
+            background_image_dirty: false,
+            background_image_generation: 0,
             background_image_texture: None,
             #[cfg(target_os = "macos")]
             metal_frame_permits: crate::grid::metal::new_frame_permits(),
@@ -1080,16 +1089,51 @@ impl Renderer {
         self.comp.batches.reset();
     }
 
-    /// Replace the background image. Pass `None` to clear it. The pixels
-    /// are uploaded into a dedicated GPU texture on the next `prepare`
-    /// call (so we don't go through the glyph atlas).
-    pub fn set_background_image_pixels(&mut self, pixels: Option<BackgroundImagePixels>) {
-        if pixels.is_some() {
-            self.background_image_dirty = pixels;
+    /// Replace the background image. Pass `None` to clear it. The pixels are
+    /// retained for native CPU rendering and uploaded into a dedicated GPU
+    /// texture on the next `prepare` call.
+    pub fn set_background_image_pixels(
+        &mut self,
+        pixels: Option<BackgroundImagePixels>,
+    ) -> Result<(), String> {
+        if let Some(pixels) = pixels {
+            let required = (pixels.width as usize)
+                .checked_mul(pixels.height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or_else(|| {
+                    "background image dimensions overflow RGBA8 size".to_owned()
+                })?;
+            if pixels.width == 0 || pixels.height == 0 || pixels.pixels.len() != required
+            {
+                return Err(format!(
+                    "background image {}x{} needs {required} RGBA bytes, got {}",
+                    pixels.width,
+                    pixels.height,
+                    pixels.pixels.len()
+                ));
+            }
+            self.background_image_pixels = Some(pixels);
+            self.background_image_dirty = true;
+            self.background_image_generation =
+                self.background_image_generation.wrapping_add(1);
         } else {
-            self.background_image_dirty = None;
+            self.background_image_pixels = None;
+            self.background_image_dirty = false;
             self.background_image_texture = None;
+            self.background_image_generation =
+                self.background_image_generation.wrapping_add(1);
         }
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn background_image_pixels(&self) -> Option<&BackgroundImagePixels> {
+        self.background_image_pixels.as_ref()
+    }
+
+    #[inline]
+    pub(crate) fn background_image_generation(&self) -> u64 {
+        self.background_image_generation
     }
 
     #[inline]
@@ -1130,7 +1174,11 @@ impl Renderer {
         // Upload pending background image (if any) before the render pass
         // begins. The texture stays cached until a new image arrives or
         // `set_background_image_pixels(None)` is called.
-        if let Some(pixels) = self.background_image_dirty.take() {
+        if self.background_image_dirty {
+            let pixels = self
+                .background_image_pixels
+                .take()
+                .expect("dirty background image must have retained pixels");
             // Vulkan needs the renderer's descriptor-set layout +
             // sampler to wire the per-image descriptor set, so it
             // takes a different path that knows about both.
@@ -1149,6 +1197,8 @@ impl Renderer {
                 self.background_image_texture =
                     upload_background_image_texture(context, &pixels);
             }
+            self.background_image_pixels = Some(pixels);
+            self.background_image_dirty = false;
         }
 
         self.instances.clear();
@@ -1679,7 +1729,7 @@ impl Renderer {
     pub fn evict_route_textures(&mut self, route_id: usize) {
         let mut freed = 0;
         self.image_textures.retain(|key, entry| {
-            let keep = crate::sugarloaf::graphics::image_key_route(*key) != route_id;
+            let keep = key.route_id != route_id;
             if !keep {
                 freed += entry.bytes;
             }

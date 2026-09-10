@@ -13,11 +13,9 @@
 //! concatenated for GPU upload. Only dirty rows are rewritten between
 //! frames; everything else stays resident in the GPU buffer.
 //!
-//! # Phase 0 status
-//!
-//! This module is scaffolding. Both backends allocate empty buffers,
-//! accept writes, and expose a `render` no-op. Shaders land in Phase 1,
-//! call sites in `rioterm::renderer` land in Phase 2.
+//! The CPU backend rasterizes into caller-owned `u32` buffers using logical
+//! `0xAARRGGBB` pixels (little-endian BGRA8 premultiplied bytes), while the
+//! other backends record native GPU work.
 
 pub mod atlas;
 pub mod cell;
@@ -58,8 +56,8 @@ pub enum GridRenderer {
     #[cfg(target_os = "linux")]
     Vulkan(vulkan::VulkanGridRenderer),
     /// Software grid renderer. Same `CellBg` / `CellText` storage as
-    /// the GPU backends, blits into the softbuffer surface during
-    /// `Sugarloaf::render_cpu` instead of recording GPU draws.
+    /// the GPU backends, blits into the CPU render target instead of
+    /// recording GPU draws.
     Cpu(cpu::CpuGridRenderer),
 }
 
@@ -261,9 +259,9 @@ impl GridRenderer {
         }
     }
 
-    /// Software cell-bg pass. Paints the grid bg into the
-    /// caller-supplied `0x00RRGGBB` u32 buffer (typically
-    /// softbuffer's `buffer_mut`). No-op for non-CPU variants.
+    /// Software cell-bg pass. Paints the grid bg into a tightly packed
+    /// caller-supplied `0xAARRGGBB` buffer. The physical little-endian bytes
+    /// are BGRA8 premultiplied. No-op for non-CPU variants.
     pub fn render_bg_cpu(
         &self,
         buf: &mut [u32],
@@ -271,12 +269,26 @@ impl GridRenderer {
         buf_h: u32,
         uniforms: &GridUniforms,
     ) {
+        self.render_bg_cpu_strided(buf, buf_w, buf_h, buf_w, uniforms);
+    }
+
+    /// Software cell-bg pass for a caller-owned buffer with an explicit
+    /// `u32` row stride. Only the first `buf_w` pixels of each row are used.
+    pub fn render_bg_cpu_strided(
+        &self,
+        buf: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        stride_pixels: u32,
+        uniforms: &GridUniforms,
+    ) {
         if let GridRenderer::Cpu(r) = self {
-            r.render_bg(buf, buf_w, buf_h, uniforms);
+            r.render_bg_strided(buf, buf_w, buf_h, stride_pixels, uniforms);
         }
     }
 
-    /// Software cell-text pass.
+    /// Software cell-text pass into a tightly packed `0xAARRGGBB` buffer
+    /// (little-endian BGRA8 premultiplied bytes).
     pub fn render_text_cpu(
         &self,
         buf: &mut [u32],
@@ -284,18 +296,22 @@ impl GridRenderer {
         buf_h: u32,
         uniforms: &GridUniforms,
     ) {
-        if let GridRenderer::Cpu(r) = self {
-            r.render_text(buf, buf_w, buf_h, uniforms);
-        }
+        self.render_text_cpu_strided(buf, buf_w, buf_h, buf_w, uniforms);
     }
 
-    /// Whether this backend actually renders grid cells. All backends
-    /// — including CPU — render through the grid path now, so this
-    /// always returns `true`. Kept for backwards compatibility with
-    /// the previous `Unsupported` variant; remove once no caller
-    /// branches on it.
-    pub fn is_active(&self) -> bool {
-        true
+    /// Software cell-text pass for a caller-owned buffer with an explicit
+    /// `u32` row stride. Only the first `buf_w` pixels of each row are used.
+    pub fn render_text_cpu_strided(
+        &self,
+        buf: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        stride_pixels: u32,
+        uniforms: &GridUniforms,
+    ) {
+        if let GridRenderer::Cpu(r) = self {
+            r.render_text_strided(buf, buf_w, buf_h, stride_pixels, uniforms);
+        }
     }
 
     /// Cached lookup for a previously-rasterized glyph. Returns the
