@@ -2,18 +2,20 @@
 //
 // CPU rasterization pipeline.
 //
-// Writes directly into softbuffer's `&mut [u32]` (0x00RRGGBB) — no
-// intermediate pixmap, no pixel format conversion at present time.
+// Writes logical `0xAARRGGBB` values into a caller-owned `u32` target. On
+// little-endian platforms this is BGRA8 premultiplied memory. Native
+// softbuffer presentation is a thin wrapper around the same rasterizer.
 //
-// v1 limitations: monochrome glyphs only (color-atlas glyphs not
-// implemented), no per-corner radii / borders / advanced underlines.
-// Kitty image overlays composite via `draw_image_overlay`.
+// CPU parity is intentionally explicit: color atlas glyphs and RGBA image
+// overlays are supported; advanced underline shaders and GPU-only effects
+// are not. Unsupported or malformed image data returns an error instead of
+// being reported as a complete frame.
 
-use crate::context::cpu::CpuContext;
+use crate::context::cpu::{CpuContext, CpuRenderError, CpuRenderTarget};
 use crate::premul::{pack_opaque, pack_premul};
 use crate::renderer::compositor::Vertex;
 use crate::renderer::image_cache::ImageCache;
-use crate::renderer::Renderer;
+use crate::renderer::{BackgroundImagePixels, Renderer};
 use crate::sugarloaf::graphics::{GraphicDataEntry, GraphicKey, GraphicOverlay};
 use rustc_hash::FxHashMap;
 use std::hash::Hasher;
@@ -40,6 +42,31 @@ impl CpuCache {
     pub fn clear(&mut self) {
         self.glyphs.clear();
         self.has_last = false;
+    }
+
+    fn prepare_buffer(&mut self, age: u8) {
+        // The scene hash describes the last frame, not every buffer in the
+        // presenter's pool. Age zero is undefined; older buffers need repaint.
+        self.has_last &= age == 1;
+    }
+}
+
+#[cfg(test)]
+mod buffer_age_tests {
+    use super::*;
+
+    #[test]
+    fn older_back_buffer_invalidates_cached_frame() {
+        let mut cache = CpuCache::new();
+        cache.has_last = true;
+        cache.prepare_buffer(2);
+        assert!(!cache.has_last);
+        cache.has_last = true;
+        cache.prepare_buffer(1);
+        assert!(cache.has_last);
+        cache.has_last = true;
+        cache.prepare_buffer(0);
+        assert!(!cache.has_last);
     }
 }
 
@@ -159,6 +186,8 @@ struct ParsedQuad {
     max_y: f32,
     min_u: f32,
     min_v: f32,
+    max_u: f32,
+    max_v: f32,
     color: [f32; 4],
     color_layer: i32,
     mask_layer: i32,
@@ -173,6 +202,8 @@ fn parse_quad(chunk: &[Vertex]) -> ParsedQuad {
     let mut max_y = f32::NEG_INFINITY;
     let mut min_u = f32::INFINITY;
     let mut min_v = f32::INFINITY;
+    let mut max_u = f32::NEG_INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
     for v in chunk {
         if v.pos[0] < min_x {
             min_x = v.pos[0];
@@ -192,6 +223,12 @@ fn parse_quad(chunk: &[Vertex]) -> ParsedQuad {
         if v.uv[1] < min_v {
             min_v = v.uv[1];
         }
+        if v.uv[0] > max_u {
+            max_u = v.uv[0];
+        }
+        if v.uv[1] > max_v {
+            max_v = v.uv[1];
+        }
     }
     let v0 = chunk[0];
     ParsedQuad {
@@ -201,6 +238,8 @@ fn parse_quad(chunk: &[Vertex]) -> ParsedQuad {
         max_y,
         min_u,
         min_v,
+        max_u,
+        max_v,
         color: v0.color,
         color_layer: v0.layers[0],
         mask_layer: v0.layers[1],
@@ -274,11 +313,10 @@ impl PendingFill {
 }
 
 #[inline]
-fn flush_fill(buf: &mut [u32], buf_w: i32, p: &PendingFill) {
-    let buf_w_us = buf_w as usize;
+fn flush_fill(buf: &mut [u32], stride: usize, p: &PendingFill) {
     for y in p.y0..p.y1 {
-        let row_start = (y as usize) * buf_w_us + (p.x0 as usize);
-        let row_end = (y as usize) * buf_w_us + (p.x1 as usize);
+        let row_start = (y as usize) * stride + (p.x0 as usize);
+        let row_end = (y as usize) * stride + (p.x1 as usize);
         buf[row_start..row_end].fill(p.packed);
     }
 }
@@ -292,6 +330,51 @@ pub fn render_cpu(
     text: &crate::text::Text,
     images: &ImageLayers,
 ) {
+    let surface = &mut ctx.surface;
+
+    let width = ctx.width_px;
+    let height = ctx.height_px;
+    let mut buffer = match surface.buffer_mut() {
+        Ok(buffer) => buffer,
+        Err(e) => {
+            tracing::error!("softbuffer buffer_mut failed: {e}");
+            return;
+        }
+    };
+
+    cache.prepare_buffer(buffer.age());
+    let result = match CpuRenderTarget::new(&mut buffer, width, height, width) {
+        Ok(mut target) => render_cpu_target(
+            &mut target,
+            renderer,
+            cache,
+            background,
+            grids,
+            text,
+            images,
+        ),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = result {
+        tracing::error!("CPU rendering failed: {e}");
+        return;
+    }
+
+    if let Err(e) = buffer.present() {
+        tracing::error!("softbuffer present failed: {e}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_cpu_target(
+    target: &mut CpuRenderTarget<'_>,
+    renderer: &Renderer,
+    cache: &mut CpuCache,
+    background: Option<crate::sugarloaf::Color>,
+    grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
+    text: &crate::text::Text,
+    images: &ImageLayers,
+) -> Result<(), CpuRenderError> {
     // Flatten and z-sort image overlays once. The sort is stable and
     // each panel's vec arrives ordered (z, image_id, placement_id)
     // from the frontend, so equal keys keep their per-panel paint
@@ -304,6 +387,11 @@ pub fn render_cpu(
     let vertices = renderer.vertices();
     let quad_instances = renderer.instances();
     let text_instances = text.instances();
+    let target_width = target.width();
+    let target_height = target.height();
+    let target_stride = target.stride_pixels();
+
+    validate_image_layers(images, renderer.background_image_pixels())?;
 
     // Frame skip.
     //
@@ -325,6 +413,10 @@ pub fn render_cpu(
         } else {
             h.write_u8(0);
         }
+        h.write_u64(renderer.background_image_generation());
+        h.write_u32(target_width);
+        h.write_u32(target_height);
+        h.write_u32(target_stride);
         let bytes: &[u8] = bytemuck::cast_slice(vertices);
         h.write(bytes);
         let inst_bytes: &[u8] = bytemuck::cast_slice(quad_instances);
@@ -373,37 +465,19 @@ pub fn render_cpu(
     };
 
     if cache.has_last && cache.last_frame_hash == frame_hash {
-        return;
+        return Ok(());
     }
-    cache.last_frame_hash = frame_hash;
-    cache.has_last = true;
+    let buf_w = target_width as i32;
+    let buf_h = target_height as i32;
+    let stride = target_stride as usize;
+    let (buffer, _, _, _) = target.parts_mut();
 
-    let buf_w = ctx.width_px as i32;
-    let buf_h = ctx.height_px as i32;
-    if buf_w == 0 || buf_h == 0 {
-        return;
-    }
-
-    let mut buffer = match ctx.surface.buffer_mut() {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!("softbuffer buffer_mut failed: {e}");
-            return;
-        }
-    };
-
-    // Bg fill writes premultiplied RGBA on Windows only: softbuffer's GDI
-    // path copies the alpha byte through to the DWM redirection surface,
-    // where `DwmEnableBlurBehindWindow` makes `window.opacity` real. Its
-    // other presenters drop the byte (macOS `NoneSkipFirst`, Wayland
-    // `Xrgb8888`), so premultiplying there would darken the window with
-    // no transparency in return; those keep the full-brightness opaque
-    // fill and opacity stays a no-op on the CPU backend, as before.
     let bg_u32 = match background {
         Some(c) => {
             #[cfg(target_os = "windows")]
+            let a = c.a.clamp(0.0, 1.0);
+            #[cfg(target_os = "windows")]
             {
-                let a = c.a.clamp(0.0, 1.0);
                 pack_premul(
                     (c.r.clamp(0.0, 1.0) * a * 255.0) as u8,
                     (c.g.clamp(0.0, 1.0) * a * 255.0) as u8,
@@ -412,15 +486,20 @@ pub fn render_cpu(
                 )
             }
             #[cfg(not(target_os = "windows"))]
-            pack_opaque(
-                (c.r.clamp(0.0, 1.0) * 255.0) as u8,
-                (c.g.clamp(0.0, 1.0) * 255.0) as u8,
-                (c.b.clamp(0.0, 1.0) * 255.0) as u8,
-            )
+            {
+                pack_opaque(
+                    (c.r.clamp(0.0, 1.0) * 255.0) as u8,
+                    (c.g.clamp(0.0, 1.0) * 255.0) as u8,
+                    (c.b.clamp(0.0, 1.0) * 255.0) as u8,
+                )
+            }
         }
         None => 0,
     };
-    buffer.fill(bg_u32);
+    for y in 0..target_height as usize {
+        let row_start = y * stride;
+        buffer[row_start..row_start + target_width as usize].fill(bg_u32);
+    }
 
     // Grid passes: paint each panel's terminal cells (bg + glyphs)
     // into the buffer before overlay vertices, so UI overlays
@@ -430,35 +509,78 @@ pub fn render_cpu(
     // images.
     {
         use crate::renderer::IMAGE_BG_LIMIT;
-        let buf_slice: &mut [u32] = &mut buffer;
+        let buf_slice: &mut [u32] = buffer;
         let split_below_bg =
             image_overlays.partition_point(|o| o.z_index < IMAGE_BG_LIMIT);
         let split_below_text = image_overlays.partition_point(|o| o.z_index < 0);
         let (below_bg, rest) = image_overlays.split_at(split_below_bg);
         let (below_text, above_text) = rest.split_at(split_below_text - split_below_bg);
 
-        draw_image_overlays(buf_slice, buf_w, buf_h, below_bg, images.data);
+        draw_background_image(
+            buf_slice,
+            buf_w,
+            buf_h,
+            stride,
+            renderer.background_image_pixels(),
+        );
+        draw_image_overlays(buf_slice, buf_w, buf_h, stride, below_bg, images.data)?;
         for (grid, uniforms) in grids.iter() {
-            grid.render_bg_cpu(buf_slice, ctx.width_px, ctx.height_px, uniforms);
+            grid.render_bg_cpu_strided(
+                buf_slice,
+                target_width,
+                target_height,
+                target_stride,
+                uniforms,
+            );
         }
-        draw_image_overlays(buf_slice, buf_w, buf_h, below_text, images.data);
+        draw_image_overlays(buf_slice, buf_w, buf_h, stride, below_text, images.data)?;
         for (grid, uniforms) in grids.iter() {
-            grid.render_text_cpu(buf_slice, ctx.width_px, ctx.height_px, uniforms);
+            grid.render_text_cpu_strided(
+                buf_slice,
+                target_width,
+                target_height,
+                target_stride,
+                uniforms,
+            );
         }
-        draw_image_overlays(buf_slice, buf_w, buf_h, above_text, images.data);
+        draw_image_overlays(buf_slice, buf_w, buf_h, stride, above_text, images.data)?;
     }
 
     // QuadInstance pass: split borders, panel rects, scrollbar, dim
     // overlays — anything queued via `sugarloaf.rect/quad/rounded_rect`.
-    // Image / mask layers (subpixel text, image atlas) are not handled
-    // here; sub-pixel UI text already lives in `text.render_cpu`, and
-    // the grid path owns terminal glyphs.
+    // Color-atlas instances are also used by `Sugarloaf::image_rect`.
     if !quad_instances.is_empty() {
-        let buf_slice: &mut [u32] = &mut buffer;
+        let buf_slice: &mut [u32] = buffer;
+        let images = renderer.image_cache();
+        let atlas_size = images.cpu_max_texture_size();
         for inst in quad_instances {
-            // Image / mask atlas layers — skip on CPU (handled by
-            // grid + text passes for the use cases that matter).
-            if inst.layers[0] != 0 || inst.layers[1] != 0 {
+            if inst.layers[0] > 0 {
+                let q = ParsedQuad {
+                    min_x: inst.pos[0],
+                    min_y: inst.pos[1],
+                    max_x: inst.pos[0] + inst.size[0],
+                    max_y: inst.pos[1] + inst.size[1],
+                    min_u: inst.uv_rect[0],
+                    min_v: inst.uv_rect[1],
+                    max_u: inst.uv_rect[2],
+                    max_v: inst.uv_rect[3],
+                    color: inst.color,
+                    color_layer: inst.layers[0],
+                    mask_layer: inst.layers[1],
+                    clip: inst.clip_rect,
+                };
+                let Some((x0, y0, x1, y1)) = snap_and_clip(&q, buf_w, buf_h) else {
+                    continue;
+                };
+                draw_color_glyph(
+                    buf_slice, stride, buf_w, buf_h, &q, x0, y0, x1, y1, images,
+                    atlas_size,
+                )?;
+                continue;
+            }
+            // Mask-only instances are not emitted by the current public
+            // image-rect API; grid/text paths own their mask glyphs.
+            if inst.layers[1] > 0 {
                 continue;
             }
             // Underline pattern shaders — TODO: implement on CPU.
@@ -467,14 +589,14 @@ pub fn render_cpu(
             if inst.underline_style > 1 {
                 continue;
             }
-            draw_quad_instance(buf_slice, buf_w, buf_h, inst);
+            draw_quad_instance(buf_slice, stride, buf_w, buf_h, inst);
         }
     }
 
     if !vertices.is_empty() {
         let images = renderer.image_cache();
         let atlas_size = images.cpu_max_texture_size();
-        let buf_slice: &mut [u32] = &mut buffer;
+        let buf_slice: &mut [u32] = buffer;
 
         let mut pending: Option<PendingFill> = None;
 
@@ -494,23 +616,28 @@ pub fn render_cpu(
             };
             let (x0, y0, x1, y1) = snapped;
 
-            // Glyph?
-            if q.mask_layer > 0 {
+            // The GPU samples the color atlas first and uses a mask layer to
+            // modulate it when both are present. Keep that ordering here.
+            if q.color_layer > 0 {
                 if let Some(p) = pending.take() {
-                    flush_fill(buf_slice, buf_w, &p);
+                    flush_fill(buf_slice, stride, &p);
                 }
-                draw_glyph(
-                    buf_slice, buf_w, x0, y0, x1, y1, q.min_x, q.min_y, q.min_u, q.min_v,
-                    q.color, images, atlas_size, cache,
-                );
+                draw_color_glyph(
+                    buf_slice, stride, buf_w, buf_h, &q, x0, y0, x1, y1, images,
+                    atlas_size,
+                )?;
                 continue;
             }
 
-            // Color-atlas (image / color glyph): not implemented.
-            if q.color_layer > 0 {
+            // Mask glyph.
+            if q.mask_layer > 0 {
                 if let Some(p) = pending.take() {
-                    flush_fill(buf_slice, buf_w, &p);
+                    flush_fill(buf_slice, stride, &p);
                 }
+                draw_glyph(
+                    buf_slice, stride, x0, y0, x1, y1, q.min_x, q.min_y, q.min_u,
+                    q.min_v, q.color, images, atlas_size, cache,
+                );
                 continue;
             }
 
@@ -529,7 +656,7 @@ pub fn render_cpu(
                     if p.try_extend(x0, y0, x1, y1, packed) {
                         continue;
                     }
-                    flush_fill(buf_slice, buf_w, p);
+                    flush_fill(buf_slice, stride, p);
                 }
                 pending = Some(PendingFill {
                     x0,
@@ -540,25 +667,24 @@ pub fn render_cpu(
                 });
             } else {
                 if let Some(p) = pending.take() {
-                    flush_fill(buf_slice, buf_w, &p);
+                    flush_fill(buf_slice, stride, &p);
                 }
-                fill_translucent_simd(buf_slice, buf_w, x0, y0, x1, y1, r, g, b, a);
+                fill_translucent_simd(buf_slice, stride, x0, y0, x1, y1, r, g, b, a);
             }
         }
 
         if let Some(p) = pending.take() {
-            flush_fill(buf_slice, buf_w, &p);
+            flush_fill(buf_slice, stride, &p);
         }
     }
 
     // UI text pass — tab labels, search, command palette, assistant,
     // island, etc. Sits on top of grids + UI quads so labels never
     // get hidden by panel borders or the cursor.
-    text.render_cpu(&mut buffer, ctx.width_px, ctx.height_px);
-
-    if let Err(e) = buffer.present() {
-        tracing::error!("softbuffer present failed: {e}");
-    }
+    text.render_cpu_strided(buffer, target_width, target_height, target_stride);
+    cache.last_frame_hash = frame_hash;
+    cache.has_last = true;
+    Ok(())
 }
 
 /// Draw a batch of image overlays into the buffer.
@@ -566,24 +692,123 @@ fn draw_image_overlays(
     buf: &mut [u32],
     buf_w: i32,
     buf_h: i32,
+    stride: usize,
     overlays: &[&GraphicOverlay],
     data: &FxHashMap<GraphicKey, GraphicDataEntry>,
-) {
+) -> Result<(), CpuRenderError> {
     for overlay in overlays {
-        let entry = match data.get(&overlay.image_id) {
-            Some(e) => e,
-            None => continue,
-        };
+        let entry =
+            data.get(&overlay.image_id)
+                .ok_or(CpuRenderError::MissingImageData {
+                    route_id: overlay.image_id.route_id,
+                    image_id: overlay.image_id.image_id,
+                })?;
         let (width, height, pixels) = match &entry.handle.data {
             crate::components::core::image::Data::Rgba {
                 width,
                 height,
                 pixels,
             } => (*width, *height, pixels.as_ref()),
-            _ => continue,
+            _ => {
+                return Err(CpuRenderError::UnsupportedImageData {
+                    route_id: overlay.image_id.route_id,
+                    image_id: overlay.image_id.image_id,
+                });
+            }
         };
-        draw_image_overlay(buf, buf_w, buf_h, overlay, width, height, pixels);
+        draw_image_overlay_strided(
+            buf, buf_w, buf_h, stride, overlay, width, height, pixels,
+        );
     }
+    Ok(())
+}
+
+fn validate_image_layers(
+    images: &ImageLayers,
+    background: Option<&BackgroundImagePixels>,
+) -> Result<(), CpuRenderError> {
+    if let Some(background) = background {
+        validate_rgba_pixels(background.width, background.height, &background.pixels)?;
+    }
+    for overlay in images.overlays.values().flatten() {
+        let entry = images.data.get(&overlay.image_id).ok_or(
+            CpuRenderError::MissingImageData {
+                route_id: overlay.image_id.route_id,
+                image_id: overlay.image_id.image_id,
+            },
+        )?;
+        let (width, height, pixels) = match &entry.handle.data {
+            crate::components::core::image::Data::Rgba {
+                width,
+                height,
+                pixels,
+            } => (*width, *height, pixels.as_ref()),
+            _ => {
+                return Err(CpuRenderError::UnsupportedImageData {
+                    route_id: overlay.image_id.route_id,
+                    image_id: overlay.image_id.image_id,
+                });
+            }
+        };
+        validate_rgba_pixels(width, height, pixels)?;
+    }
+    Ok(())
+}
+
+fn validate_rgba_pixels(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Result<(), CpuRenderError> {
+    let required_bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(CpuRenderError::InvalidImageData {
+            width,
+            height,
+            required_bytes: usize::MAX,
+            actual_bytes: pixels.len(),
+        })?;
+    if width == 0 || height == 0 || pixels.len() != required_bytes {
+        return Err(CpuRenderError::InvalidImageData {
+            width,
+            height,
+            required_bytes,
+            actual_bytes: pixels.len(),
+        });
+    }
+    Ok(())
+}
+
+fn draw_background_image(
+    buf: &mut [u32],
+    buf_w: i32,
+    buf_h: i32,
+    stride: usize,
+    background: Option<&BackgroundImagePixels>,
+) {
+    let Some(background) = background else {
+        return;
+    };
+    let overlay = GraphicOverlay {
+        image_id: GraphicKey::new(0, 0),
+        x: 0.0,
+        y: 0.0,
+        width: buf_w as f32,
+        height: buf_h as f32,
+        z_index: 0,
+        source_rect: GraphicOverlay::FULL_SOURCE_RECT,
+    };
+    draw_image_overlay_strided(
+        buf,
+        buf_w,
+        buf_h,
+        stride,
+        &overlay,
+        background.width,
+        background.height,
+        &background.pixels,
+    );
 }
 
 /// Nearest-neighbor, alpha-blended blit of one image overlay.
@@ -604,10 +829,53 @@ pub fn draw_image_overlay(
     image_height: u32,
     rgba: &[u8],
 ) {
+    draw_image_overlay_strided(
+        buf,
+        buf_w,
+        buf_h,
+        buf_w.max(0) as usize,
+        overlay,
+        image_width,
+        image_height,
+        rgba,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_image_overlay_strided(
+    buf: &mut [u32],
+    buf_w: i32,
+    buf_h: i32,
+    stride: usize,
+    overlay: &GraphicOverlay,
+    image_width: u32,
+    image_height: u32,
+    rgba: &[u8],
+) {
+    if buf_w <= 0 || buf_h <= 0 || stride < buf_w as usize {
+        return;
+    }
+    let required_target = match (buf_h as usize - 1)
+        .checked_mul(stride)
+        .and_then(|offset| offset.checked_add(buf_w as usize))
+    {
+        Some(required) => required,
+        None => return,
+    };
+    if buf.len() < required_target {
+        return;
+    }
     if image_width == 0 || image_height == 0 {
         return;
     }
-    if rgba.len() < (image_width as usize) * (image_height as usize) * 4 {
+    let required_source = match (image_width as usize)
+        .checked_mul(image_height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    {
+        Some(required) => required,
+        None => return,
+    };
+    if rgba.len() < required_source {
         return;
     }
     if overlay.width <= 0.0 || overlay.height <= 0.0 {
@@ -643,7 +911,7 @@ pub fn draw_image_overlay(
         let v = v0 + (v1 - v0) * t_y;
         let sy = ((v * ih) as i32).clamp(0, max_sy) as usize;
         let src_row = sy * image_width as usize;
-        let dst_row = (py * buf_w) as usize;
+        let dst_row = (py as usize) * stride;
         for px in cx0..cx1 {
             let t_x = ((px - x0) as f32 + 0.5) / span_x;
             let u = u0 + (u1 - u0) * t_x;
@@ -670,7 +938,7 @@ pub fn draw_image_overlay(
 #[inline]
 fn fill_translucent_simd(
     buf: &mut [u32],
-    buf_w: i32,
+    stride: usize,
     x0: i32,
     y0: i32,
     x1: i32,
@@ -691,10 +959,9 @@ fn fill_translucent_simd(
     let src_v4 = u32x4::splat(src_premul);
     let inv_v4 = u32x4::splat(inv);
 
-    let buf_w_us = buf_w as usize;
     for y in y0..y1 {
-        let row_start = (y as usize) * buf_w_us + (x0 as usize);
-        let row_end = (y as usize) * buf_w_us + (x1 as usize);
+        let row_start = (y as usize) * stride + (x0 as usize);
+        let row_end = (y as usize) * stride + (x1 as usize);
         let row = &mut buf[row_start..row_end];
 
         // 256-bit chunks first.
@@ -729,7 +996,7 @@ fn fill_translucent_simd(
 #[inline]
 fn draw_glyph(
     buf: &mut [u32],
-    buf_w: i32,
+    stride: usize,
     x0: i32,
     y0: i32,
     x1: i32,
@@ -814,12 +1081,11 @@ fn draw_glyph(
     }
 
     let glyph = cache.glyphs.get(&key).unwrap();
-    let buf_w_us = buf_w as usize;
     let g_w_us = glyph.w as usize;
 
     for yy in 0..glyph.h as usize {
         let dst_y = y0 as usize + yy;
-        let dst_row_off = dst_y * buf_w_us + x0 as usize;
+        let dst_row_off = dst_y * stride + x0 as usize;
         let src_row_off = yy * g_w_us;
         let dst_row = &mut buf[dst_row_off..dst_row_off + g_w_us];
         let src_row = &glyph.pixels[src_row_off..src_row_off + g_w_us];
@@ -844,13 +1110,94 @@ fn draw_glyph(
     }
 }
 
+/// Blit one color-atlas quad. Color atlas payloads are already
+/// premultiplied RGBA8, just like the GPU texture; sample them directly and
+/// apply the same source-over operation as the rest of the CPU path.
+#[allow(clippy::too_many_arguments)]
+fn draw_color_glyph(
+    buf: &mut [u32],
+    stride: usize,
+    buf_w: i32,
+    buf_h: i32,
+    q: &ParsedQuad,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    images: &ImageCache,
+    atlas_size: u16,
+) -> Result<(), CpuRenderError> {
+    let Some(atlas) = images.cpu_color_atlas_buffer((q.color_layer - 1) as usize) else {
+        return Err(CpuRenderError::MissingColorAtlas {
+            layer: q.color_layer,
+        });
+    };
+    let atlas_size = atlas_size as usize;
+    let required_atlas = atlas_size
+        .checked_mul(atlas_size)
+        .and_then(|pixels| pixels.checked_mul(4));
+    if atlas_size == 0 || required_atlas.is_none_or(|required| atlas.len() < required) {
+        return Err(CpuRenderError::InvalidColorAtlas {
+            layer: q.color_layer,
+        });
+    }
+    let mask_atlas = if q.mask_layer > 0 {
+        let required_mask = atlas_size.checked_mul(atlas_size);
+        if required_mask
+            .is_none_or(|required| images.cpu_mask_atlas_buffer().len() < required)
+        {
+            return Err(CpuRenderError::InvalidMaskAtlas);
+        }
+        Some(images.cpu_mask_atlas_buffer())
+    } else {
+        None
+    };
+    let color_alpha = (q.color[3].clamp(0.0, 1.0) * 255.0) as u8;
+    let width = q.max_x - q.min_x;
+    let height = q.max_y - q.min_y;
+    if width <= 0.0 || height <= 0.0 {
+        return Ok(());
+    }
+    let max_sx = atlas_size.saturating_sub(1);
+    let max_sy = atlas_size.saturating_sub(1);
+    for py in y0.max(0)..y1.min(buf_h) {
+        let v = ((py as f32 + 0.5 - q.min_y) / height).clamp(0.0, 1.0);
+        let atlas_y = ((q.min_v + (q.max_v - q.min_v) * v) * atlas_size as f32)
+            .floor()
+            .max(0.0) as usize;
+        let atlas_y = atlas_y.min(max_sy);
+        for px in x0.max(0)..x1.min(buf_w) {
+            let u = ((px as f32 + 0.5 - q.min_x) / width).clamp(0.0, 1.0);
+            let atlas_x = ((q.min_u + (q.max_u - q.min_u) * u) * atlas_size as f32)
+                .floor()
+                .max(0.0) as usize;
+            let atlas_x = atlas_x.min(max_sx);
+            let src = (atlas_y * atlas_size + atlas_x) * 4;
+            let alpha = mask_atlas.map_or(atlas[src + 3], |mask| {
+                ((u16::from(color_alpha)
+                    * u16::from(mask[atlas_y * atlas_size + atlas_x])
+                    + 127)
+                    / 255) as u8
+            });
+            if alpha == 0 {
+                continue;
+            }
+            let source = pack_premul(atlas[src], atlas[src + 1], atlas[src + 2], alpha);
+            let dst = (py as usize) * stride + px as usize;
+            buf[dst] = blend_over_swar(source, buf[dst]);
+        }
+    }
+    Ok(())
+}
+
 /// Rasterize one `QuadInstance` (rect / quad / rounded_rect /
-/// underline-style 1) into the softbuffer pixel buffer. Honors
+/// underline-style 1) into the CPU pixel buffer. Honors
 /// `clip_rect` (interpreted the same as the GPU shader: zero w/h
 /// means "no clip"). Rounded corners use a square-distance test
 /// against each corner center.
 fn draw_quad_instance(
     buf: &mut [u32],
+    stride: usize,
     buf_w: i32,
     buf_h: i32,
     inst: &crate::renderer::batch::QuadInstance,
@@ -913,8 +1260,6 @@ fn draw_quad_instance(
     }
 
     let any_radii = inst.corner_radii.iter().any(|&r| r > 0.0);
-    let stride = buf_w as usize;
-
     if !any_radii {
         // Solid fill — fast path.
         if a == 255 {
@@ -1245,5 +1590,13 @@ mod image_overlay_tests {
         let image = vec![0u8; 2 * 2 * 4]; // all alpha 0
         draw_image_overlay(&mut buf, 2, 2, &overlay(0.0, 0.0, 2.0, 2.0), 2, 2, &image);
         assert!(buf.iter().all(|&px| px == 0x0012_3456));
+    }
+
+    #[test]
+    fn malformed_rgba_length_is_rejected_before_writes() {
+        assert!(matches!(
+            validate_rgba_pixels(1, 1, &[255, 0, 0, 255, 1]),
+            Err(CpuRenderError::InvalidImageData { .. })
+        ));
     }
 }

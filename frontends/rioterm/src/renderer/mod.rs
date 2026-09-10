@@ -17,10 +17,7 @@ pub mod search;
 pub mod trail_cursor;
 pub mod utils;
 
-use rio_backend::event::TerminalDamage;
-
-use crate::context::renderable::{PendingUpdate, RenderableContent};
-use crate::context::ContextManager;
+use crate::context::{renderable::PendingUpdate, Context, ContextManager};
 use crate::crosswords::style::{Style as CellStyle, StyleFlags};
 use rio_backend::config::colors::term::TermColors;
 use rio_backend::config::colors::{
@@ -45,6 +42,35 @@ const TOOLTIP_BG_COLOR: [f32; 4] = [0.12, 0.12, 0.12, 0.96];
 const TOOLTIP_TEXT_COLOR: [u8; 4] = [237, 237, 237, 255];
 const TOOLTIP_DEPTH_BG: f32 = 0.1;
 const TOOLTIP_ORDER: u8 = 20;
+
+fn refresh_context(context: &mut Context<EventProxy>, force_full_damage: bool) -> bool {
+    let is_dirty = context.renderable_content.pending_update.is_dirty();
+    if !is_dirty && !force_full_damage {
+        return false;
+    }
+
+    let ui_damage = context
+        .renderable_content
+        .pending_update
+        .take_terminal_damage();
+    context.renderable_content.pending_update.reset();
+    context
+        .terminal
+        .lock()
+        .refresh_renderable(&mut context.renderable_content);
+    if force_full_damage {
+        context.renderable_content.frame_damage =
+            rio_backend::event::TerminalDamage::Full;
+    } else if let Some(ui_damage) = ui_damage {
+        context.renderable_content.frame_damage = PendingUpdate::merge_terminal_damages(
+            context.renderable_content.frame_damage,
+            ui_damage,
+        );
+    }
+    context.renderable_content.has_blinking_enabled =
+        context.renderable_content.blinking_cursor;
+    true
+}
 
 /// Longest prefix of `text` that still fits `max_width` once an
 /// ellipsis is appended, or `text` untouched when it already fits.
@@ -148,7 +174,7 @@ fn window_bg_alpha(config: &Config) -> f32 {
     }
 }
 
-pub use rio_backend::sugarloaf::{atlas_image_key, kitty_image_key, route_image_key};
+pub use rio_backend::sugarloaf::{atlas_image_key, kitty_image_key};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowOverlay {
@@ -456,259 +482,39 @@ impl Renderer {
         context_manager: &mut ContextManager<EventProxy>,
     ) -> (Option<crate::context::renderable::WindowUpdate>, bool) {
         let mut any_panel_dirty = false;
-        let grid = context_manager.current_grid_mut();
-        let active_route = grid.current().route_id;
-        let grid_scaled_margin = grid.get_scaled_margin();
+        let active_route = context_manager.current_grid().current().route_id;
         let mut has_active_changed = false;
         if self.last_active != Some(active_route) {
             has_active_changed = true;
             self.last_active = Some(active_route);
         }
 
+        // Hidden tabs do not participate in the compositor draw below, but
+        // imported panes still need fresh interaction metadata before their
+        // resident Sugarloaf grid can publish a usable first frame.
+        let force_full_damage = has_active_changed || self.is_game_mode_enabled;
+        for grid in context_manager.contexts_mut().iter_mut() {
+            if grid.route_ids().contains(&active_route) {
+                continue;
+            }
+            for grid_context in grid.contexts_mut().values_mut() {
+                let context = grid_context.context_mut();
+                any_panel_dirty |= refresh_context(context, force_full_damage);
+            }
+        }
+
+        let grid = context_manager.current_grid_mut();
+        let grid_scaled_margin = grid.get_scaled_margin();
+
         for grid_context in grid.contexts_mut().values_mut() {
-            let panel_rect = grid_context.layout_rect;
             let context = grid_context.context_mut();
 
             let force_full_damage = has_active_changed || self.is_game_mode_enabled;
 
-            let is_dirty = context.renderable_content.pending_update.is_dirty();
-
-            // Check if we need to render
-            if !is_dirty && !force_full_damage {
-                // No updates pending, skip rendering
+            if !refresh_context(context, force_full_damage) {
                 continue;
             }
             any_panel_dirty = true;
-
-            // UI-side damage (scroll, selection, resize, etc.)
-            let ui_terminal_damage = context
-                .renderable_content
-                .pending_update
-                .take_terminal_damage();
-            context.renderable_content.pending_update.reset();
-
-            {
-                let mut terminal = context.terminal.lock();
-
-                // Clear in-flight flag so PTY thread can notify again
-                terminal.damage_event_in_flight = false;
-
-                let pty_damage = terminal.peek_damage_event();
-
-                let damage = if force_full_damage {
-                    TerminalDamage::Full
-                } else {
-                    match (ui_terminal_damage, pty_damage) {
-                        (Some(ui), Some(pty)) => {
-                            PendingUpdate::merge_terminal_damages(ui, pty)
-                        }
-                        (Some(d), None) | (None, Some(d)) => d,
-                        // UI-only damage (overlay hover, command-palette
-                        // input, etc.): cells didn't change, but the
-                        // panel still has to go through the render path
-                        // so UI overlays paint on top of a fresh frame.
-                        // Noop propagates to `RowsToRebuild::None` in
-                        // `screen::render`'s emit loop — grid keeps its
-                        // resident CPU bg/fg buffers, zero row work.
-                        (None, None) => TerminalDamage::Noop,
-                    }
-                };
-
-                terminal.reset_damage();
-
-                terminal.snapshot_visible(
-                    &damage,
-                    &mut context.renderable_content.visible_rows,
-                    &mut context.renderable_content.row_styles,
-                    &mut context.renderable_content.extras,
-                );
-                context.renderable_content.term_colors = terminal.colors;
-                context.renderable_content.display_offset = terminal.display_offset();
-                context.renderable_content.columns = terminal.columns();
-                context.renderable_content.screen_lines = terminal.screen_lines();
-                context.renderable_content.history_size = terminal.history_size();
-                context.renderable_content.lines_evicted = terminal.lines_evicted();
-                context.renderable_content.blinking_cursor = terminal.blinking_cursor;
-                context.renderable_content.cursor.state = terminal.cursor();
-                if terminal.graphics.kitty_graphics_dirty {
-                    context.renderable_content.kitty_virtual_placements =
-                        terminal.graphics.kitty_virtual_placements.clone();
-                    context.renderable_content.kitty_images =
-                        terminal.graphics.kitty_images.clone();
-                    context.renderable_content.kitty_placements = {
-                        let mut placements: Vec<_> = terminal
-                            .graphics
-                            .kitty_placements
-                            .values()
-                            .filter(|p| {
-                                terminal.graphics.kitty_images.contains_key(&p.image_id)
-                            })
-                            .cloned()
-                            .collect();
-                        // Tie-break on the unique key so equal
-                        // z-indexes keep a stable paint order across
-                        // frames (map iteration order is not).
-                        placements
-                            .sort_by_key(|p| (p.z_index, p.image_id, p.placement_id));
-                        placements
-                    };
-                    context.renderable_content.atlas_placements =
-                        terminal.graphics.atlas_placements.clone();
-                    context.renderable_content.kitty_graphics_dirty = true;
-                    terminal.graphics.kitty_graphics_dirty = false;
-                } else {
-                    context.renderable_content.kitty_graphics_dirty = false;
-                }
-                context.renderable_content.frame_damage = damage;
-                drop(terminal);
-            }
-
-            // Recalculate image overlay positions every frame when placements
-            // exist. Positions depend on display_offset and history_size which
-            // change on scroll and text output (like approach).
-            let rc = &context.renderable_content;
-            let route_id = context.route_id;
-            let has_overlays = !rc.kitty_placements.is_empty();
-            let has_virtual = !rc.kitty_virtual_placements.is_empty();
-            let has_atlas = !rc.atlas_placements.is_empty();
-            if has_overlays || has_virtual || has_atlas {
-                let layout = context.dimension;
-                // Canonical integer cell stride — line_height already
-                // baked into `cell.cell_height`. Same value the GPU
-                // grid uniform paints with.
-                let cell_width = layout.cell.cell_width as f32;
-                let cell_height = layout.cell.cell_height as f32;
-                // Rounded like the grid's own paint origin
-                // (screen/mod.rs panel_left/panel_top), so image quads
-                // and the clip rect sit exactly on the painted cell
-                // grid instead of up to half a pixel off.
-                let origin_x = (panel_rect[0] + grid_scaled_margin.left).round();
-                let origin_y = (panel_rect[1] + grid_scaled_margin.top).round();
-
-                // Images clip to the panel's cell grid, exactly like
-                // text: without this a wide image paints across split
-                // dividers onto neighbor panels.
-                let clip_x0 = origin_x;
-                let clip_y0 = origin_y;
-                let clip_x1 = origin_x + rc.columns as f32 * cell_width;
-                let clip_y1 = origin_y + rc.screen_lines as f32 * cell_height;
-
-                let overlays = sugarloaf
-                    .image_overlays
-                    .entry(context.rich_text_id)
-                    .or_default();
-                overlays.clear();
-
-                let viewport = rio_backend::ansi::graphics::OverlayViewport {
-                    cell_width,
-                    cell_height,
-                    origin_x,
-                    origin_y,
-                    // Absolute lines above the screen top: ring
-                    // evictions + current history.
-                    history_size: rc.lines_evicted as i64 + rc.history_size as i64,
-                    display_offset: rc.display_offset as i64,
-                    screen_lines: rc.screen_lines as i64,
-                };
-
-                if has_atlas {
-                    // Sixel/iTerm2 grid-plane images draw below text
-                    // and below kitty overlays at the same z.
-                    for p in &rc.atlas_placements {
-                        let Some(geometry) =
-                            rio_backend::ansi::graphics::atlas_overlay_geometry(
-                                p, &viewport,
-                            )
-                        else {
-                            continue;
-                        };
-                        let mut overlay = rio_backend::sugarloaf::GraphicOverlay {
-                            image_id: rio_backend::sugarloaf::GraphicKey::new(
-                                context.route_id,
-                                p.image_key,
-                            ),
-                            x: geometry.x,
-                            y: geometry.y,
-                            width: geometry.width,
-                            height: geometry.height,
-                            z_index: -1,
-                            source_rect: geometry.source_rect,
-                        };
-                        if rio_backend::ansi::graphics::clip_overlay_to_rect(
-                            &mut overlay,
-                            clip_x0,
-                            clip_y0,
-                            clip_x1,
-                            clip_y1,
-                        ) {
-                            overlays.push(overlay);
-                        }
-                    }
-                }
-
-                if has_overlays {
-                    for p in &rc.kitty_placements {
-                        let (image_width, image_height) = rc
-                            .kitty_images
-                            .get(&p.image_id)
-                            .map(|stored| (stored.data.width, stored.data.height))
-                            .unwrap_or((0, 0));
-                        let Some(geometry) =
-                            rio_backend::ansi::graphics::kitty_overlay_geometry(
-                                p,
-                                image_width,
-                                image_height,
-                                &viewport,
-                            )
-                        else {
-                            continue;
-                        };
-                        let mut overlay = rio_backend::sugarloaf::GraphicOverlay {
-                            image_id: rio_backend::sugarloaf::GraphicKey::new(
-                                context.route_id,
-                                kitty_image_key(p.image_id),
-                            ),
-                            x: geometry.x,
-                            y: geometry.y,
-                            width: geometry.width,
-                            height: geometry.height,
-                            z_index: p.z_index,
-                            source_rect: geometry.source_rect,
-                        };
-                        if rio_backend::ansi::graphics::clip_overlay_to_rect(
-                            &mut overlay,
-                            clip_x0,
-                            clip_y0,
-                            clip_x1,
-                            clip_y1,
-                        ) {
-                            overlays.push(overlay);
-                        }
-                    }
-                }
-
-                if has_virtual {
-                    Self::push_virtual_placeholder_overlays(
-                        overlays,
-                        rc,
-                        route_id,
-                        origin_x,
-                        origin_y,
-                        cell_width,
-                        cell_height,
-                        (clip_x0, clip_y0, clip_x1, clip_y1),
-                    );
-                }
-
-                overlays.sort_by_key(|overlay| (overlay.z_index, overlay.image_id));
-            } else if rc.kitty_graphics_dirty {
-                // All placements (kitty and atlas) were removed, so drop
-                // this panel's overlay vec.
-                sugarloaf.clear_image_overlays_for(context.rich_text_id);
-            }
-
-            context.renderable_content.has_blinking_enabled =
-                context.renderable_content.blinking_cursor;
 
             if context.renderable_content.blinking_cursor {
                 let has_selection = context.renderable_content.selection_range.is_some();
@@ -977,217 +783,6 @@ impl Renderer {
             island.needs_redraw()
         } else {
             false
-        }
-    }
-
-    /// Scan visible rows for kitty Unicode-placeholder cells (U+10EEEE) and
-    /// push one `GraphicOverlay` per row-run. Implements four key behaviors
-    /// of the Kitty graphics Unicode-placeholder protocol:
-    ///
-    /// 1. Per-row `kitty_virtual_placeholder` flag check skips rows
-    ///    with no placeholders.
-    /// 2. Continuation rules — a cell with missing diacritics inherits
-    ///    from the previous cell on the row (`canAppend`).
-    /// 3. Run aggregation — consecutive cells with same image / row /
-    ///    sequential column collapse into one Placement
-    ///    (`PlacementIterator.next`, `graphics_unicode.zig:36-99`).
-    /// 4. Per-run source rect with aspect-fit + centering — handles
-    ///    partial visibility (placement scrolled half off-screen) and
-    ///    cells that fall in the centering padding
-    ///    (`renderPlacement`, `graphics_unicode.zig:212-329`).
-    #[allow(clippy::too_many_arguments)]
-    fn push_virtual_placeholder_overlays(
-        overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
-        rc: &RenderableContent,
-        route_id: usize,
-        origin_x: f32,
-        origin_y: f32,
-        cell_width: f32,
-        cell_height: f32,
-        clip: (f32, f32, f32, f32),
-    ) {
-        use rio_backend::ansi::kitty_virtual::{
-            IncompletePlacement, PlaceholderRun, PLACEHOLDER,
-        };
-
-        for (line_idx, row) in rc.visible_rows.iter().enumerate() {
-            // Per-row dirty flag: skip rows that never had a placeholder
-            // written. O(visible_w · visible_h) → O(rows_with_placeholders).
-            if !row.kitty_virtual_placeholder {
-                continue;
-            }
-
-            // Walk the row left-to-right, building a single in-flight run.
-            // When the next cell can't extend it (different image, col
-            // discontinuity, etc.) we flush the run as one overlay and
-            // start a new one. Mirrors `PlacementIterator.next`.
-            let mut run: Option<(IncompletePlacement, usize)> = None;
-            let row_styles = rc
-                .row_styles
-                .get(line_idx)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-
-            for (col_idx, square) in row.inner.iter().enumerate() {
-                if square.c() != PLACEHOLDER {
-                    if let Some((p, start_col)) = run.take() {
-                        flush_run(
-                            overlays,
-                            rc,
-                            route_id,
-                            p.complete(),
-                            line_idx,
-                            start_col,
-                            origin_x,
-                            origin_y,
-                            cell_width,
-                            cell_height,
-                            clip,
-                        );
-                    }
-                    continue;
-                }
-
-                let style = rio_grid::resolve_style(row_styles, col_idx);
-                let combining: &[char] = square
-                    .extras_id()
-                    .and_then(|eid| rc.extras.get(&eid))
-                    .map(|e| e.zerowidth.as_slice())
-                    .unwrap_or(&[]);
-
-                let mut cell = IncompletePlacement::from_cell(
-                    style.fg,
-                    style.underline_color,
-                    combining,
-                );
-
-                match &mut run {
-                    Some((current, _)) if current.can_append(&cell) => {
-                        current.append();
-                    }
-                    _ => {
-                        if let Some((p, start_col)) = run.take() {
-                            flush_run(
-                                overlays,
-                                rc,
-                                route_id,
-                                p.complete(),
-                                line_idx,
-                                start_col,
-                                origin_x,
-                                origin_y,
-                                cell_width,
-                                cell_height,
-                                clip,
-                            );
-                        }
-                        // Default missing row/col on the FIRST cell of a
-                        // run. Without this, a subsequent cell with
-                        // `Some(col)` couldn't sequentially extend a
-                        // run started by a cell with `None`.
-                        if cell.row.is_none() {
-                            cell.row = Some(0);
-                        }
-                        if cell.col.is_none() {
-                            cell.col = Some(0);
-                        }
-                        run = Some((cell, col_idx));
-                    }
-                }
-            }
-
-            if let Some((p, start_col)) = run {
-                flush_run(
-                    overlays,
-                    rc,
-                    route_id,
-                    p.complete(),
-                    line_idx,
-                    start_col,
-                    origin_x,
-                    origin_y,
-                    cell_width,
-                    cell_height,
-                    clip,
-                );
-            }
-        }
-
-        /// Look up metadata + image for a completed `PlaceholderRun`,
-        /// compute its on-screen geometry via
-        /// `kitty_virtual::compute_run_geometry`, and push one
-        /// `GraphicOverlay`. Returns silently when the placement isn't
-        /// registered, the image isn't transmitted yet, or the run lies
-        /// entirely in the aspect-fit centering padding.
-        #[allow(clippy::too_many_arguments)]
-        fn flush_run(
-            overlays: &mut Vec<rio_backend::sugarloaf::GraphicOverlay>,
-            rc: &RenderableContent,
-            route_id: usize,
-            run: PlaceholderRun,
-            screen_line: usize,
-            start_screen_col: usize,
-            origin_x: f32,
-            origin_y: f32,
-            cell_width: f32,
-            cell_height: f32,
-            clip: (f32, f32, f32, f32),
-        ) {
-            let vp = rio_backend::ansi::kitty_virtual::resolve_virtual_placement(
-                &rc.kitty_virtual_placements,
-                run.image_id,
-                run.placement_id,
-            );
-            let vp = match vp {
-                Some(v) => v,
-                None => return,
-            };
-            let img = match rc.kitty_images.get(&run.image_id) {
-                Some(i) => i,
-                None => return,
-            };
-
-            let geom = match rio_backend::ansi::kitty_virtual::compute_run_geometry(
-                &run,
-                vp.columns,
-                vp.rows,
-                img.data.width as u32,
-                img.data.height as u32,
-                (vp.x, vp.y, vp.width, vp.height),
-                cell_width,
-                cell_height,
-                origin_x,
-                origin_y,
-                screen_line,
-                start_screen_col,
-            ) {
-                Some(g) => g,
-                None => return,
-            };
-
-            let mut overlay = rio_backend::sugarloaf::GraphicOverlay {
-                image_id: rio_backend::sugarloaf::GraphicKey::new(
-                    route_id,
-                    kitty_image_key(run.image_id),
-                ),
-                x: geom.x,
-                y: geom.y,
-                width: geom.width,
-                height: geom.height,
-                z_index: vp.z_index,
-                source_rect: geom.source_rect,
-            };
-            overlay.x += vp.cell_x_offset as f32;
-            overlay.y += vp.cell_y_offset as f32;
-            if rio_backend::ansi::graphics::clip_overlay_to_rect(
-                &mut overlay,
-                clip.0,
-                clip.1,
-                clip.2,
-                clip.3,
-            ) {
-                overlays.push(overlay);
-            }
         }
     }
 }

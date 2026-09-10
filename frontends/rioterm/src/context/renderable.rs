@@ -1,14 +1,8 @@
-use rio_backend::ansi::graphics::{
-    AtlasPlacement, KittyPlacement, StoredImage, VirtualPlacement,
-};
 use rio_backend::config::colors::term::TermColors;
 use rio_backend::config::CursorConfig;
-use rio_backend::crosswords::grid::row::Row;
 use rio_backend::crosswords::pos::CursorState;
-use rio_backend::crosswords::square::Square;
 use rio_backend::event::TerminalDamage;
 use rio_backend::selection::SelectionRange;
-use rustc_hash::FxHashMap;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug)]
@@ -53,62 +47,21 @@ pub struct RenderableContent {
     pub last_typing: Option<Instant>,
     pub last_blink_toggle: Option<Instant>,
     pub pending_update: PendingUpdate,
-    pub background: Option<BackgroundState>,
-    /// Damage hint for the in-progress frame. Set by `Renderer::run`
-    /// from PTY + UI damage merging, consumed by `Screen::render`'s
-    /// grid emit to choose `RowsToRebuild::{None,Dirty,All}`. The
-    /// per-row decision under `Dirty` reads `visible_rows[y].dirty`
-    /// rather than this hint, so this is just a coarse gate.
-    ///
-    /// `Full` on construction so the first frame's emission rebuilds
-    /// everything — the grid's CPU+GPU buffers start zeroed and
-    /// need a full fill. `mem::replace`'d to `Noop` by `Screen::render`
-    /// after consumption so next frame only re-emits if damage
-    /// actually arrived.
     pub frame_damage: TerminalDamage,
-
-    /// Per-context viewport row buffer. Populated once per frame by
-    /// `Renderer::run` via `Crosswords::snapshot_visible` (which
-    /// reuses the existing `Row<Square>` allocations across frames),
-    /// then read by `Screen::render`'s grid-emit path and the kitty
-    /// virtual-placement overlay path. Single source of truth — only
-    /// one terminal lock + one materialize pass per frame per panel.
-    pub visible_rows: Vec<Row<Square>>,
-    /// Per-row resolved cell styles, index-parallel to `visible_rows`.
-    /// Values, not ids: rows copied on earlier frames can't be
-    /// retinted by later style-table mutations.
-    pub row_styles: Vec<Vec<rio_backend::crosswords::style::Style>>,
-    /// Per-frame snapshot of extras (zero-width chars, hyperlinks,
-    /// sixel/iterm graphics) actually referenced by visible cells —
-    /// keyed by the cell's `extras_id`. Refreshed per-dirty-row by
-    /// `snapshot_visible`. Bounded by visible-cells-with-extras, not
-    /// by total session-lifetime allocations on the live grid's
-    /// `ExtrasTable`.
-    pub extras: rustc_hash::FxHashMap<u16, rio_backend::crosswords::square::Extras>,
-    /// Per-context palette + named-color overrides as of the snapshot.
-    /// `Copy` — captured by value alongside the row data.
+    pub background: Option<BackgroundState>,
+    /// Palette and viewport metadata for compositor UI and input hit testing.
     pub term_colors: TermColors,
     /// Visible-area scroll offset at the time of the snapshot. Used by
     /// downstream selection-line / hint-line math.
     pub display_offset: usize,
-    /// Cached terminal dimensions captured under the same lock as
-    /// `visible_rows`. Used for kitty placement positioning.
-    pub columns: usize,
     pub screen_lines: usize,
     pub history_size: usize,
-    /// Lines ever evicted off the scrollback ring; base of the
-    /// absolute row space image placements anchor in.
-    pub lines_evicted: u64,
-    /// Sixel/iTerm2 placements (snapshot; DEC grid-plane semantics).
-    pub atlas_placements: Vec<AtlasPlacement>,
+    pub columns: usize,
     /// `true` when the terminal has cursor blink enabled this frame.
     pub blinking_cursor: bool,
-    /// Kitty graphics state captured under the snapshot lock. Owned
-    /// here so the kitty overlay path doesn't need to lock again.
-    pub kitty_virtual_placements: FxHashMap<(u32, u32), VirtualPlacement>,
-    pub kitty_images: FxHashMap<u32, StoredImage>,
-    pub kitty_placements: Vec<KittyPlacement>,
-    pub kitty_graphics_dirty: bool,
+    /// Worker/session failure shown in this pane instead of silently falling
+    /// back to a locally-created terminal.
+    pub session_error: Option<String>,
 }
 
 impl RenderableContent {
@@ -123,24 +76,16 @@ impl RenderableContent {
             last_typing: None,
             last_blink_toggle: None,
             pending_update: PendingUpdate::default(),
+            frame_damage: TerminalDamage::Full,
             is_blinking_cursor_visible: false,
             background: None,
-            frame_damage: TerminalDamage::Full,
-            visible_rows: Vec::new(),
-            row_styles: Vec::new(),
-            extras: rustc_hash::FxHashMap::default(),
             term_colors: TermColors::default(),
             display_offset: 0,
-            columns: 0,
             screen_lines: 0,
             history_size: 0,
-            lines_evicted: 0,
-            atlas_placements: Vec::new(),
+            columns: 0,
             blinking_cursor: false,
-            kitty_virtual_placements: FxHashMap::default(),
-            kitty_images: FxHashMap::default(),
-            kitty_placements: Vec::new(),
-            kitty_graphics_dirty: false,
+            session_error: None,
         }
     }
 
@@ -168,12 +113,7 @@ impl PendingUpdate {
         self.dirty
     }
 
-    /// Mark as needing to check for damage on next render. Use this
-    /// when UI overlays (command palette, assistant, search bar,
-    /// island) change but terminal cells haven't — the `dirty` flag
-    /// alone is enough to pass `Renderer::run`'s per-context gate,
-    /// and `(None, None) => TerminalDamage::Noop` in the inner damage
-    /// match keeps the panel in the render set with zero row work.
+    /// Mark compositor UI or passive frame metadata for refresh.
     pub fn set_dirty(&mut self) {
         self.dirty = true;
     }
@@ -216,9 +156,8 @@ impl PendingUpdate {
 
 #[cfg(test)]
 mod pipeline_tests {
-    //! End-to-end damage pipeline harness: replicates the renderer's
-    //! frame consumption (`renderer/mod.rs`) and row-rebuild decisions
-    //! (`screen::render`) against a painted text mirror, drives
+    //! Snapshot damage regression harness, retained from the in-process
+    //! renderer. Models row-rebuild decisions against a painted mirror, drives
     //! vim-like scroll workloads through the real parser and grid, and
     //! asserts two invariants at every quiescent point:
     //!

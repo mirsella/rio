@@ -7,7 +7,6 @@ pub struct WgpuContext<'a> {
     pub queue: wgpu::Queue,
     pub format: wgpu::TextureFormat,
     pub alpha_mode: wgpu::CompositeAlphaMode,
-    pub adapter_info: wgpu::AdapterInfo,
     surface_caps: wgpu::SurfaceCapabilities,
     pub size: SugarloafWindowSize,
     pub scale: f32,
@@ -240,13 +239,12 @@ impl<'a> WgpuContext<'a> {
             surface,
             format,
             alpha_mode,
+            surface_caps,
             size: SugarloafWindowSize {
                 width: size.width,
                 height: size.height,
             },
             scale,
-            adapter_info,
-            surface_caps,
             // Always disabled on webgpu
             supports_f16: false,
             colorspace: renderer_config.colorspace,
@@ -310,6 +308,17 @@ impl<'a> WgpuContext<'a> {
     #[inline]
     pub fn surface_caps(&self) -> &wgpu::SurfaceCapabilities {
         &self.surface_caps
+    }
+
+    #[inline]
+    pub fn supports_filter_texture_usage(&self) -> bool {
+        self.surface_caps
+            .usages
+            .contains(wgpu::TextureUsages::COPY_SRC)
+            && self
+                .surface_caps
+                .usages
+                .contains(wgpu::TextureUsages::COPY_DST)
     }
 
     #[inline]
