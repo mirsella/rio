@@ -1,4 +1,5 @@
 use crate::context::Context;
+#[cfg(unix)]
 use std::path::Path;
 
 #[derive(PartialEq)]
@@ -34,6 +35,7 @@ pub fn create_title_extra_from_context<T: rio_backend::event::EventListener>(
 /// - Replace home directory prefix with `~`
 /// - If 4+ components deep, show `…/last/three/components`
 fn shorten_path(absolute: &str) -> String {
+    #[cfg(unix)]
     let path = Path::new(absolute);
 
     // Replace home prefix with ~
