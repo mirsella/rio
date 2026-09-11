@@ -5,25 +5,41 @@
 //! payloads or process arguments.  Terminal session descriptors travel only
 //! over the authenticated socket.
 
-use rio_backend::event::{EventListener, RioEvent, WindowId};
-use rio_session::{codec, SessionDescriptor};
-use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use rio_backend::event::RioEvent;
+use rio_backend::event::{EventListener, WindowId};
+#[cfg(unix)]
+use rio_session::codec;
+use rio_session::SessionDescriptor;
+#[cfg(unix)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt;
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
+#[cfg(unix)]
+use std::sync::mpsc::{self, Receiver};
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
 use std::thread;
+#[cfg(unix)]
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 const MAX_CONNECTIONS: usize = 8;
 const MAX_OFFERS: usize = 64;
 const MAX_LAYOUT_DEPTH: usize = 64;
 const MAX_LAYOUT_NODES: usize = MAX_OFFERS * 4;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(unix)]
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, bincode::Encode, bincode::Decode)]
@@ -147,18 +163,30 @@ impl TransferOffer {
         if self.transfer_id == [0; 16] {
             return Err("transfer id is empty".into());
         }
-        if self.panes.is_empty() || self.panes.len() > MAX_OFFERS {
+        Self::validate_parts(self.panes.iter(), &self.tabs, self.active_pane)
+    }
+
+    pub(crate) fn validate_parts<'a, I>(
+        panes: I,
+        tabs: &[TabOffer],
+        active_pane: u32,
+    ) -> Result<(), String>
+    where
+        I: IntoIterator<Item = &'a PaneOffer> + Clone,
+    {
+        let pane_count = panes.clone().into_iter().count();
+        if pane_count == 0 || pane_count > MAX_OFFERS {
             return Err("transfer pane count is outside the bounded limit".into());
         }
-        if self.tabs.is_empty() || self.tabs.len() > MAX_OFFERS {
+        if tabs.is_empty() || tabs.len() > MAX_OFFERS {
             return Err("transfer tab count is outside the bounded limit".into());
         }
-        if self.active_pane as usize >= self.panes.len() {
+        if usize::try_from(active_pane).map_or(true, |index| index >= pane_count) {
             return Err("active transfer pane is out of range".into());
         }
-        let mut tab_ids = HashSet::with_capacity(self.tabs.len());
-        let mut routes = HashSet::with_capacity(self.panes.len());
-        for tab in &self.tabs {
+        let mut tab_ids = HashSet::with_capacity(tabs.len());
+        let mut routes = HashSet::with_capacity(pane_count);
+        for tab in tabs {
             if tab.tab_id == 0 || !tab_ids.insert(tab.tab_id) {
                 return Err("transfer tab identity is empty or duplicated".into());
             }
@@ -167,9 +195,9 @@ impl TransferOffer {
             if tab.active_route == 0 || !layout_routes.contains(&tab.active_route) {
                 return Err("active transfer route is not in its tab layout".into());
             }
-            let pane_routes: HashSet<_> = self
-                .panes
-                .iter()
+            let pane_routes: HashSet<_> = panes
+                .clone()
+                .into_iter()
                 .filter(|pane| pane.tab_id == tab.tab_id)
                 .map(|pane| pane.route_id)
                 .collect();
@@ -182,7 +210,7 @@ impl TransferOffer {
                 return Err("transfer layout does not match its panes".into());
             }
         }
-        for pane in &self.panes {
+        for pane in panes {
             if pane.route_id == 0 || pane.tab_id == 0 {
                 return Err("transfer pane identity is empty".into());
             }
@@ -247,7 +275,10 @@ enum Request {
         version: u16,
         capability: [u8; 32],
     },
-    Offer(TransferOffer),
+    Offer {
+        offer: TransferOffer,
+        target_index: Option<u32>,
+    },
     Take([u8; 16]),
     Probe,
     ArmSelection {
@@ -373,7 +404,9 @@ pub struct WindowControl {
     events: Receiver<WindowControlEvent>,
     event_sender: SyncSender<WindowControlEvent>,
     published: Arc<Mutex<HashMap<[u8; 16], TransferOffer>>>,
-    _acceptor: thread::JoinHandle<()>,
+    acceptor_stop: Arc<AtomicBool>,
+    acceptor_stopped: Arc<AtomicBool>,
+    acceptor: Option<thread::JoinHandle<()>>,
 }
 
 #[cfg(not(unix))]
@@ -395,6 +428,10 @@ impl WindowControl {
         let listener = UnixListener::bind(&socket_path)
             .map_err(|error| format!("bind window control endpoint: {error}"))?;
         set_private_file(&socket_path)?;
+        if let Err(error) = listener.set_nonblocking(true) {
+            let _ = std::fs::remove_file(&socket_path);
+            return Err(format!("make window control endpoint stoppable: {error}"));
+        }
 
         let descriptor = WindowEndpoint {
             instance,
@@ -416,6 +453,10 @@ impl WindowControl {
             .with_window_target(rio_backend::event::WindowTarget::dynamic(window_id));
         let accept_sender = event_sender.clone();
         let accept_published = published.clone();
+        let acceptor_stop = Arc::new(AtomicBool::new(false));
+        let acceptor_stopped = Arc::new(AtomicBool::new(false));
+        let acceptor_stop_thread = acceptor_stop.clone();
+        let acceptor_stopped_thread = acceptor_stopped.clone();
         let acceptor = match thread::Builder::new()
             .name("rio-window-control".into())
             .spawn(move || {
@@ -426,6 +467,10 @@ impl WindowControl {
                     window_id,
                     capability,
                     accept_published,
+                    AcceptorState {
+                        stop: acceptor_stop_thread,
+                        stopped: acceptor_stopped_thread,
+                    },
                 )
             }) {
             Ok(acceptor) => acceptor,
@@ -442,7 +487,9 @@ impl WindowControl {
             events,
             event_sender,
             published,
-            _acceptor: acceptor,
+            acceptor_stop,
+            acceptor_stopped,
+            acceptor: Some(acceptor),
         })
     }
 
@@ -481,11 +528,16 @@ impl WindowControl {
         &self,
         target: WindowEndpoint,
         offer: TransferOffer,
+        target_index: Option<usize>,
         event_proxy: T,
         window_id: WindowId,
     ) -> Result<(), String> {
         target.validate()?;
         offer.validate()?;
+        let target_index = target_index
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| "window transfer target index is too large".to_string())?;
         if target.instance == self.descriptor.instance {
             return Err("a window cannot receive its own transfer".into());
         }
@@ -495,7 +547,7 @@ impl WindowControl {
         thread::Builder::new()
             .name("rio-window-offer".into())
             .spawn(move || {
-                let result = send_offer(&target, &offer);
+                let result = send_offer(&target, &offer, target_index);
                 let _ = sender.try_send(WindowControlEvent::OfferResult {
                     transfer_id: offer.transfer_id,
                     result,
@@ -545,7 +597,7 @@ impl WindowControl {
                             .into_iter()
                             .find(|target| target.process_id == process_id)
                         {
-                            return send_offer(&target, &offer);
+                            return send_offer(&target, &offer, None);
                         }
                         if std::time::Instant::now() >= deadline {
                             return Err(
@@ -815,6 +867,15 @@ impl WindowControl {
 #[cfg(unix)]
 impl Drop for WindowControl {
     fn drop(&mut self) {
+        self.acceptor_stop.store(true, Ordering::Release);
+        if let Some(acceptor) = self.acceptor.take() {
+            let _ = acceptor.join();
+            if !self.acceptor_stopped.load(Ordering::Acquire) {
+                tracing::error!(
+                    "window control acceptor exited without reporting shutdown"
+                );
+            }
+        }
         let _ = std::fs::remove_file(&self.registry_path);
         let _ = std::fs::remove_file(&self.descriptor.endpoint);
     }
@@ -901,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_two_process_shape_offer_commits_routes() {
+    fn authenticated_two_process_shape_offer_preserves_requested_slots() {
         let first = WindowControl::new(VoidListener, WindowId::from(1)).unwrap();
         let second = WindowControl::new(VoidListener, WindowId::from(2)).unwrap();
         let offer = TransferOffer {
@@ -924,20 +985,32 @@ mod tests {
             }],
             active_pane: 0,
         };
-        first
-            .offer_async(
-                second.descriptor().clone(),
-                offer,
-                VoidListener,
-                WindowId::from(1),
-            )
-            .unwrap();
+        for (target_index, transfer_id) in [(0, [3; 16]), (1, [4; 16]), (2, [5; 16])] {
+            let mut offer = offer.clone();
+            offer.transfer_id = transfer_id;
+            first
+                .offer_async(
+                    second.descriptor().clone(),
+                    offer,
+                    Some(target_index),
+                    VoidListener,
+                    WindowId::from(1),
+                )
+                .unwrap();
+        }
 
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut result = None;
-        while std::time::Instant::now() < deadline {
+        let mut received_indexes = HashSet::new();
+        let mut results = 0;
+        while std::time::Instant::now() < deadline && results < 3 {
             for event in second.poll() {
-                if let WindowControlEvent::IncomingOffer { reply, .. } = event {
+                if let WindowControlEvent::IncomingOffer {
+                    reply,
+                    target_index,
+                    ..
+                } = event
+                {
+                    received_indexes.insert(target_index.unwrap());
                     reply
                         .send(WindowControlResponse::Committed { routes: vec![41] })
                         .unwrap();
@@ -945,15 +1018,14 @@ mod tests {
             }
             for event in first.poll() {
                 if let WindowControlEvent::OfferResult { result: value, .. } = event {
-                    result = Some(value);
+                    assert_eq!(value.unwrap(), vec![41]);
+                    results += 1;
                 }
-            }
-            if result.is_some() {
-                break;
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(result.unwrap().unwrap(), vec![41]);
+        assert_eq!(received_indexes, [0, 1, 2].into_iter().collect());
+        assert_eq!(results, 3);
     }
 
     #[test]
@@ -1013,6 +1085,14 @@ mod tests {
         }
         assert_eq!(result.unwrap().unwrap(), vec![51]);
         assert!(source.published.lock().unwrap().get(&[4; 16]).is_none());
+    }
+
+    #[test]
+    fn drop_joins_acceptor_after_signaling_shutdown() {
+        let control = WindowControl::new(VoidListener, WindowId::from(13)).unwrap();
+        let stopped = control.acceptor_stopped.clone();
+        drop(control);
+        assert!(stopped.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1076,6 +1156,7 @@ impl WindowControl {
         &self,
         _target: WindowEndpoint,
         _offer: TransferOffer,
+        _target_index: Option<usize>,
         _event_proxy: T,
         _window_id: WindowId,
     ) -> Result<(), String> {
@@ -1139,6 +1220,12 @@ impl WindowControl {
 }
 
 #[cfg(unix)]
+struct AcceptorState {
+    stop: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
 fn accept_loop<T: EventListener + Clone + Send + 'static>(
     listener: UnixListener,
     sender: SyncSender<WindowControlEvent>,
@@ -1146,25 +1233,38 @@ fn accept_loop<T: EventListener + Clone + Send + 'static>(
     window_id: WindowId,
     expected_capability: [u8; 32],
     published: Arc<Mutex<HashMap<[u8; 16], TransferOffer>>>,
+    state: AcceptorState,
 ) {
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let sender = sender.clone();
-        let event_proxy = event_proxy.clone();
-        let published = published.clone();
-        let _ = thread::Builder::new()
-            .name("rio-window-control-peer".into())
-            .spawn(move || {
-                handle_connection(
-                    stream,
-                    sender,
-                    event_proxy,
-                    window_id,
-                    expected_capability,
-                    published,
-                )
-            });
+    while !state.stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let sender = sender.clone();
+                let event_proxy = event_proxy.clone();
+                let published = published.clone();
+                let _ = thread::Builder::new()
+                    .name("rio-window-control-peer".into())
+                    .spawn(move || {
+                        handle_connection(
+                            stream,
+                            sender,
+                            event_proxy,
+                            window_id,
+                            expected_capability,
+                            published,
+                        )
+                    });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                tracing::debug!(%error, "window control accept failed");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
+    state.stopped.store(true, Ordering::Release);
 }
 
 #[cfg(unix)]
@@ -1282,8 +1382,25 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
         }
         _ => {}
     }
-    let offer = match request {
-        Request::Offer(offer) => offer,
+    let (offer, target_index) = match request {
+        Request::Offer {
+            offer,
+            target_index,
+        } => {
+            let target_index = match target_index.map(usize::try_from).transpose() {
+                Ok(target_index) => target_index,
+                Err(_) => {
+                    let _ = codec::write_frame(
+                        &mut stream,
+                        &WindowControlResponse::Rejected(
+                            "transfer target index is not representable".into(),
+                        ),
+                    );
+                    return;
+                }
+            };
+            (offer, target_index)
+        }
         Request::Take(transfer_id) => {
             let offer = published
                 .lock()
@@ -1354,7 +1471,7 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
             offer,
             reply: reply_sender,
             target_window: Some(u64::from(window_id)),
-            target_index: None,
+            target_index,
         })
         .is_err()
     {
@@ -1377,31 +1494,17 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
 fn send_offer(
     target: &WindowEndpoint,
     offer: &TransferOffer,
+    target_index: Option<u32>,
 ) -> Result<Vec<u64>, String> {
-    let mut stream = UnixStream::connect(&target.endpoint)
-        .map_err(|error| format!("connect target window: {error}"))?;
-    stream
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .map_err(|error| error.to_string())?;
+    let mut stream = authenticated_stream(target)?;
     codec::write_frame(
         &mut stream,
-        &Request::Hello {
-            version: VERSION,
-            capability: target.capability,
+        &Request::Offer {
+            offer: offer.clone(),
+            target_index,
         },
     )
     .map_err(|error| error.to_string())?;
-    match codec::read_frame::<_, WindowControlResponse>(&mut stream)
-        .map_err(|error| error.to_string())?
-    {
-        WindowControlResponse::Hello => {}
-        _ => return Err("target rejected control authentication".into()),
-    }
-    codec::write_frame(&mut stream, &Request::Offer(offer.clone()))
-        .map_err(|error| error.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|error| error.to_string())?;
@@ -1514,28 +1617,7 @@ fn take_offer(
     target: &WindowEndpoint,
     transfer_id: [u8; 16],
 ) -> Result<Option<(TransferOffer, UnixStream)>, String> {
-    let mut stream = UnixStream::connect(&target.endpoint)
-        .map_err(|error| format!("connect target window: {error}"))?;
-    stream
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    codec::write_frame(
-        &mut stream,
-        &Request::Hello {
-            version: VERSION,
-            capability: target.capability,
-        },
-    )
-    .map_err(|error| error.to_string())?;
-    match codec::read_frame::<_, WindowControlResponse>(&mut stream)
-        .map_err(|error| error.to_string())?
-    {
-        WindowControlResponse::Hello => {}
-        _ => return Err("target rejected control authentication".into()),
-    }
+    let mut stream = authenticated_stream(target)?;
     codec::write_frame(&mut stream, &Request::Take(transfer_id))
         .map_err(|error| error.to_string())?;
     match codec::read_frame::<_, WindowControlResponse>(&mut stream)
@@ -1579,7 +1661,6 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
     Ok(bytes)
 }
 
-#[cfg(unix)]
 fn hex_id(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
