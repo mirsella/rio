@@ -255,10 +255,10 @@ where
             let terminal = match &mut terminal {
                 Some(terminal) => terminal,
                 None => terminal.insert(match self.terminal.try_lock_unfair() {
-                    // Force block if we are at the buffer size limit.
-                    None if unprocessed >= READ_BUFFER_SIZE => {
-                        self.terminal.lock_unfair()
-                    }
+                    // Do not read past buffered bytes while the terminal is
+                    // busy. A PTY can return EIO after its final bytes, and
+                    // those bytes must be parsed before that error is handled.
+                    None if unprocessed > 0 => self.terminal.lock_unfair(),
                     None => continue,
                     Some(terminal) => terminal,
                 }),

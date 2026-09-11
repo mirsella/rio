@@ -5,6 +5,7 @@
 
 pub mod codec;
 pub mod protocol;
+#[cfg(unix)]
 mod snapshot;
 pub mod worker;
 
@@ -16,14 +17,21 @@ pub use protocol::{
     SessionEvent, SessionId, SessionReply, SessionSpec, ViMotion,
 };
 
+#[cfg(unix)]
 use protocol::PROTOCOL_VERSION;
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 #[cfg(unix)]
 const SESSION_TRANSPORT_SUPPORTED: bool = cfg!(any(
@@ -112,6 +120,43 @@ struct ConnectedSession {
     generation: u64,
     initial_frame: FullFrame,
     had_active_owner: bool,
+}
+
+#[cfg(unix)]
+struct WorkerCleanup {
+    child: Option<std::process::Child>,
+    endpoint_dir: PathBuf,
+    recovery_path: Option<PathBuf>,
+    active: bool,
+}
+
+#[cfg(unix)]
+impl WorkerCleanup {
+    fn into_child(mut self) -> std::process::Child {
+        let child = self
+            .child
+            .take()
+            .expect("worker cleanup child must be installed");
+        self.active = false;
+        child
+    }
+}
+
+#[cfg(unix)]
+impl Drop for WorkerCleanup {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(path) = self.recovery_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.endpoint_dir);
+    }
 }
 
 /// An authenticated session attachment whose ownership has not been committed.
@@ -230,6 +275,7 @@ pub struct SessionClient {
     #[cfg(unix)]
     connection: Mutex<ClientConnection>,
     poisoned: AtomicBool,
+    #[cfg(unix)]
     next_request_id: AtomicU64,
     events: Mutex<VecDeque<SessionEvent>>,
     #[cfg(unix)]
@@ -278,7 +324,13 @@ impl SessionClient {
         let endpoint_dir = endpoint_directory(session_id)?;
         let endpoint = endpoint_dir.join("session.sock");
 
-        let mut child = std::process::Command::new(worker_path.as_ref())
+        let mut cleanup = WorkerCleanup {
+            child: None,
+            endpoint_dir,
+            recovery_path: None,
+            active: true,
+        };
+        let child = std::process::Command::new(worker_path.as_ref())
             .env_clear()
             .arg("--endpoint")
             .arg(&endpoint)
@@ -289,27 +341,27 @@ impl SessionClient {
             .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|error| {
-                let _ = std::fs::remove_dir_all(&endpoint_dir);
                 SessionError::Io(io::Error::other(format!(
                     "start session worker: {error}"
                 )))
             })?;
+        cleanup.child = Some(child);
 
-        let mut bootstrap = match child.stdin.take() {
+        let mut bootstrap = match cleanup
+            .child
+            .as_mut()
+            .expect("worker cleanup child must be installed")
+            .stdin
+            .take()
+        {
             Some(bootstrap) => bootstrap,
             None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = std::fs::remove_dir_all(&endpoint_dir);
                 return Err(SessionError::protocol(
                     "worker bootstrap pipe is unavailable",
-                ));
+                ))
             }
         };
         if let Err(error) = std::io::Write::write_all(&mut bootstrap, &capability) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_dir_all(&endpoint_dir);
             return Err(error.into());
         }
         drop(bootstrap);
@@ -320,23 +372,10 @@ impl SessionClient {
             session_id,
         };
 
-        if let Err(error) = descriptor.save_recovery() {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = std::fs::remove_dir_all(&endpoint_dir);
-            return Err(error);
-        }
+        cleanup.recovery_path = Some(descriptor.save_recovery()?);
 
-        let connection = match connect_until_ready(&descriptor, Some(spec), true) {
-            Ok(connection) => connection,
-            Err(error) => {
-                descriptor.remove_recovery();
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = std::fs::remove_dir_all(&endpoint_dir);
-                return Err(error);
-            }
-        };
+        let connection = connect_until_ready(&descriptor, Some(spec), true)?;
+        let child = cleanup.into_child();
 
         Ok(Self {
             descriptor,
@@ -1105,7 +1144,8 @@ impl SessionClient {
         let _ = stream.shutdown(std::net::Shutdown::Both);
     }
 
-    fn queue_event(&self, mut event: SessionEvent) -> Result<(), SessionError> {
+    #[cfg(unix)]
+    fn queue_event(&self, event: SessionEvent) -> Result<(), SessionError> {
         let mut events = self
             .events
             .lock()
@@ -1141,23 +1181,27 @@ impl SessionClient {
                 )
             });
         }
-        if events.len() >= protocol::MAX_PENDING_REQUESTS {
-            let removable = events.iter().position(|pending| {
-                !matches!(
-                    pending,
+        if matches!(
+            event,
+            SessionEvent::ChildExited { .. }
+                | SessionEvent::ClipboardOverflow
+                | SessionEvent::Closed
+        ) && events.iter().any(|pending| {
+            matches!(
+                (&event, pending),
+                (
+                    SessionEvent::ChildExited { .. },
                     SessionEvent::ChildExited { .. }
-                        | SessionEvent::Closed
-                        | SessionEvent::ClipboardOverflow
-                        | SessionEvent::ClipboardLoad { .. }
-                        | SessionEvent::ColorRequest { .. }
-                        | SessionEvent::TextAreaSizeRequest { .. }
-                        | SessionEvent::GlyphProtocolQuery { .. }
-                        | SessionEvent::ColorChange { .. }
-                        | SessionEvent::RequestRefused { .. }
-                        | SessionEvent::RequestExpired { .. }
-                        | SessionEvent::DesktopNotification { .. }
-                )
-            });
+                ) | (
+                    SessionEvent::ClipboardOverflow,
+                    SessionEvent::ClipboardOverflow
+                ) | (SessionEvent::Closed, SessionEvent::Closed)
+            )
+        }) {
+            return Ok(());
+        }
+        if events.len() >= protocol::MAX_PENDING_REQUESTS {
+            let removable = events.iter().position(|pending| !pending.is_critical());
             if let Some(index) = removable {
                 let _ = events.remove(index);
             } else if matches!(event, SessionEvent::ClipboardStore { .. }) {
@@ -1167,25 +1211,21 @@ impl SessionClient {
                 {
                     return Ok(());
                 }
-                event = SessionEvent::ClipboardOverflow;
-            } else if !matches!(
-                event,
-                SessionEvent::ChildExited { .. }
-                    | SessionEvent::Closed
-                    | SessionEvent::ClipboardOverflow
-                    | SessionEvent::ClipboardLoad { .. }
-                    | SessionEvent::ColorRequest { .. }
-                    | SessionEvent::TextAreaSizeRequest { .. }
-                    | SessionEvent::GlyphProtocolQuery { .. }
-                    | SessionEvent::RequestRefused { .. }
-                    | SessionEvent::RequestExpired { .. }
-                    | SessionEvent::DesktopNotification { .. }
-            ) {
+                // Do not exceed the bounded queue when all retained events
+                // are critical; preserve those events instead.
                 return Ok(());
+            } else if matches!(
+                event,
+                SessionEvent::Closed | SessionEvent::ChildExited { .. }
+            ) {
+                // Preserve lifecycle delivery when saturated, mirroring the
+                // worker queue: the session is ending, so the exit event
+                // replaces older critical state instead of poisoning.
+                events.clear();
             } else {
-                return Err(SessionError::protocol(
-                    "session event queue is saturated with critical events",
-                ));
+                // Drop additional critical state when saturated, mirroring
+                // the worker queue, instead of poisoning the attachment.
+                return Ok(());
             }
         }
         events.push_back(event);
@@ -1518,7 +1558,15 @@ fn server_error(code: protocol::ErrorCode, message: String) -> SessionError {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{ReplyKind, SessionCommand};
+    use super::{ClientConnection, ReplyKind, SessionClient, SessionCommand};
+    use crate::protocol::{
+        SessionDescriptor, SessionEvent, SessionId, MAX_PENDING_REQUESTS,
+    };
+    use std::collections::VecDeque;
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::Mutex;
 
     #[test]
     fn focus_no_change_is_accepted_by_the_pump_classifier() {
@@ -1526,5 +1574,70 @@ mod tests {
             ReplyKind::for_command(&SessionCommand::Focus { focused: true }),
             ReplyKind::AcceptedOrNoChange
         ));
+    }
+
+    #[test]
+    fn client_event_queue_stays_bounded_when_critical_is_full() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let client = SessionClient {
+            descriptor: SessionDescriptor {
+                endpoint: PathBuf::from("/var/empty/session.sock"),
+                capability: [1; 32],
+                session_id: SessionId([1; 16]),
+            },
+            connection: Mutex::new(ClientConnection {
+                stream,
+                generation: 1,
+                ready_pending: false,
+            }),
+            poisoned: AtomicBool::new(false),
+            next_request_id: AtomicU64::new(1),
+            events: Mutex::new(VecDeque::new()),
+            worker: Mutex::new(None),
+        };
+
+        for index in 0..MAX_PENDING_REQUESTS {
+            client
+                .queue_event(SessionEvent::ColorChange {
+                    route_id: 1,
+                    index: index as u16,
+                    color: None,
+                })
+                .unwrap();
+        }
+        client
+            .queue_event(SessionEvent::ClipboardStore {
+                kind: 0,
+                text: String::from("overflow"),
+            })
+            .unwrap();
+        // Additional critical state is dropped while saturated, without
+        // poisoning the attachment.
+        client
+            .queue_event(SessionEvent::ColorChange {
+                route_id: 1,
+                index: u16::MAX,
+                color: None,
+            })
+            .unwrap();
+        {
+            let events = client.events.lock().unwrap();
+            assert_eq!(events.len(), MAX_PENDING_REQUESTS);
+            assert!(events.iter().any(|event| matches!(
+                event,
+                SessionEvent::ColorChange { index: 0, .. }
+            )));
+        }
+        // Lifecycle delivery is preserved: the exit event replaces older
+        // critical state instead of poisoning the attachment.
+        client
+            .queue_event(SessionEvent::ChildExited { status: Some(1) })
+            .unwrap();
+
+        let events = client.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ChildExited { status: Some(1) })));
     }
 }
