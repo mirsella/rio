@@ -1108,16 +1108,23 @@ fn create_graphic_data(cmd: &KittyGraphicsCommand) -> Result<GraphicData, Graphi
             debug!("File path: {}", path_str);
             let path = Path::new(path_str);
 
-            // Security checks
-            if !path.is_file() {
+            // Resolve symlinks before checking the protected roots. A string
+            // search would reject ordinary directories named "dev" and miss
+            // links into procfs, sysfs, or devtmpfs.
+            let canonical_path = path
+                .canonicalize()
+                .map_err(|_| GraphicError::FileNotFound)?;
+            if !canonical_path.is_file() {
                 return Err(GraphicError::FileNotFound);
             }
 
-            // Check for sensitive paths
-            let path_str_lower = path_str.to_lowercase();
-            if path_str_lower.contains("/proc/")
-                || path_str_lower.contains("/sys/")
-                || path_str_lower.contains("/dev/")
+            // Check canonical path components, not substrings. These are
+            // Unix pseudo-filesystems; canonicalization also catches links
+            // that resolve into them.
+            #[cfg(unix)]
+            if [Path::new("/proc"), Path::new("/sys"), Path::new("/dev")]
+                .iter()
+                .any(|root| canonical_path.starts_with(root))
             {
                 return Err(GraphicError::InvalidData);
             }
@@ -1135,7 +1142,8 @@ fn create_graphic_data(cmd: &KittyGraphicsCommand) -> Result<GraphicData, Graphi
                 return Err(GraphicError::TooLarge);
             }
 
-            let mut file = File::open(path).map_err(|_| GraphicError::FileNotFound)?;
+            let mut file =
+                File::open(&canonical_path).map_err(|_| GraphicError::FileNotFound)?;
             let mut data = Vec::new();
 
             if cmd.size > 0 {

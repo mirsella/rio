@@ -382,10 +382,26 @@ fn child_exit_delivers_final_output_and_status() {
         worker_path(),
     )
     .unwrap();
-    let frame =
-        snapshot_until(&client, |frame| frame_text(frame).contains("final-output"));
-    assert!(frame_text(&frame).contains("final-output"));
-    assert_eq!(wait_for_child_exit(&client), Some(7));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = 'wait: loop {
+        // Keep taking snapshots while the PTY drains to exercise terminal-lock
+        // contention, but inspect a fresh frame after observing child exit.
+        client.snapshot().unwrap();
+        while let Some(event) = client.poll_event().unwrap() {
+            if let SessionEvent::ChildExited { status } = event {
+                let final_output_visible =
+                    frame_text(&client.snapshot().unwrap()).contains("final-output");
+                assert!(
+                    final_output_visible,
+                    "child exit was delivered before the final PTY output"
+                );
+                break 'wait status;
+            }
+        }
+        assert!(Instant::now() < deadline, "child exit event timed out");
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status, Some(7));
     client.close().unwrap();
     wait_for_endpoint_removal(client.descriptor());
 }

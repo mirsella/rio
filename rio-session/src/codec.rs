@@ -1,6 +1,7 @@
 use crate::{protocol::MAX_FRAME_SIZE, SessionError};
 use bincode::{Decode, Encode};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 fn config() -> impl bincode::config::Config {

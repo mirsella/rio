@@ -40,8 +40,9 @@ use std::error::Error;
 #[cfg(feature = "pty")]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
+#[cfg(feature = "pty")]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 #[cfg(all(feature = "pty", target_os = "windows"))]
 use teletypewriter::create_pty;
 #[cfg(all(feature = "pty", not(target_os = "windows")))]
@@ -413,7 +414,7 @@ pub(crate) struct Listener {
     delegate: Arc<dyn SurfaceDelegate>,
     graphics_updates: Arc<Mutex<GraphicsUpdateStore>>,
     #[cfg(feature = "pty")]
-    pty_writer: Arc<Mutex<Option<corcovado::channel::Sender<Msg>>>>,
+    pty_writer: Arc<OnceLock<corcovado::channel::Sender<Msg>>>,
     #[cfg(feature = "pty")]
     input_budget: Option<InputBudget>,
     #[cfg(feature = "pty")]
@@ -458,7 +459,14 @@ impl Listener {
                     return;
                 }
                 #[cfg(feature = "pty")]
-                if let Some(channel) = self.pty_writer.lock().unwrap().as_ref() {
+                {
+                    let Some(channel) = self.pty_writer.get() else {
+                        debug_assert!(
+                            false,
+                            "PTY writer must be initialized before dispatch"
+                        );
+                        return;
+                    };
                     let input: Cow<'static, [u8]> = Cow::Owned(text.into_bytes());
                     let result = if let Some(budget) = &self.input_budget {
                         match budget.try_reserve(input.len()) {
@@ -663,6 +671,89 @@ fn trailing_url_punctuation(text: &str) -> usize {
     trimmed
 }
 
+/// Append one foreground or background SGR color component.
+fn serialize_color(out: &mut String, foreground: bool, color: &AnsiColor) {
+    use std::fmt::Write as _;
+
+    match color {
+        AnsiColor::Named(n) => {
+            let n = *n as u16;
+            let code = match (n, foreground) {
+                (0..=7, true) => 30 + n,
+                (0..=7, false) => 40 + n,
+                (8..=15, true) => 90 + (n - 8),
+                (8..=15, false) => 100 + (n - 8),
+                (_, true) => 39,
+                (_, false) => 49,
+            };
+            let _ = write!(out, ";{code}");
+        }
+        AnsiColor::Indexed(i) => {
+            let prefix = if foreground { 38 } else { 48 };
+            let _ = write!(out, ";{prefix};5;{i}");
+        }
+        AnsiColor::Spec(rgb) => {
+            let prefix = if foreground { 38 } else { 48 };
+            let _ = write!(out, ";{prefix};2;{};{};{}", rgb.r, rgb.g, rgb.b);
+        }
+    }
+}
+
+/// Emit `\x1b[0m` plus the minimal SGR codes reproducing `style`.
+fn serialize_style(out: &mut String, style: &Style) {
+    use std::fmt::Write as _;
+
+    out.push_str("\x1b[0");
+    serialize_color(out, true, &style.fg);
+    serialize_color(out, false, &style.bg);
+
+    let flags = style.flags;
+    if flags.contains(StyleFlags::BOLD) {
+        out.push_str(";1");
+    }
+    if flags.contains(StyleFlags::DIM) {
+        out.push_str(";2");
+    }
+    if flags.contains(StyleFlags::ITALIC) {
+        out.push_str(";3");
+    }
+    if flags.contains(StyleFlags::UNDERLINE) {
+        out.push_str(";4");
+    } else if flags.contains(StyleFlags::DOUBLE_UNDERLINE) {
+        out.push_str(";4:2");
+    } else if flags.contains(StyleFlags::UNDERCURL) {
+        out.push_str(";4:3");
+    } else if flags.contains(StyleFlags::DOTTED_UNDERLINE) {
+        out.push_str(";4:4");
+    } else if flags.contains(StyleFlags::DASHED_UNDERLINE) {
+        out.push_str(";4:5");
+    }
+    if flags.contains(StyleFlags::INVERSE) {
+        out.push_str(";7");
+    }
+    if flags.contains(StyleFlags::HIDDEN) {
+        out.push_str(";8");
+    }
+    if flags.contains(StyleFlags::STRIKEOUT) {
+        out.push_str(";9");
+    }
+    out.push('m');
+
+    if let Some(underline) = &style.underline_color {
+        match underline {
+            AnsiColor::Indexed(i) => {
+                let _ = write!(out, "\x1b[58;5;{i}m");
+            }
+            AnsiColor::Spec(rgb) => {
+                let _ = write!(out, "\x1b[58;2;{};{};{}m", rgb.r, rgb.g, rgb.b);
+            }
+            AnsiColor::Named(n) => {
+                let _ = write!(out, "\x1b[58;5;{}m", *n as u16);
+            }
+        }
+    }
+}
+
 pub struct Surface {
     id: SurfaceId,
     alt_is_meta: std::sync::atomic::AtomicBool,
@@ -755,7 +846,7 @@ impl Surface {
         let id = engine.next_surface_id.fetch_add(1, Ordering::SeqCst);
         let graphics_updates = Arc::new(Mutex::new(GraphicsUpdateStore::default()));
         #[cfg(feature = "pty")]
-        let pty_writer = Arc::new(Mutex::new(None));
+        let pty_writer = Arc::new(OnceLock::new());
         let listener = Listener {
             surface_id: id,
             delegate: engine.delegate.clone(),
@@ -897,7 +988,9 @@ impl Surface {
             )
             .map_err(|err| std::io::Error::other(err.to_string()))?;
             let channel = machine.channel();
-            *pty_writer.lock().unwrap() = Some(channel.clone());
+            pty_writer
+                .set(channel.clone())
+                .expect("PTY writer initialized exactly once");
             let io_thread = machine.spawn();
 
             Ok(Surface {
@@ -1581,6 +1674,9 @@ impl Surface {
         let cols = grid.columns();
         let history = term.history_size() as i32;
         let rows = term.screen_lines() as i32;
+        if cols == 0 || rows == 0 {
+            return String::new();
+        }
 
         // Trim trailing all-empty screen rows, like dump().
         let mut last = rows - 1;
@@ -1681,10 +1777,16 @@ impl Surface {
         use rio_vt::crosswords::search::{RegexIter, RegexSearch};
 
         let mut regex = RegexSearch::new(pattern).ok()?;
+        if max == 0 {
+            return Some(Vec::new());
+        }
         let term = self.terminal.lock();
         let history = term.history_size() as i32;
         let rows = term.screen_lines() as i32;
         let cols = term.columns();
+        if rows == 0 || cols == 0 {
+            return Some(Vec::new());
+        }
         let start = Pos::new(Line(-history), PosColumn(0));
         let end = Pos::new(Line(rows - 1), PosColumn(cols - 1));
 
@@ -2230,6 +2332,15 @@ mod tests {
                 ..SurfaceDesc::default()
             })
             .expect("spawn sleeper")
+    }
+
+    #[test]
+    fn zero_sized_surface_queries_are_safe() {
+        let surface = quiet_surface(0, 0);
+
+        assert_eq!(surface.serialize(), "");
+        assert_eq!(surface.search("text", 1), Some(Vec::new()));
+        assert_eq!(surface.search("text", 0), Some(Vec::new()));
     }
 
     // serialize() must reconstruct content, styling, and hyperlinks when

@@ -107,6 +107,7 @@ impl EnvVar {
 
     /// The caller validates the containing session spec before moving these
     /// bytes into the PTY environment.
+    #[cfg(unix)]
     pub(crate) fn into_utf8(self) -> Result<(String, String), crate::SessionError> {
         let key = String::from_utf8(self.key).map_err(|_| Self::non_utf8())?;
         let value = String::from_utf8(self.value).map_err(|_| Self::non_utf8())?;
@@ -166,8 +167,6 @@ impl SessionSpec {
             spec.validate()?;
             Ok(spec)
         }
-        #[cfg(not(unix))]
-        unreachable!()
     }
 
     pub fn validate(&self) -> Result<(), crate::SessionError> {
@@ -280,7 +279,11 @@ impl SessionDescriptor {
         }
         use std::io::Write;
         let mut file = options.open(path)?;
-        file.write_all(&bytes)?;
+        if let Err(error) = file.write_all(&bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -587,6 +590,7 @@ pub enum ServerMessage {
     },
 }
 
+#[cfg(unix)]
 impl ClientMessage {
     pub(crate) fn validate(&self) -> Result<(), crate::SessionError> {
         match self {
@@ -619,6 +623,7 @@ impl ClientMessage {
     }
 }
 
+#[cfg(unix)]
 impl ServerMessage {
     pub(crate) fn validate(&self) -> Result<(), crate::SessionError> {
         match self {
@@ -1012,6 +1017,7 @@ pub enum SessionReply {
     Closed,
 }
 
+#[cfg(unix)]
 impl SessionReply {
     pub(crate) fn validate(&self) -> Result<(), crate::SessionError> {
         match self {
@@ -1112,7 +1118,25 @@ pub enum SessionEvent {
     Closed,
 }
 
+#[cfg(unix)]
 impl SessionEvent {
+    pub(crate) fn is_critical(&self) -> bool {
+        matches!(
+            self,
+            Self::ChildExited { .. }
+                | Self::ClipboardOverflow
+                | Self::ClipboardLoad { .. }
+                | Self::ColorRequest { .. }
+                | Self::TextAreaSizeRequest { .. }
+                | Self::GlyphProtocolQuery { .. }
+                | Self::ColorChange { .. }
+                | Self::RequestRefused { .. }
+                | Self::RequestExpired { .. }
+                | Self::DesktopNotification { .. }
+                | Self::Closed
+        )
+    }
+
     pub(crate) fn validate(&self) -> Result<(), crate::SessionError> {
         match self {
             Self::Title { title } => validate_string(title)?,
@@ -1227,6 +1251,7 @@ pub struct SearchNavigation {
     pub vi_mode: bool,
 }
 
+#[cfg(unix)]
 impl SearchNavigation {
     fn validate(&self) -> Result<(), crate::SessionError> {
         if self.display_offset > MAX_SCROLLBACK as u32 {

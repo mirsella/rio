@@ -5252,6 +5252,11 @@ impl<U: EventListener> Handler for Crosswords<U> {
                     !removed
                 });
                 overlay_changed = self.graphics.kitty_placements.len() != before;
+                if delete.delete_data {
+                    // Cursor data deletion also discards images that have no
+                    // remaining placement; virtual placements remain live.
+                    deleted_image_ids.extend(self.graphics.kitty_images.keys().copied());
+                }
             }
             b'p' | b'P' => {
                 if delete.x > 0 && delete.y > 0 {
