@@ -744,6 +744,8 @@ impl<'a> RouteWindow<'a> {
             is_focused: true,
             is_occluded: false,
             needs_render_after_occlusion: false,
+            #[cfg(target_os = "windows")]
+            initial_frame_rendered: false,
             winit_window: window,
             screen,
         })

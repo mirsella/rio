@@ -21,6 +21,7 @@ use rio_backend::event::EventListener;
 use rio_backend::event::{WindowId, WindowTarget};
 use rio_backend::selection::SelectionRange;
 use rio_backend::sugarloaf::{font::SugarloafFont, Rect, Sugarloaf, SugarloafErrors};
+use rio_session::protocol::FullFrame;
 use std::error::Error;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -291,6 +292,27 @@ where
 {
     let mut prepared = prepared;
     let frame = prepared.take_initial_frame();
+    create_prepared_context_with_frame(
+        prepared,
+        frame,
+        window_id,
+        route_id,
+        rich_text_id,
+        dimension,
+    )
+}
+
+fn create_prepared_context_with_frame<T>(
+    prepared: PreparedSession,
+    frame: FullFrame,
+    window_id: WindowId,
+    route_id: usize,
+    rich_text_id: usize,
+    dimension: ContextDimension,
+) -> Context<T>
+where
+    T: rio_backend::event::EventListener,
+{
     let terminal = Arc::new(FairMutex::new(RemoteView::from_frame(frame, window_id)));
     Context {
         route_id,
@@ -304,6 +326,71 @@ where
         ime: Ime::new(),
         _listener: PhantomData,
     }
+}
+
+fn create_prepared_context_for_transfer<T>(
+    prepared: PreparedSession,
+    window_id: WindowId,
+    route_id: usize,
+    rich_text_id: usize,
+    dimension: ContextDimension,
+) -> Context<T>
+where
+    T: rio_backend::event::EventListener,
+{
+    let frame = prepared.initial_frame().clone();
+    create_prepared_context_with_frame(
+        prepared,
+        frame,
+        window_id,
+        route_id,
+        rich_text_id,
+        dimension,
+    )
+}
+
+fn restore_prepared_transfer<T: EventListener>(
+    mut panes: rustc_hash::FxHashMap<
+        u64,
+        (crate::router::window_control::PaneOffer, PreparedSession),
+    >,
+    contexts: Vec<Context<T>>,
+    target_panes: &mut rustc_hash::FxHashMap<
+        usize,
+        crate::router::window_control::PaneOffer,
+    >,
+    source_order: &[u64],
+) -> Vec<(crate::router::window_control::PaneOffer, PreparedSession)> {
+    for mut context in contexts {
+        let Some(pane) = target_panes.remove(&context.route_id) else {
+            tracing::error!(
+                route_id = context.route_id,
+                "transfer rollback lost route mapping"
+            );
+            continue;
+        };
+        let Some(prepared) = context.pending_session.take() else {
+            tracing::error!(
+                route_id = context.route_id,
+                "transfer rollback lost prepared session"
+            );
+            continue;
+        };
+        panes.insert(pane.route_id, (pane, prepared));
+    }
+
+    let restored = source_order
+        .iter()
+        .filter_map(|source_route| panes.remove(source_route))
+        .collect::<Vec<_>>();
+    if restored.len() != source_order.len() {
+        tracing::error!(
+            restored = restored.len(),
+            expected = source_order.len(),
+            "transfer rollback did not recover every prepared session"
+        );
+    }
+    restored
 }
 
 #[cfg(test)]
@@ -1131,14 +1218,36 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if prepared.is_empty()
             || active_pane >= prepared.len()
             || tabs.is_empty()
-            || self.contexts.len() + tabs.len() > self.capacity
+            || tabs.len() > self.capacity.saturating_sub(self.contexts.len())
+            || insertion_index.is_some_and(|index| index > self.contexts.len())
         {
             return Err(prepared);
         }
 
-        let active_source = prepared[active_pane].0.route_id;
+        let active_pane_index = active_pane;
+        let Ok(active_pane) = u32::try_from(active_pane_index) else {
+            return Err(prepared);
+        };
+        if let Err(error) = crate::router::window_control::TransferOffer::validate_parts(
+            prepared.iter().map(|(pane, _)| pane),
+            &tabs,
+            active_pane,
+        ) {
+            tracing::warn!(%error, "rejecting invalid prepared transfer");
+            return Err(prepared);
+        }
+
+        let active_source = prepared[active_pane_index].0.route_id;
         let source_order: Vec<_> =
             prepared.iter().map(|(pane, _)| pane.route_id).collect();
+        let source_tab_routes = tabs
+            .iter()
+            .map(|tab| {
+                let mut routes = Vec::new();
+                transfer_layout_routes(&tab.layout, &mut routes);
+                routes
+            })
+            .collect::<Vec<_>>();
         let mut panes = prepared
             .into_iter()
             .map(|(pane, prepared)| (pane.route_id, (pane, prepared)))
@@ -1146,34 +1255,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 u64,
                 (crate::router::window_control::PaneOffer, PreparedSession),
             >>();
-        if panes.len() != source_order.len() {
-            return Err(panes.into_values().collect());
-        }
-        let source_tab_routes = tabs
-            .iter()
-            .map(|tab| {
-                let mut routes = Vec::new();
-                transfer_layout_routes(&tab.layout, &mut routes);
-                if routes.is_empty()
-                    || tab.active_route == 0
-                    || !routes.contains(&tab.active_route)
-                    || routes.iter().any(|route| {
-                        panes
-                            .get(route)
-                            .is_none_or(|(pane, _)| pane.tab_id != tab.tab_id)
-                    })
-                {
-                    None
-                } else {
-                    Some(routes)
-                }
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(source_tab_routes) = source_tab_routes else {
-            return Err(panes.into_values().collect());
-        };
 
         let mut tab_routes = rustc_hash::FxHashMap::default();
+        let mut target_panes = rustc_hash::FxHashMap::default();
         let mut new_grids = Vec::with_capacity(tabs.len());
         let mut active_grid = None;
         for (index, (tab, routes)) in tabs.iter().zip(source_tab_routes).enumerate() {
@@ -1186,12 +1270,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             let contexts = routes
                 .iter()
                 .map(|route| {
-                    let (_, prepared) = panes
+                    let (pane, prepared) = panes
                         .remove(route)
                         .expect("validated transfer route disappeared");
                     let target_route = Self::next_route_id();
                     tab_routes.insert(*route, target_route);
-                    create_prepared_context::<T>(
+                    target_panes.insert(target_route, pane);
+                    create_prepared_context_for_transfer::<T>(
                         prepared,
                         self.window_id,
                         target_route,
@@ -1200,19 +1285,34 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     )
                 })
                 .collect();
-            let grid = ContextGrid::from_layout_offer(crate::layout::LayoutOfferInput {
-                contexts,
-                layout: &tab.layout,
-                active_route: tab.active_route,
-                route_map: &tab_routes,
-                pane_rects: &pane_rects,
-                scaled_margin: self.get_current_grid_scaled_margin(),
-                border_color: self.config.split_color,
-                panel_config: self.config.panel,
-            })
-            .unwrap_or_else(|(_, error)| {
-                panic!("validated transfer layout could not be rebuilt: {error}")
-            });
+            let grid = match ContextGrid::from_layout_offer(
+                crate::layout::LayoutOfferInput {
+                    contexts,
+                    layout: &tab.layout,
+                    active_route: tab.active_route,
+                    route_map: &tab_routes,
+                    pane_rects: &pane_rects,
+                    scaled_margin: self.get_current_grid_scaled_margin(),
+                    border_color: self.config.split_color,
+                    panel_config: self.config.panel,
+                },
+            ) {
+                Ok(grid) => grid,
+                Err((contexts, error)) => {
+                    tracing::warn!(%error, "rejecting transfer with an unrebuildable layout");
+                    let contexts = new_grids
+                        .into_iter()
+                        .flat_map(ContextGrid::take_contexts)
+                        .chain(contexts)
+                        .collect();
+                    return Err(restore_prepared_transfer(
+                        panes,
+                        contexts,
+                        &mut target_panes,
+                        &source_order,
+                    ));
+                }
+            };
             if tab_routes
                 .get(&active_source)
                 .is_some_and(|_| active_grid.is_none())
@@ -1222,11 +1322,18 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             new_grids.push(grid);
         }
         if !panes.is_empty() {
-            return Err(panes.into_values().collect());
+            let contexts = new_grids
+                .into_iter()
+                .flat_map(ContextGrid::take_contexts)
+                .collect();
+            return Err(restore_prepared_transfer(
+                panes,
+                contexts,
+                &mut target_panes,
+                &source_order,
+            ));
         }
-        let insert_at = insertion_index
-            .unwrap_or(self.contexts.len())
-            .min(self.contexts.len());
+        let insert_at = insertion_index.unwrap_or(self.contexts.len());
         for (offset, grid) in new_grids.into_iter().enumerate() {
             self.contexts.insert(insert_at + offset, grid);
         }

@@ -297,8 +297,10 @@ mod merge_hover_tests {
     }
 
     #[test]
-    fn stale_hover_index_is_rejected_after_target_tabs_change() {
-        assert!(merge_target_index_is_valid(2, 2, true));
+    fn native_target_accepts_beginning_middle_end_and_rejects_stale() {
+        for index in 0..=2 {
+            assert!(merge_target_index_is_valid(index, 2, true));
+        }
         assert!(!merge_target_index_is_valid(3, 2, true));
         assert!(!merge_target_index_is_valid(2, 2, false));
     }
@@ -2254,6 +2256,7 @@ impl<'a> Application<'a> {
         &mut self,
         source_id: rio_backend::event::WindowId,
         target: crate::router::window_control::WindowEndpoint,
+        target_index: usize,
     ) -> Result<(), String> {
         let transfer_id = crate::router::window_control::new_transfer_id()?;
         let source_index = self
@@ -2279,7 +2282,13 @@ impl<'a> Application<'a> {
             .window_control
             .as_ref()
             .ok_or_else(|| "cross-window control is unavailable".to_string())?;
-        control.offer_async(target, offer, self.event_proxy.clone(), source_id)?;
+        control.offer_async(
+            target,
+            offer,
+            Some(target_index),
+            self.event_proxy.clone(),
+            source_id,
+        )?;
         self.track_outgoing_offer(transfer_id, source_id, source_routes);
         Ok(())
     }
@@ -3154,10 +3163,18 @@ impl Application<'_> {
         source: crate::router::window_control::WindowEndpoint,
         reply: SyncSender<crate::router::window_control::WindowControlResponse>,
     ) {
-        let valid_source = self
-            .window_control
-            .as_ref()
-            .is_some_and(|control| control.descriptor().instance != source.instance);
+        let valid_source = {
+            #[cfg(unix)]
+            {
+                self.window_control.as_ref().is_some_and(|control| {
+                    control.descriptor().instance != source.instance
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
         let has_terminal = self.router.routes.get(&window_id).is_some_and(|route| {
             route.path == RoutePath::Terminal
                 && !route.window.screen.context_manager.is_empty()
@@ -3257,9 +3274,12 @@ impl Application<'_> {
         &mut self,
         selection_id: [u8; 16],
         target_window: u64,
-        _target_index: usize,
+        target_index: u32,
         clicked: bool,
     ) {
+        let Ok(target_index) = usize::try_from(target_index) else {
+            return;
+        };
         let Some(pending) = self.pending_merge_selection.as_ref() else {
             return;
         };
@@ -3279,7 +3299,9 @@ impl Application<'_> {
         }
         let source_window = pending.source_window;
         self.clear_merge_window();
-        if let Err(error) = self.start_foreign_window_merge(source_window, target) {
+        if let Err(error) =
+            self.start_foreign_window_merge(source_window, target, target_index)
+        {
             self.show_merge_error(source_window, error);
         }
     }
@@ -3368,12 +3390,13 @@ impl Application<'_> {
                     target_index,
                 } => {
                     let sender = self.incoming_prepared_sender.clone();
+                    let preparation_reply = reply.clone();
                     let preparation = self.session_preparations.clone();
                     let event_proxy = self.event_proxy.clone();
                     let wake_window = target_window
                         .map(rio_backend::event::WindowId::from)
                         .or_else(|| self.router.routes.keys().next().copied());
-                    std::thread::Builder::new()
+                    let preparation = std::thread::Builder::new()
                         .name("rio-window-prepare".into())
                         .spawn(move || {
                             let prepared = offer
@@ -3402,8 +3425,14 @@ impl Application<'_> {
                                     window_id,
                                 );
                             }
-                        })
-                        .ok();
+                        });
+                    if let Err(error) = preparation {
+                        let _ = preparation_reply.try_send(
+                            crate::router::window_control::WindowControlResponse::Rejected(
+                                format!("start transfer preparation: {error}"),
+                            ),
+                        );
+                    }
                 }
                 crate::router::window_control::WindowControlEvent::OfferResult {
                     transfer_id,
@@ -3453,7 +3482,7 @@ impl Application<'_> {
                 } => self.handle_selection_event(
                     selection_id,
                     target_window,
-                    target_index as usize,
+                    target_index,
                     clicked,
                 ),
                 crate::router::window_control::WindowControlEvent::ArmSelectionResult {
@@ -3488,26 +3517,9 @@ impl Application<'_> {
                 .collect();
             let recovery =
                 matches!(&pending.completion, PendingPreparedCompletion::Recovery);
-            let mut current_route = None;
-            if let Some(route) = self.router.routes.get_mut(&pending.window_id) {
-                route
-                    .window
-                    .screen
-                    .context_manager
-                    .remove_transferred_routes(
-                        &routes,
-                        &mut route.window.screen.sugarloaf,
-                    );
-                if !route.window.screen.context_manager.is_empty() {
-                    let size = route.window.winit_window.inner_size();
-                    route.window.screen.refresh_after_tab_transfer(size);
-                }
-                if recovery {
-                    current_route =
-                        Some(route.window.screen.context_manager.current_route());
-                }
-                route.request_redraw();
-            }
+            let current_route = self
+                .remove_pending_prepared_routes(pending.window_id, &routes)
+                .filter(|_| recovery);
             match pending.completion {
                 PendingPreparedCompletion::Incoming { reply } => {
                     let _ = reply.try_send(
@@ -3530,12 +3542,25 @@ impl Application<'_> {
     }
 
     fn install_incoming_transfer(&mut self, incoming: PreparedIncoming) {
-        let window_id = incoming
-            .target_window
-            .map(rio_backend::event::WindowId::from)
-            .filter(|window_id| self.router.routes.contains_key(window_id))
-            .or_else(|| self.router.get_focused_route())
-            .or_else(|| self.router.routes.keys().next().copied());
+        let window_id = match incoming.target_window {
+            Some(target_window) => {
+                let window_id = rio_backend::event::WindowId::from(target_window);
+                if self
+                    .router
+                    .routes
+                    .get(&window_id)
+                    .is_some_and(|route| route.path == RoutePath::Terminal)
+                {
+                    Some(window_id)
+                } else {
+                    None
+                }
+            }
+            None => self
+                .router
+                .get_focused_route()
+                .or_else(|| self.router.routes.keys().next().copied()),
+        };
         let Some(window_id) = window_id else {
             let _ = incoming.reply.try_send(
                 crate::router::window_control::WindowControlResponse::Rejected(
@@ -3594,7 +3619,7 @@ impl Application<'_> {
         let Ok(target_routes) = target_routes else {
             let _ = incoming.reply.try_send(
                 crate::router::window_control::WindowControlResponse::Rejected(
-                    "target context capacity is full".into(),
+                    "target context capacity or insertion index is invalid".into(),
                 ),
             );
             return;
@@ -3662,27 +3687,13 @@ impl Application<'_> {
                 Ok(routes) => routes,
                 Err(error) => {
                     tracing::warn!(%error, "cross-window transfer returned an invalid commit");
-                    if let Some(route_id) =
-                        self.router.routes.get(&pending.source_window).map(|route| {
-                            route.window.screen.context_manager.current_route()
-                        })
-                    {
-                        self.show_session_error(pending.source_window, route_id, error);
-                    }
-                    return;
+                    return self
+                        .report_outgoing_transfer_error(pending.source_window, error);
                 }
             },
             Err(error) => {
                 tracing::warn!(%error, "cross-window transfer rejected");
-                if let Some(route_id) = self
-                    .router
-                    .routes
-                    .get(&pending.source_window)
-                    .map(|route| route.window.screen.context_manager.current_route())
-                {
-                    self.show_session_error(pending.source_window, route_id, error);
-                }
-                return;
+                return self.report_outgoing_transfer_error(pending.source_window, error);
             }
         };
         tracing::info!(
@@ -3730,6 +3741,21 @@ impl Application<'_> {
         }
     }
 
+    fn report_outgoing_transfer_error(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        error: String,
+    ) {
+        if let Some(route_id) = self
+            .router
+            .routes
+            .get(&window_id)
+            .map(|route| route.window.screen.context_manager.current_route())
+        {
+            self.show_session_error(window_id, route_id, error);
+        }
+    }
+
     fn commit_prepared_route(
         &mut self,
         window_id: rio_backend::event::WindowId,
@@ -3754,6 +3780,26 @@ impl Application<'_> {
         context
             .commit_pending_session(event_proxy)
             .map_err(|error| error.to_string())
+    }
+
+    fn remove_pending_prepared_routes(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        routes: &[usize],
+    ) -> Option<usize> {
+        let route = self.router.routes.get_mut(&window_id)?;
+        route
+            .window
+            .screen
+            .context_manager
+            .remove_transferred_routes(routes, &mut route.window.screen.sugarloaf);
+        if !route.window.screen.context_manager.is_empty() {
+            let size = route.window.winit_window.inner_size();
+            route.window.screen.refresh_after_tab_transfer(size);
+        }
+        let current_route = route.window.screen.context_manager.current_route();
+        route.request_redraw();
+        Some(current_route)
     }
 
     fn finish_ready_prepared(
@@ -3841,23 +3887,12 @@ impl Application<'_> {
                     .filter(|route| !committed_targets.contains(&route.target_route))
                     .map(|route| route.target_route)
                     .collect();
-                if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    route
-                        .window
-                        .screen
-                        .context_manager
-                        .remove_transferred_routes(
-                            &uncommitted,
-                            &mut route.window.screen.sugarloaf,
-                        );
-                    if !route.window.screen.context_manager.is_empty() {
-                        let size = route.window.winit_window.inner_size();
-                        route.window.screen.refresh_after_tab_transfer(size);
-                    }
-                }
+                self.remove_pending_prepared_routes(window_id, &uncommitted);
             }
-            if let Some(route) = self.router.routes.get_mut(&window_id) {
-                route.request_redraw();
+            if error.is_none() {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    route.request_redraw();
+                }
             }
         } else {
             error = Some("target window disappeared before commit".into());
@@ -3906,27 +3941,16 @@ impl Application<'_> {
         let error = self
             .commit_prepared_route(window_id, target_route, "recovered")
             .err();
-        let current_route = if let Some(route) = self.router.routes.get_mut(&window_id) {
-            let current_route = route.window.screen.context_manager.current_route();
-            if error.is_some() {
-                route
-                    .window
-                    .screen
-                    .context_manager
-                    .remove_transferred_routes(
-                        &[target_route],
-                        &mut route.window.screen.sugarloaf,
-                    );
-                if !route.window.screen.context_manager.is_empty() {
-                    let size = route.window.winit_window.inner_size();
-                    route.window.screen.refresh_after_tab_transfer(size);
-                }
-            }
+        let current_route = self
+            .router
+            .routes
+            .get(&window_id)
+            .map(|route| route.window.screen.context_manager.current_route());
+        if error.is_some() {
+            self.remove_pending_prepared_routes(window_id, &[target_route]);
+        } else if let Some(route) = self.router.routes.get_mut(&window_id) {
             route.request_redraw();
-            Some(current_route)
-        } else {
-            None
-        };
+        }
         if let Some(error) = error {
             if let Some(route_id) = current_route {
                 self.show_session_error(window_id, route_id, error);
@@ -6611,6 +6635,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
         // SAFETY: The clipboard must be dropped before the event loop, so
         // replace it with a safe no-op placeholder.
         self.router.clipboard = Clipboard::new_nop();
+
+        // `process::exit` skips field destructors; stop the acceptor explicitly.
+        self.window_control.take();
 
         std::process::exit(0);
     }
