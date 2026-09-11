@@ -34,6 +34,7 @@ COMPARE=${COMPARE:-/usr/bin/compare}
 IDENTIFY=${IDENTIFY:-/usr/bin/identify}
 QDBUS6=${QDBUS6:-/usr/bin/qdbus6}
 VULKANINFO=${VULKANINFO:-/usr/bin/vulkaninfo}
+VKCUBE=${VKCUBE:-/usr/bin/vkcube}
 WAYLAND_INFO=${WAYLAND_INFO:-/usr/bin/wayland-info}
 SPECTACLE=${SPECTACLE:-/usr/bin/spectacle}
 RADEONTOP=${RADEONTOP:-/usr/bin/radeontop}
@@ -41,7 +42,12 @@ XDOTTOOL=${XDOTTOOL:-/usr/bin/xdotool}
 USE_PRIVATE_X11=${RIO_ACCEPT_KWIN_X11:-0}
 RIO_ACCEPT_GPU_SELECTION_ONLY=${RIO_ACCEPT_GPU_SELECTION_ONLY:-0}
 VISUAL_STATES=(base palette cursor underline kitty sixel alternate)
-selection_captured=0
+KITTY_RED_REGION='48x48+420+283'
+KITTY_GREEN_REGION='48x48+468+283'
+KITTY_BLUE_REGION='48x48+420+331'
+KITTY_WHITE_REGION='48x48+468+331'
+SIXEL_RED_REGION='48x6+420+283'
+SIXEL_BLUE_REGION='48x6+420+289'
 
 PIDS=()
 XVFB_PID=
@@ -53,11 +59,6 @@ export DISPLAY XDG_RUNTIME_DIR="$RUNTIME_DIR" TMPDIR="$TMP_DIR"
 unset WAYLAND_DISPLAY WAYLAND_SOCKET
 
 trap cleanup EXIT INT TERM
-
-wait_for_marker() {
-    local file=$1 marker=$2 description=$3
-    wait_for_text "$file" "$marker" "$description"
-}
 
 rio_process_for() {
     local root=$1 binary=$2 pid args
@@ -126,7 +127,7 @@ start_variant() {
         -e /bin/sh "$FIXTURE" >"$stdout" 2>&1 &
     STARTED_PID=$!
     PIDS+=("$STARTED_PID")
-    wait_for_marker "$ack" READY "$phase/$variant shell"
+    wait_for_text "$ack" READY "$phase/$variant shell"
     wait_until "$phase/$variant Rio startup" 30 \
         "[[ -f \"$config/log/rio.log\" ]] && grep -Fq 'Initialisation complete' \"$config/log/rio.log\""
     GUI_PID=$(rio_process_for "$STARTED_PID" "$binary") \
@@ -154,12 +155,12 @@ capture_content() {
     "$IDENTIFY" "$content" >>"$RUN_DIR/summary.log"
 }
 
-capture_content_region() {
-    local phase=$1 variant=$2 state=$3 region=$4
-    local source="$RUN_DIR/$phase-$variant-$state-content.png"
-    local output="$RUN_DIR/$phase-$variant-$state-region.png"
+capture_state_region() {
+    local phase=$1 variant=$2 source_state=$3 output_state=$4 region=$5
+    local source="$RUN_DIR/$phase-$variant-$source_state-content.png"
+    local output="$RUN_DIR/$phase-$variant-$output_state-region.png"
     "$CONVERT" "$source" -crop "$region" +repage "$output"
-    [[ -s "$output" ]] || die "content region capture was empty for $phase/$variant/$state"
+    [[ -s "$output" ]] || die "state region capture was empty for $phase/$variant/$output_state"
 }
 
 positive_ae_metric() {
@@ -182,6 +183,45 @@ assert_region_delta() {
         || die "$phase/$variant $label region did not change"
 }
 
+pixel_color_count() {
+    local image=$1 color=$2
+    local expression
+    case "$color" in
+        '#ff0000')
+            expression='r > 0.45 && r > g*1.5 && r > b*1.5'
+            ;;
+        '#ff8000')
+            expression='r > 0.45 && g > 0.2 && g < 0.85 && b < 0.35 && r > g*1.2 && g > b*1.5'
+            ;;
+        '#00ff00')
+            expression='g > 0.45 && g > r*1.5 && g > b*1.5'
+            ;;
+        '#0000ff')
+            expression='b > 0.45 && b > r*1.5 && b > g*1.5'
+            ;;
+        '#ffffff')
+            expression='r > 0.45 && g > 0.45 && b > 0.45'
+            ;;
+        *)
+            die "pixel oracle has no predicate for expected color $color"
+            ;;
+    esac
+    "$CONVERT" "$image" -alpha off -colorspace RGB \
+        -fx "$expression ? 1 : 0" -format '%[fx:mean*w*h]' info:
+}
+
+assert_pixel_color() {
+    local phase=$1 variant=$2 state=$3 label=$4 color=$5 minimum=$6
+    local image="$RUN_DIR/$phase-$variant-$state-region.png" count
+    count=$(pixel_color_count "$image" "$color")
+    printf '%s.%s.%s_pixel_oracle_%s=%s color=%s minimum=%s\n' \
+        "$phase" "$variant" "$state" "$label" "$count" "$color" "$minimum" \
+        >>"$RUN_DIR/summary.log"
+    awk -v count="$count" -v minimum="$minimum" \
+        'BEGIN { exit !(count >= minimum) }' \
+        || die "$phase/$variant $label pixel oracle found too few $color pixels"
+}
+
 state_delta() {
     local phase=$1 variant=$2 state=$3 raw metric
     raw=$("$COMPARE" -metric AE \
@@ -200,17 +240,39 @@ run_visual_variant() {
     start_variant "$phase" "$variant" "$binary" "$filter"
     ack="$RUN_DIR/$phase-$variant-ack.log"
     for state in "${VISUAL_STATES[@]}"; do
-        wait_for_marker "$ack" "STATE=$state" "$phase/$variant $state fixture state"
+        wait_for_text "$ack" "STATE=$state" "$phase/$variant $state fixture state"
         sleep 0.75
         capture_content "$phase" "$variant" "$state"
         [[ "$state" == base ]] || state_delta "$phase" "$variant" "$state"
     done
-    capture_content_region "$phase" "$variant" base '784x160+0+112'
-    capture_content_region "$phase" "$variant" palette '784x160+0+112'
-    capture_content_region "$phase" "$variant" underline '784x160+0+112'
+    # Fixture rows 10-14 contain the OSC-4 mutation and advanced underline set.
+    for state in base palette underline; do
+        capture_state_region "$phase" "$variant" "$state" "$state" '784x180+0+250'
+    done
     assert_region_delta "$phase" "$variant" base palette osc4_palette_mutation
     assert_region_delta "$phase" "$variant" base underline advanced_underline_styles
-    wait_for_marker "$ack" DONE "$phase/$variant fixture completion"
+    if [[ "$filter" == none ]]; then
+        assert_pixel_color "$phase" "$variant" palette osc4_mutated_red '#ff0000' 8
+        assert_pixel_color "$phase" "$variant" underline colored_underline '#ff8000' 1
+
+        capture_state_region "$phase" "$variant" kitty kitty-red "$KITTY_RED_REGION"
+        capture_state_region "$phase" "$variant" kitty kitty-green "$KITTY_GREEN_REGION"
+        capture_state_region "$phase" "$variant" kitty kitty-blue "$KITTY_BLUE_REGION"
+        capture_state_region "$phase" "$variant" kitty kitty-white "$KITTY_WHITE_REGION"
+        assert_pixel_color "$phase" "$variant" kitty-red kitty_red '#ff0000' 128
+        assert_pixel_color "$phase" "$variant" kitty-green kitty_green '#00ff00' 128
+        assert_pixel_color "$phase" "$variant" kitty-blue kitty_blue '#0000ff' 128
+        assert_pixel_color "$phase" "$variant" kitty-white kitty_white '#ffffff' 128
+
+        capture_state_region "$phase" "$variant" sixel sixel-red "$SIXEL_RED_REGION"
+        capture_state_region "$phase" "$variant" sixel sixel-blue "$SIXEL_BLUE_REGION"
+        assert_pixel_color "$phase" "$variant" sixel-red sixel_red '#ff0000' 64
+        assert_pixel_color "$phase" "$variant" sixel-blue sixel_blue '#0000ff' 64
+    else
+        printf '%s.%s.pixel_oracle=SKIPPED: filtered capture; canonical image-color checks use native unfiltered output only\n' \
+            "$phase" "$variant" >>"$RUN_DIR/summary.log"
+    fi
+    wait_for_text "$ack" DONE "$phase/$variant fixture completion"
     stop_tree "$STARTED_PID"
     log "$phase/$variant visual states captured with GPU rendering"
 }
@@ -219,7 +281,7 @@ run_selection_variant() {
     local variant=$1 binary=$2 phase=selection ack window raw metric
     start_variant "$phase" "$variant" "$binary" none webgpu
     ack="$RUN_DIR/$phase-$variant-ack.log"
-    wait_for_marker "$ack" STATE=base "$phase/$variant selection fixture state"
+    wait_for_text "$ack" STATE=base "$phase/$variant selection fixture state"
     sleep 0.75
     window=$(window_for_pid "$GUI_PID" || true)
     if [[ ! "$window" =~ ^[0-9]+$ ]] &&
@@ -239,8 +301,9 @@ run_selection_variant() {
     "$XDOTTOOL" key --window "$window" --clearmodifiers ctrl+shift+a
     sleep 1
     capture_content "$phase" "$variant" after
-    capture_content_region "$phase" "$variant" before '784x220+0+0'
-    capture_content_region "$phase" "$variant" after '784x220+0+0'
+    for state in before after; do
+        capture_state_region "$phase" "$variant" "$state" "$state" '784x220+0+0'
+    done
     assert_region_delta "$phase" "$variant" before after selection_highlight
     raw=$(
         "$COMPARE" -metric AE \
@@ -253,8 +316,7 @@ run_selection_variant() {
     positive_ae_metric "$metric" \
         || die "GPU selection did not change the captured content for $variant"
     printf 'selection=CAPTURED variant=%s\n' "$variant" >>"$RUN_DIR/summary.log"
-    selection_captured=1
-    wait_for_marker "$ack" DONE "$phase/$variant selection fixture completion"
+    wait_for_text "$ack" DONE "$phase/$variant selection fixture completion"
     stop_tree "$STARTED_PID"
     log "$phase/$variant GPU selection capture completed"
 }
@@ -275,13 +337,13 @@ run_profile_variant() {
         >"$stdout" 2>&1 &
     profile_root=$!
     PIDS+=("$profile_root")
-    wait_for_marker "$ack" READY "profile $phase/$variant shell"
+    wait_for_text "$ack" READY "profile $phase/$variant shell"
     wait_until "profile $phase/$variant Rio startup" 30 \
         "[[ -f \"$config/log/rio.log\" ]] && grep -Fq 'Initialisation complete' \"$config/log/rio.log\""
     profile_gui=$(rio_process_for "$profile_root" "$binary") \
         || die "profile Rio GUI process not found for $phase/$variant"
     place_window "$profile_gui" "profile-$phase" "$variant"
-    wait_for_marker "$ack" PROFILE_START "profile $phase/$variant workload start"
+    wait_for_text "$ack" PROFILE_START "profile $phase/$variant workload start"
     gpu_log="$RUN_DIR/profile-$phase-$variant-radeontop.log"
     "$RADEONTOP" -d "$gpu_log" -i 1 -l 4 >"$LOG_DIR/profile-$phase-$variant-radeontop.stdout" 2>&1 &
     gpu_pid=$!
@@ -301,7 +363,7 @@ run_profile_variant() {
             ps -p "$pid" -o pid=,ppid=,%cpu=,rss=,args= 2>/dev/null || true
         done
     } >"$RUN_DIR/profile-$phase-$variant-after.txt"
-    wait_for_marker "$ack" PROFILE_FRAMES "profile $phase/$variant workload completion"
+    wait_for_text "$ack" PROFILE_FRAMES "profile $phase/$variant workload completion"
     grep -F 'PROFILE_FRAMES=' "$ack" >>"$RUN_DIR/summary.log"
     kill "$gpu_pid" 2>/dev/null || true
     wait "$gpu_pid" 2>/dev/null || true
@@ -313,11 +375,60 @@ run_profile_variant() {
     log "$phase/$variant bounded GPU workload snapshot captured"
 }
 
+run_present_timing_probe() {
+    local log="$RUN_DIR/present-timing-vkcube.log" status
+    if [[ ! -x "$VKCUBE" ]]; then
+        printf '%s\n' \
+            "presentation_probe=UNAVAILABLE: vkcube is not installed at $VKCUBE" \
+            >>"$RUN_DIR/summary.log"
+        return
+    fi
+    if ! command -v timeout >/dev/null 2>&1; then
+        printf '%s\n' \
+            'presentation_probe=UNAVAILABLE: timeout command is not installed' \
+            >>"$RUN_DIR/summary.log"
+        return
+    fi
+    if HOME="$RUN_DIR/home" XDG_CONFIG_HOME="$RUN_DIR/kwin-config" \
+        XDG_DATA_HOME="$RUN_DIR/kwin-data" XDG_CACHE_HOME="$RUN_DIR/kwin-cache" \
+        DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" WAYLAND_DISPLAY="$SOCKET" \
+        timeout 30s "$VKCUBE" --wsi wayland --display_timing --c 60 \
+        >"$log" 2>&1; then
+        status=0
+    else
+        status=$?
+    fi
+    if grep -Fq 'VK_GOOGLE_display_timing extension NOT AVAILABLE' "$log"; then
+        printf '%s\n' \
+            'presentation_probe=UNAVAILABLE: private vkcube reported VK_GOOGLE_display_timing extension NOT AVAILABLE; no present timestamps' \
+            >>"$RUN_DIR/summary.log"
+    elif grep -Fq 'VK_GOOGLE_display_timing extension enabled' "$log"; then
+        printf '%s\n' \
+            "presentation_probe=CAPABILITY_ONLY: vkcube enabled VK_GOOGLE_display_timing but emitted no interval records; exit_status=$status" \
+            >>"$RUN_DIR/summary.log"
+    else
+        printf '%s\n' \
+            "presentation_probe=UNAVAILABLE: private vkcube exit_status=$status without a display-timing result" \
+            >>"$RUN_DIR/summary.log"
+    fi
+}
+
+record_gpu_startup() {
+    local rio_log count=0
+    for rio_log in "$CONFIG_DIR"/*/*/log/rio.log; do
+        grep -E 'Vulkan device created:|Swapchain:|Selected adapter:|Surface format:' \
+            "$rio_log" >>"$RUN_DIR/summary.log" \
+            || die "GPU startup evidence missing from $rio_log"
+        count=$((count + 1))
+    done
+    log "GPU startup evidence captured from $count Rio logs"
+}
+
 require_tools() {
     local command
     for command in "$KWIN" "$DBUS_DAEMON" "$CONVERT" "$COMPARE" "$IDENTIFY" \
         "$QDBUS6" "$VULKANINFO" "$RADEONTOP" \
-        "$WAYLAND_INFO" pgrep ps grep; do
+        "$WAYLAND_INFO" pgrep ps grep awk; do
         require_command "$command"
     done
     if [[ "$USE_PRIVATE_X11" == 1 || "$USE_PRIVATE_X11" == true || "$USE_PRIVATE_X11" == yes ]]; then
@@ -373,6 +484,7 @@ else
     vulkaninfo_status=$?
     log "UNSUPPORTED: vulkaninfo exited with status=$vulkaninfo_status; Rio startup logs remain the GPU evidence"
 fi
+run_present_timing_probe
 XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$SOCKET" "$WAYLAND_INFO" \
     >"$LOG_DIR/wayland-info.log" 2>&1 || die "private Wayland global enumeration failed"
 grep -Eiq 'wl_compositor|xdg_wm_base' "$LOG_DIR/wayland-info.log" \
@@ -383,19 +495,10 @@ if [[ "$RIO_ACCEPT_GPU_SELECTION_ONLY" == 1 || "$RIO_ACCEPT_GPU_SELECTION_ONLY" 
         || die "GPU selection-only mode requires RIO_ACCEPT_KWIN_X11=1"
     run_selection_variant current "$RIO_CURRENT_BIN"
     run_selection_variant upstream "$RIO_UPSTREAM_BIN"
-    gpu_log_count=0
-    for rio_log in "$CONFIG_DIR"/*/*/log/rio.log; do
-        if grep -Eq 'Vulkan device created:|Swapchain:|Selected adapter:|Surface format:' "$rio_log"; then
-            grep -E 'Vulkan device created:|Swapchain:|Selected adapter:|Surface format:' "$rio_log" >>"$RUN_DIR/summary.log"
-            gpu_log_count=$((gpu_log_count + 1))
-        else
-            die "GPU startup evidence missing from $rio_log"
-        fi
-    done
-    log "GPU startup evidence captured from $gpu_log_count Rio logs"
+    record_gpu_startup
     printf '%s\n' \
         'selection=CAPTURED: public SelectAll changed dedicated content regions under private X11/KWin' \
-        'ime=UNSUPPORTED: no private text-input/IME injector is available; preedit and commit are not claimed' \
+        'ime=UNVERIFIED: text-input/input-method protocols and KWin --inputmethod are installed, but no ready private input-method server is available; preedit and commit are not claimed' \
         'note=selection-only mode uses WGPU to avoid native Vulkan X11 surface limitations' \
         >>"$RUN_DIR/summary.log"
     log "PASS: private X11/KWin GPU selection regions completed"
@@ -440,31 +543,23 @@ done
 (( filter_delta_count > 0 )) \
     || die "configured newpixiecrt produced no content-crop delta in any captured state"
 
-gpu_log_count=0
-for rio_log in "$CONFIG_DIR"/*/*/log/rio.log; do
-    if grep -Eq 'Vulkan device created:|Swapchain:|Selected adapter:|Surface format:' "$rio_log"; then
-        grep -E 'Vulkan device created:|Swapchain:|Selected adapter:|Surface format:' "$rio_log" >>"$RUN_DIR/summary.log"
-        gpu_log_count=$((gpu_log_count + 1))
-    else
-        die "GPU startup evidence missing from $rio_log"
-    fi
-done
-log "GPU startup evidence captured from $gpu_log_count Rio logs"
+record_gpu_startup
 
 printf '%s\n' \
-    'graphics_fixture=CAPTURED: Kitty RGB and Sixel states emitted under live GPU rendering' \
+    'graphics_fixture=CAPTURED: Kitty RGBA quadrants and Sixel red/blue bands emitted under live GPU rendering' \
     'osc4=CAPTURED: palette index mutation changed a dedicated content region' \
     'underline=CAPTURED: double, curly, dotted, dashed, and colored underline regions changed' \
     'filters=CAPTURED: configured newpixiecrt path under live GPU rendering' \
-    'ime=UNSUPPORTED: no private text-input/IME injector is available; preedit and commit are not claimed' \
+    'ime=UNVERIFIED: text-input/input-method protocols and KWin --inputmethod are installed, but no ready private input-method server is available; preedit and commit are not claimed' \
     'input=UNVERIFIED: this visual harness does not claim native pointer or key delivery' \
-    'perf=BOUNDED: profile frame count plus two CPU/RSS snapshots per variant/phase' \
+    'perf=BOUNDED_ACTIVITY: profile frame count plus two CPU/RSS snapshots per variant/phase' \
+    'presentation_timing=UNMEASURED: private KWin/Xvfb and Rio logs expose no presentation or swapchain-completion timestamps; no FPS, frame-latency, or input-latency claim' \
     'note=content crops and AE metrics are evidence; they are not whole-window pixel identity' \
     >>"$RUN_DIR/summary.log"
-if ((selection_captured == 0)); then
+if [[ "$USE_PRIVATE_X11" != 1 && "$USE_PRIVATE_X11" != true && "$USE_PRIVATE_X11" != yes ]]; then
     printf '%s\n' \
         'selection=UNVERIFIED: GPU selection capture requires private Xvfb/KWin-X11 mode' \
         >>"$RUN_DIR/summary.log"
 fi
 log "PASS: private Wayland GPU visual states, graphics protocol fixtures, filter path, and bounded workload snapshots completed"
-log "UNSUPPORTED: IME preedit/commit injection was unavailable; native keyboard delivery remains covered by separate acceptance paths"
+log "UNVERIFIED: no ready private input-method server was available for IME preedit/commit; native keyboard delivery remains covered by separate acceptance paths"
