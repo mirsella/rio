@@ -31,7 +31,7 @@ mod unix {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+    use std::sync::mpsc::{self, Receiver, SyncSender};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -190,7 +190,11 @@ mod unix {
     }
 
     impl DeferredNotifications {
-        fn drain_into(&mut self, notifications: &mut Vec<Notification>) {
+        fn drain_into(
+            &mut self,
+            critical_notifications: &mut Vec<Notification>,
+            notifications: &mut Vec<Notification>,
+        ) {
             if let Some(title) = self.title.take() {
                 notifications.push(Notification::Action(Action::SetTitle {
                     title,
@@ -214,18 +218,18 @@ mod unix {
                 notifications.push(Notification::ClipboardOverflow);
             }
             if let Some(status) = self.child_exited.take() {
-                notifications.push(Notification::ChildExited(status));
+                critical_notifications.push(Notification::ChildExited(status));
             }
             if self.closed {
                 self.closed = false;
-                notifications.push(Notification::Closed);
+                critical_notifications.push(Notification::Closed);
             }
             notifications.extend(
                 self.terminal_requests
                     .drain(..)
                     .map(Notification::TerminalRequest),
             );
-            notifications.extend(self.request_refused.drain(..).map(
+            critical_notifications.extend(self.request_refused.drain(..).map(
                 |(request_id, kind, reason)| Notification::RequestRefused {
                     request_id,
                     kind,
@@ -654,7 +658,6 @@ mod unix {
 
     impl Runtime {
         fn new(spec: SessionSpec, delegate: Arc<Delegate>) -> Result<Self, SessionError> {
-            spec.validate()?;
             if let Some(working_dir) = spec.working_dir.as_deref() {
                 let path = Path::new(working_dir);
                 if !path.is_absolute() || !path.is_dir() {
@@ -901,7 +904,6 @@ mod unix {
             if let Some(error) = self.surface.take_input_error() {
                 return Err(input_error(error));
             }
-            command.validate()?;
             let selection_line = self.validate_command(&command)?;
             let reply = match command {
                 SessionCommand::Write(bytes) => {
@@ -1693,20 +1695,23 @@ mod unix {
     }
 
     struct Shared {
-        gate: Mutex<()>,
-        runtime: Mutex<Option<Runtime>>,
-        active: Mutex<Option<Active>>,
+        state: Mutex<SharedState>,
         notifications: Mutex<Receiver<Notification>>,
         critical_notifications: Mutex<Receiver<Notification>>,
         next_generation: AtomicU64,
         connection_count: AtomicUsize,
         closing: AtomicBool,
         close_pending: AtomicBool,
-        idle_since: Mutex<Option<Instant>>,
         connections: Mutex<Vec<(RawFd, UnixStream)>>,
         session_id: SessionId,
         capability: [u8; 32],
         delegate: Arc<Delegate>,
+    }
+
+    struct SharedState {
+        runtime: Option<Runtime>,
+        active: Option<Active>,
+        idle_since: Option<Instant>,
     }
 
     struct ConnectionGuard {
@@ -1730,16 +1735,17 @@ mod unix {
             delegate: Arc<Delegate>,
         ) -> Self {
             Self {
-                gate: Mutex::new(()),
-                runtime: Mutex::new(None),
-                active: Mutex::new(None),
+                state: Mutex::new(SharedState {
+                    runtime: None,
+                    active: None,
+                    idle_since: Some(Instant::now()),
+                }),
                 notifications: Mutex::new(receiver),
                 critical_notifications: Mutex::new(critical_receiver),
                 next_generation: AtomicU64::new(1),
                 connection_count: AtomicUsize::new(0),
                 closing: AtomicBool::new(false),
                 close_pending: AtomicBool::new(false),
-                idle_since: Mutex::new(Some(Instant::now())),
                 connections: Mutex::new(Vec::new()),
                 session_id,
                 capability,
@@ -1747,31 +1753,23 @@ mod unix {
             }
         }
 
-        fn set_idle(&self, idle: bool) {
-            if let Ok(mut since) = self.idle_since.lock() {
-                *since = if idle { Some(Instant::now()) } else { None };
+        fn expire_if_idle(&self) -> bool {
+            let state = self.state.lock().expect("worker state lock poisoned");
+            if state
+                .idle_since
+                .is_some_and(|since| since.elapsed() >= IDLE_RETENTION)
+            {
+                self.closing.store(true, Ordering::Release);
+                true
+            } else {
+                false
             }
         }
 
-        fn expired(&self) -> bool {
-            self.idle_since
-                .lock()
-                .ok()
-                .and_then(|since| *since)
-                .is_some_and(|since| since.elapsed() >= IDLE_RETENTION)
-        }
-
         fn refresh_idle_after_terminal_event(&self) {
-            let Ok(_gate) = self.gate.lock() else {
-                return;
-            };
-            let detached = self
-                .active
-                .lock()
-                .ok()
-                .is_some_and(|active| active.is_none());
-            if detached {
-                self.set_idle(true);
+            let mut state = self.state.lock().expect("worker state lock poisoned");
+            if state.active.is_none() {
+                state.idle_since = Some(Instant::now());
             }
         }
 
@@ -1903,14 +1901,8 @@ mod unix {
             if let Err(error) = drain_notifications(&shared) {
                 break Err(error);
             }
-            {
-                let _gate = shared.gate.lock().expect("worker state lock poisoned");
-                if shared.expired() {
-                    // Fence new commits before leaving the loop. A commit that
-                    // won the gate first has already cancelled idle retention.
-                    shared.closing.store(true, Ordering::Release);
-                    break Ok(());
-                }
+            if shared.expire_if_idle() {
+                break Ok(());
             }
             let mut index = 0;
             while index < connection_threads.len() {
@@ -2030,13 +2022,6 @@ mod unix {
             );
             return Ok(());
         }
-        if let Some(spec) = &hello.3 {
-            if let Err(error) = spec.validate() {
-                let _ = send_error(&mut stream, error_code(&error), &error.to_string());
-                return Ok(());
-            }
-        }
-
         let generation =
             match establish_attachment(&shared, &mut stream, connection_fd, hello.3) {
                 Ok(generation) => generation,
@@ -2072,37 +2057,30 @@ mod unix {
         connection_fd: RawFd,
         spec: Option<SessionSpec>,
     ) -> Result<u64, SessionError> {
-        let current_generation =
+        let current_generation = {
+            let mut state = shared
+                .state
+                .lock()
+                .map_err(|_| SessionError::protocol("worker state lock poisoned"))?;
+            if shared.closing.load(Ordering::Acquire)
+                || shared.close_pending.load(Ordering::Acquire)
             {
-                let _gate = shared
-                    .gate
-                    .lock()
-                    .map_err(|_| SessionError::protocol("worker state lock poisoned"))?;
-                if shared.closing.load(Ordering::Acquire)
-                    || shared.close_pending.load(Ordering::Acquire)
-                {
-                    return Err(SessionError::Detached);
-                }
-                let active = shared.active.lock().map_err(|_| {
-                    SessionError::protocol("worker attachment lock poisoned")
-                })?;
-                let mut runtime = shared.runtime.lock().map_err(|_| {
-                    SessionError::protocol("worker runtime lock poisoned")
-                })?;
-                if runtime.is_none() {
-                    let spec = match spec {
-                        Some(spec) => spec,
-                        None => {
-                            return Err(SessionError::invalid(
-                                "first attachment needs a session spec",
-                            ));
-                        }
-                    };
-                    let new_runtime = Runtime::new(spec, Arc::clone(&shared.delegate))?;
-                    *runtime = Some(new_runtime);
-                }
-                active.as_ref().map(|active| active.generation)
-            };
+                return Err(SessionError::Detached);
+            }
+            if state.runtime.is_none() {
+                let spec = match spec {
+                    Some(spec) => spec,
+                    None => {
+                        return Err(SessionError::invalid(
+                            "first attachment needs a session spec",
+                        ));
+                    }
+                };
+                let new_runtime = Runtime::new(spec, Arc::clone(&shared.delegate))?;
+                state.runtime = Some(new_runtime);
+            }
+            state.active.as_ref().map(|active| active.generation)
+        };
 
         if let Some(current_generation) = current_generation {
             codec::write_frame_until(
@@ -2126,35 +2104,29 @@ mod unix {
         }
 
         let generation = shared.next_generation()?;
-        let frame =
+        let frame = {
+            let mut state = shared
+                .state
+                .lock()
+                .map_err(|_| SessionError::protocol("worker state lock poisoned"))?;
+            if shared.closing.load(Ordering::Acquire)
+                || shared.close_pending.load(Ordering::Acquire)
             {
-                let _gate = shared
-                    .gate
-                    .lock()
-                    .map_err(|_| SessionError::protocol("worker state lock poisoned"))?;
-                if shared.closing.load(Ordering::Acquire)
-                    || shared.close_pending.load(Ordering::Acquire)
-                {
-                    return Err(SessionError::Detached);
+                return Err(SessionError::Detached);
+            }
+            if let Some(active) = state.active.as_ref() {
+                if Some(active.generation) != current_generation {
+                    return Err(SessionError::protocol("stale attachment claim"));
                 }
-                let active = shared.active.lock().map_err(|_| {
-                    SessionError::protocol("worker attachment lock poisoned")
-                })?;
-                if let Some(active) = active.as_ref() {
-                    if Some(active.generation) != current_generation {
-                        return Err(SessionError::protocol("stale attachment claim"));
-                    }
-                }
-                let mut runtime = shared.runtime.lock().map_err(|_| {
-                    SessionError::protocol("worker runtime lock poisoned")
-                })?;
-                let runtime = runtime
-                    .as_mut()
-                    .ok_or_else(|| SessionError::protocol("session runtime missing"))?;
-                let frame = runtime.snapshots.full_frame(&runtime.surface)?;
-                frame.validate()?;
-                frame
-            };
+            }
+            let runtime = state
+                .runtime
+                .as_mut()
+                .ok_or_else(|| SessionError::protocol("session runtime missing"))?;
+            let frame = runtime.snapshots.full_frame(&runtime.surface)?;
+            frame.validate()?;
+            frame
+        };
 
         codec::write_frame_until(
             stream,
@@ -2169,8 +2141,8 @@ mod unix {
         read_prepared_commit(stream, generation, Instant::now())?;
 
         let old_fd = {
-            let _gate = shared
-                .gate
+            let mut state = shared
+                .state
                 .lock()
                 .map_err(|_| SessionError::protocol("worker state lock poisoned"))?;
             if shared.closing.load(Ordering::Acquire)
@@ -2178,28 +2150,19 @@ mod unix {
             {
                 return Err(SessionError::Detached);
             }
-            let mut active = shared
-                .active
-                .lock()
-                .map_err(|_| SessionError::protocol("worker attachment lock poisoned"))?;
-            if let Some(active) = active.as_ref() {
+            if let Some(active) = state.active.as_ref() {
                 if Some(active.generation) != current_generation {
                     return Err(SessionError::protocol("stale attachment commit"));
                 }
             }
-            let old_fd = active.replace(Active {
+            let old_fd = state.active.replace(Active {
                 generation,
                 connection_fd,
             });
-            if let Some(runtime) = shared
-                .runtime
-                .lock()
-                .map_err(|_| SessionError::protocol("worker runtime lock poisoned"))?
-                .as_mut()
-            {
+            if let Some(runtime) = state.runtime.as_mut() {
                 runtime.frame_pending = true;
             }
-            shared.set_idle(false);
+            state.idle_since = None;
             old_fd.map(|active| active.connection_fd)
         };
         if let Some(old_fd) = old_fd {
@@ -2301,20 +2264,18 @@ mod unix {
                     }
                     last_request_id = request_id;
                     let (result, close, stale) = {
-                        let _gate = shared.gate.lock().map_err(|_| {
+                        let mut state = shared.state.lock().map_err(|_| {
                             SessionError::protocol("worker state lock poisoned")
                         })?;
-                        if !is_active(shared, generation)
-                            || command_generation != generation
-                        {
+                        let active = state
+                            .active
+                            .as_ref()
+                            .is_some_and(|active| active.generation == generation);
+                        if !active || command_generation != generation {
                             (Err(SessionError::protocol("stale attachment")), false, true)
                         } else {
-                            let result = shared
+                            let result = state
                                 .runtime
-                                .lock()
-                                .map_err(|_| {
-                                    SessionError::protocol("worker runtime lock poisoned")
-                                })?
                                 .as_mut()
                                 .ok_or_else(|| {
                                     SessionError::protocol("session runtime missing")
@@ -2410,56 +2371,52 @@ mod unix {
     }
 
     fn is_active(shared: &Shared, generation: u64) -> bool {
-        shared.active.lock().ok().is_some_and(|active| {
-            active
-                .as_ref()
-                .is_some_and(|value| value.generation == generation)
-        })
+        shared
+            .state
+            .lock()
+            .expect("worker state lock poisoned")
+            .active
+            .as_ref()
+            .is_some_and(|value| value.generation == generation)
     }
 
     fn detach(shared: &Shared, generation: u64) {
         // Serialize clearing ownership and arming retention with replacement
-        // commits, which disable retention under this same gate.
-        let _gate = shared.gate.lock().expect("worker state lock poisoned");
-        let detached = if let Ok(mut active) = shared.active.lock() {
-            if active
-                .as_ref()
-                .is_some_and(|value| value.generation == generation)
-            {
-                *active = None;
-                true
-            } else {
-                false
-            }
+        // commits, which disable retention under this same state lock.
+        let mut state = shared.state.lock().expect("worker state lock poisoned");
+        let detached = if state
+            .active
+            .as_ref()
+            .is_some_and(|value| value.generation == generation)
+        {
+            state.active = None;
+            true
         } else {
             false
         };
         if detached {
-            if let Ok(mut runtime) = shared.runtime.lock() {
-                if let Some(runtime) = runtime.as_mut() {
-                    let requests = runtime
-                        .pending_requests
-                        .iter()
-                        .filter_map(|pending| {
-                            terminal_request_event(&pending.request).ok()
-                        })
-                        .collect::<Vec<_>>();
-                    for event in requests {
-                        push_event(runtime, event);
-                    }
-                    if let Some(status) = runtime.child_exit_status {
-                        push_event(runtime, SessionEvent::ChildExited { status });
-                    }
-                    if runtime.terminal_closed {
-                        push_event(runtime, SessionEvent::Closed);
-                    }
+            if let Some(runtime) = state.runtime.as_mut() {
+                let requests = runtime
+                    .pending_requests
+                    .iter()
+                    .filter_map(|pending| terminal_request_event(&pending.request).ok())
+                    .collect::<Vec<_>>();
+                for event in requests {
+                    push_event(runtime, event);
+                }
+                if let Some(status) = runtime.child_exit_status {
+                    push_event(runtime, SessionEvent::ChildExited { status });
+                }
+                if runtime.terminal_closed {
+                    push_event(runtime, SessionEvent::Closed);
                 }
             }
-            shared.set_idle(true);
+            state.idle_since = Some(Instant::now());
         }
     }
 
     fn drain_notifications(shared: &Shared) -> Result<(), SessionError> {
+        let mut critical_notifications = Vec::new();
         let mut notifications = Vec::new();
         {
             let receiver = shared.notifications.lock().map_err(|_| {
@@ -2469,28 +2426,27 @@ mod unix {
                 shared.critical_notifications.lock().map_err(|_| {
                     SessionError::protocol("worker critical notification lock poisoned")
                 })?;
-            loop {
-                let notification = match critical_receiver.try_recv() {
-                    Ok(notification) => Some(notification),
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
-                        receiver.try_recv().ok()
-                    }
-                };
-                let Some(notification) = notification else {
-                    break;
-                };
+            while let Ok(notification) = critical_receiver.try_recv() {
+                critical_notifications.push(notification);
+            }
+            while let Ok(notification) = receiver.try_recv() {
                 notifications.push(notification);
             }
         }
-        if let Ok(mut deferred) = shared.delegate.deferred.lock() {
-            deferred.drain_into(&mut notifications);
+        {
+            let mut deferred = shared.delegate.deferred.lock().map_err(|_| {
+                SessionError::protocol("worker deferred notification lock poisoned")
+            })?;
+            deferred.drain_into(&mut critical_notifications, &mut notifications);
         }
+        critical_notifications.extend(notifications);
+        let notifications = critical_notifications;
         let terminal_event = {
-            let mut runtime = shared
-                .runtime
+            let mut state = shared
+                .state
                 .lock()
-                .map_err(|_| SessionError::protocol("worker runtime lock poisoned"))?;
-            let Some(runtime) = runtime.as_mut() else {
+                .map_err(|_| SessionError::protocol("worker state lock poisoned"))?;
+            let Some(runtime) = state.runtime.as_mut() else {
                 return Ok(());
             };
             expire_requests(runtime);
@@ -2646,22 +2602,21 @@ mod unix {
     fn expire_requests(runtime: &mut Runtime) {
         let now = Instant::now();
         let mut expired = Vec::new();
-        let mut pending = Vec::with_capacity(runtime.pending_requests.len());
-        for request in runtime.pending_requests.drain(..) {
+        runtime.pending_requests.retain(|request| {
             if request.expires_at <= now {
                 expired.push((request.request.id(), request.request.kind()));
                 release_request_slot(&runtime.pending_request_slots);
+                false
             } else {
-                pending.push(request);
+                true
             }
-        }
-        runtime.pending_requests = pending;
+        });
         for (request_id, kind) in expired {
             push_event(runtime, SessionEvent::RequestExpired { request_id, kind });
         }
     }
 
-    fn push_event(runtime: &mut Runtime, mut event: SessionEvent) -> bool {
+    fn push_event(runtime: &mut Runtime, event: SessionEvent) -> bool {
         if let Some(request_id) = terminal_request_event_id(&event) {
             if runtime
                 .pending_events
@@ -2730,7 +2685,7 @@ mod unix {
             let removable = runtime
                 .pending_events
                 .iter()
-                .position(|pending| !is_critical(pending));
+                .position(|pending| !pending.is_critical());
             if let Some(index) = removable {
                 let _ = runtime.pending_events.remove(index);
             } else if matches!(event, SessionEvent::ClipboardStore { .. }) {
@@ -2741,7 +2696,10 @@ mod unix {
                 {
                     return true;
                 }
-                event = SessionEvent::ClipboardOverflow;
+                // Keep the queue bounded when every slot already contains a
+                // critical event. Existing lifecycle/request events win over
+                // an additional overflow notification.
+                return false;
             } else {
                 if matches!(
                     event,
@@ -2756,23 +2714,6 @@ mod unix {
         }
         runtime.pending_events.push_back(event);
         true
-    }
-
-    fn is_critical(event: &SessionEvent) -> bool {
-        matches!(
-            event,
-            SessionEvent::ChildExited { .. }
-                | SessionEvent::ClipboardOverflow
-                | SessionEvent::ClipboardLoad { .. }
-                | SessionEvent::ColorRequest { .. }
-                | SessionEvent::TextAreaSizeRequest { .. }
-                | SessionEvent::GlyphProtocolQuery { .. }
-                | SessionEvent::ColorChange { .. }
-                | SessionEvent::RequestRefused { .. }
-                | SessionEvent::RequestExpired { .. }
-                | SessionEvent::DesktopNotification { .. }
-                | SessionEvent::Closed
-        )
     }
 
     fn terminal_request_event_id(event: &SessionEvent) -> Option<u64> {
@@ -2792,23 +2733,22 @@ mod unix {
     ) -> Result<(), SessionError> {
         let mut messages = Vec::new();
         {
-            let _gate = shared
-                .gate
+            let mut state = shared
+                .state
                 .lock()
                 .map_err(|_| SessionError::protocol("worker state lock poisoned"))?;
-            if !is_active(shared, generation) {
+            if !state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.generation == generation)
+            {
                 return Ok(());
             }
-            let mut runtime = shared
-                .runtime
-                .lock()
-                .map_err(|_| SessionError::protocol("worker runtime lock poisoned"))?;
-            let Some(runtime) = runtime.as_mut() else {
+            let Some(runtime) = state.runtime.as_mut() else {
                 return Ok(());
             };
-            if runtime.frame_pending {
+            if runtime.frame_pending && push_event(runtime, SessionEvent::FrameReady) {
                 runtime.frame_pending = false;
-                push_event(runtime, SessionEvent::FrameReady);
             }
             messages.extend(
                 runtime
@@ -2820,7 +2760,7 @@ mod unix {
         let critical = messages
             .iter()
             .filter_map(|message| match message {
-                ServerMessage::Event { event, .. } if is_critical(event) => {
+                ServerMessage::Event { event, .. } if event.is_critical() => {
                     Some(event.clone())
                 }
                 _ => None,
@@ -2841,13 +2781,8 @@ mod unix {
     }
 
     fn requeue_critical(shared: &Shared, events: Vec<SessionEvent>) {
-        let Ok(_gate) = shared.gate.lock() else {
-            return;
-        };
-        let Ok(mut runtime) = shared.runtime.lock() else {
-            return;
-        };
-        if let Some(runtime) = runtime.as_mut() {
+        let mut state = shared.state.lock().expect("worker state lock poisoned");
+        if let Some(runtime) = state.runtime.as_mut() {
             for event in events {
                 push_event(runtime, event);
             }
@@ -3074,12 +3009,12 @@ mod unix {
             critical_receiver,
             delegate,
         ));
-        *shared.active.lock().unwrap() = Some(Active {
+        let mut state = shared.state.lock().unwrap();
+        state.active = Some(Active {
             generation: 1,
             connection_fd: -1,
         });
-        shared.set_idle(false);
-        let gate = shared.gate.lock().unwrap();
+        state.idle_since = None;
         let (started, waiting) = mpsc::sync_channel(1);
         let (done, finished) = mpsc::sync_channel(1);
         let other = shared.clone();
@@ -3090,20 +3025,21 @@ mod unix {
         });
         waiting.recv().unwrap();
         assert!(finished.recv_timeout(Duration::from_millis(50)).is_err());
-        *shared.active.lock().unwrap() = Some(Active {
+        let mut state = state;
+        state.active = Some(Active {
             generation: 2,
             connection_fd: -1,
         });
-        shared.set_idle(false);
-        drop(gate);
+        state.idle_since = None;
+        drop(state);
         thread.join().unwrap();
-        assert!(shared.idle_since.lock().unwrap().is_none());
+        assert!(shared.state.lock().unwrap().idle_since.is_none());
         assert!(is_active(&shared, 2));
         detach(&shared, 2);
-        assert!(shared.idle_since.lock().unwrap().is_some());
-        assert!(!shared.expired());
-        *shared.idle_since.lock().unwrap() = Some(Instant::now() - IDLE_RETENTION);
-        assert!(shared.expired());
+        assert!(shared.state.lock().unwrap().idle_since.is_some());
+        assert!(!shared.expire_if_idle());
+        shared.state.lock().unwrap().idle_since = Some(Instant::now() - IDLE_RETENTION);
+        assert!(shared.expire_if_idle());
     }
 
     pub fn read_capability() -> Result<[u8; 32], SessionError> {

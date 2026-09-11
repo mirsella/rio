@@ -739,6 +739,19 @@ enum ImageTexture {
     Vulkan(vulkan::VulkanImageTexture),
 }
 
+#[cfg(feature = "wgpu")]
+impl ImageTexture {
+    fn wgpu_view(&self) -> Option<&wgpu::TextureView> {
+        match self {
+            Self::Wgpu { view, .. } => Some(view),
+            #[cfg(target_os = "macos")]
+            Self::Metal(_) => None,
+            #[cfg(target_os = "linux")]
+            Self::Vulkan(_) => None,
+        }
+    }
+}
+
 /// Per-image texture entry stored in the renderer.
 struct ImageTextureEntry {
     gpu: ImageTexture,
@@ -1987,7 +2000,7 @@ impl Renderer {
             // vertex buffer, reuses the kitty image pipeline + sampler.
             if matches!(part, WgpuRenderPart::Images(ImageLayer::BelowBg)) {
                 if let Some(bg_tex) = background_image_texture.as_ref() {
-                    if let ImageTexture::Wgpu { view, .. } = &bg_tex.gpu {
+                    if let Some(view) = bg_tex.gpu.wgpu_view() {
                         let instance = ImageInstance {
                             dest_pos: [0.0, 0.0],
                             dest_size: [ctx.size.width, ctx.size.height],
@@ -2058,7 +2071,7 @@ impl Renderer {
                             continue;
                         }
                         if let Some(img) = image_textures.get(&draw.image_id) {
-                            if let ImageTexture::Wgpu { view, .. } = &img.gpu {
+                            if let Some(view) = img.gpu.wgpu_view() {
                                 let bg = ctx.device.create_bind_group(
                                     &wgpu::BindGroupDescriptor {
                                         label: None,
