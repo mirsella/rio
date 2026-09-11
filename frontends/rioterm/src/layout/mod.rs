@@ -177,6 +177,16 @@ impl<T: rio_backend::event::EventListener> ContextGridItem<T> {
     }
 }
 
+fn recover_contexts<T: EventListener>(
+    by_route: FxHashMap<usize, Context<T>>,
+    inner: FxHashMap<NodeId, ContextGridItem<T>>,
+) -> Vec<Context<T>> {
+    by_route
+        .into_values()
+        .chain(inner.into_values().map(|item| item.val))
+        .collect()
+}
+
 struct LayoutBuildContext<'a> {
     tree: &'a mut TaffyTree<()>,
     panel_style: &'a Style,
@@ -399,6 +409,10 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         route_ids
     }
 
+    pub(crate) fn take_contexts(self) -> Vec<Context<T>> {
+        self.inner.into_values().map(|item| item.val).collect()
+    }
+
     pub fn owns_session_id(&self, session_id: rio_session::protocol::SessionId) -> bool {
         self.inner.values().any(|item| {
             item.val
@@ -595,13 +609,13 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         for (route_id, node) in leaves {
             let Some(target_route) = route_map.get(&route_id).copied() else {
                 return Err((
-                    by_route.into_values().collect(),
+                    recover_contexts(by_route, inner),
                     format!("transfer layout has no target route for {route_id}"),
                 ));
             };
             let Some(context) = by_route.remove(&target_route) else {
                 return Err((
-                    by_route.into_values().collect(),
+                    recover_contexts(by_route, inner),
                     format!("transfer layout has no context for route {route_id}"),
                 ));
             };
@@ -609,7 +623,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
         if !by_route.is_empty() {
             return Err((
-                by_route.into_values().collect(),
+                recover_contexts(by_route, inner),
                 "transfer layout has unused contexts".into(),
             ));
         }
@@ -619,7 +633,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
                 .is_some_and(|route| item.val.route_id == *route)
                 .then_some(*node)
         }) else {
-            let contexts = inner.into_values().map(|item| item.val).collect();
+            let contexts = recover_contexts(by_route, inner);
             return Err((contexts, "transfer layout active route is missing".into()));
         };
         let root = inner.keys().next().copied();
@@ -644,8 +658,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             border_config,
         };
         if !grid.apply_taffy_layout() {
-            let contexts = grid.inner.into_values().map(|item| item.val).collect();
-            return Err((contexts, "apply transfer layout failed".into()));
+            return Err((grid.take_contexts(), "apply transfer layout failed".into()));
         }
         Ok(grid)
     }
