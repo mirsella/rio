@@ -12,7 +12,49 @@ concurrency:
   group: release-${{ github.event_name }}-${{ github.ref_name }}
   cancel-in-progress: true
 jobs:
+  verify-release-credentials:
+    name: Verify release credentials
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
+      MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+      MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+      MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+      MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      MACOS_NOTARY_KEYCHAIN_PROFILE: ${{ secrets.MACOS_NOTARY_KEYCHAIN_PROFILE }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - name: Check required credentials
+        shell: bash
+        run: |
+          missing=()
+          for name in \
+            GORELEASER_KEY \
+            MACOS_SIGN_P12 \
+            MACOS_SIGN_PASSWORD \
+            MACOS_NOTARY_ISSUER_ID \
+            MACOS_NOTARY_KEY \
+            MACOS_NOTARY_KEY_ID \
+            KEYCHAIN_PASSWORD \
+            MACOS_NOTARY_KEYCHAIN_PROFILE; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if [[ "$GITHUB_REF" == refs/tags/v* && -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            missing+=("CARGO_REGISTRY_TOKEN")
+          fi
+
+          if ((${#missing[@]})); then
+            echo "::error title=Missing release credentials::Configure these repository secrets: ${missing[*]}"
+            exit 1
+          fi
+
   build:
+    needs: verify-release-credentials
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
