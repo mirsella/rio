@@ -33,6 +33,7 @@ jobs:
   lints:
     name: Build
     strategy:
+      fail-fast: false
       matrix:
         # Both Linux arches so the cachix cache serves x86_64 users too,
         # not just the arm runner's own architecture.
