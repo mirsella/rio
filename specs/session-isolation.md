@@ -96,7 +96,7 @@ writers, so reconnect/reclaim of the current generation is the recovery path.
 
 ## Input and view boundaries
 
-Raw `Write` and `Paste` are not a substitute for key semantics. The v3 `Key`
+Raw `Write` and `Paste` are not a substitute for key semantics. The v4 `Key`
 command uses platform-neutral key types and lets the worker's terminal core
 perform mode/Kitty/Alt-meta encoding.
 
@@ -145,8 +145,13 @@ the repository acceptance harness, not by a unit test alone.
 ## Cross-window transfer and recovery
 
 Moving a tab or split between windows is not renderer-buffer handoff. Rio uses a
-distinct authenticated window-control protocol. The same prepared attachment
-path is used when a compositor explicitly chooses a saved recovery descriptor:
+distinct authenticated window-control protocol. The current channel is
+**WindowControl v4**, separate from the session wire protocol v4 even though
+both currently use version number 4. Its bounded transfer request carries the
+target insertion index; the destination validates that index against the live
+terminal route and rejects stale targets before commit. The same prepared
+attachment path is used when a compositor explicitly chooses a saved recovery
+descriptor:
 
 1. Each compositor exposes an authenticated discovery endpoint. The source and
    destination exchange a transferable tab/split layout plus session IDs and
@@ -292,16 +297,36 @@ terminal-content crops for deterministic text, cursor, alternate-screen,
 Kitty, Sixel, OSC-4 palette mutation, and advanced underline states in plain
 and configured-filter phases, and records bounded 600-frame workloads with
 process and Radeon activity samples. It asserts dedicated palette/underline
-regions, not just capture-file existence. GPU selection capture is available
+regions with expected-color pixel counts as well as AE deltas, not just
+capture-file existence. The unfiltered current and upstream variants also assert
+the fixture's known Kitty 2x2 RGBA quadrants (red, green, blue, and white) and
+Sixel red/blue bands at fixed content geometry; filtered variants intentionally
+use AE only because the filter changes those canonical colors. GPU selection capture is available
 only under private Xvfb/KWin-X11 mode, where the public SelectAll binding is
 driven through that display; virtual KWin runs report GPU selection as
-unverified. `RIO_ACCEPT_GPU_SELECTION_ONLY=1` selection-only mode uses the WGPU
-backend to avoid the native
-Vulkan X11-surface limitation and still requires positive AE changes in both a
-dedicated selection region and the content crop. The comparison is content-crop
-AE evidence rather than whole-window equality; IME preedit/commit capture is
-unsupported because no private text-input injector is available, and native
-keyboard injection remains unverified.
+unverified. `RIO_ACCEPT_GPU_SELECTION_ONLY=1` requests the WGPU backend and
+still requires positive AE changes in both a dedicated selection region and the
+content crop. On the current host, native Wayland selection remains unverified:
+the private KWin compositor exposes no virtual-keyboard/text-input injector,
+and an X11-client retry failed at `Surface::configure` because KWin/Xvfb
+reported no DRI3 presentation support. A host-window XTest event is not
+selection evidence. The comparison is content-crop AE and expected-pixel
+evidence rather than whole-window equality. Wayland text-input-v3 and
+input-method-v1 protocol XML, Qt's input-method XML, and KWin's
+`--inputmethod` option are installed, but no ready private input-method server
+or canonical IME helper is available. `fcitx5`, `ibus`, `wtype`, `xvkbd`, and a
+Wayland virtual-keyboard injector are absent; `ydotool`/`ydotoold` use global
+uinput and do not generate isolated preedit events. A private input-method
+server remains feasible but was not added, so IME preedit/commit is unverified
+and native keyboard injection remains unverified. Profile markers, CPU/RSS
+samples, and RadeonTop activity are not presentation timing. The repeatable
+private `vkcube --wsi wayland --display_timing --c 60` probe selected the AMD
+Radeon 780M but reported `VK_GOOGLE_display_timing extension NOT AVAILABLE`;
+MangoHud, PresentMon, vkmark, and RenderDoc are also absent. The private
+KWin/Xvfb path and current Rio logs therefore expose no presentation or
+swapchain-completion timestamps, so the harness makes no FPS, frame-latency,
+or input-latency claim. A future Wayland frame-callback probe would measure
+compositor callback intervals, not Rio swapchain presentation or input latency.
 
 For focused direct-render visual evidence, use
 `scripts/session-isolation-visual-parity.sh`. It compares real current and
@@ -402,10 +427,12 @@ the current PTY backend; neither limitation may be silently dropped.
 ### M1 — Standalone worker/client foundation (complete on Linux)
 
 - [x] Worker owns the PTY/parser/grid and survives client detach on Linux.
-- [x] v3 bounded/authenticated protocol, generation-fenced takeover, explicit
-      close, final child status, and hostile transport cases are tested on
-      Linux.
-- [ ] Full desktop terminal/input/graphics parity and exact PTY queue bounds.
+- [x] v4 bounded/authenticated protocol, generation-fenced takeover, explicit
+       close, final child status, and hostile transport cases are tested on
+       Linux.
+- [x] PTY input queue and selection extraction are bounded before upstream
+      allocation.
+- [ ] Full desktop terminal/input/graphics parity.
 
 ### M2 — Compositor-facing frontend adapter (complete on Linux)
 
@@ -455,9 +482,9 @@ isolation claim is valid until those paths stop reaching `Crosswords`.
 - [x] Window/compositor failures leave detached workers available for recovery.
 - [x] Cross-window transfer handles partial per-session commits without two
        writers or exposing capabilities in drag payloads.
-- [ ] Interrupted selected-tab transfer acceptance passes with the current
+- [x] Interrupted selected-tab transfer acceptance passes with the current
        frontend after the selected-tab ownership fix.
-- [ ] PTY input and selection serialization are bounded before upstream
-      allocation.
+- [x] PTY input and selection serialization are bounded before upstream
+       allocation; broad desktop input/selection parity remains open.
 - [ ] macOS/BSD transport behavior is separately validated; Windows transport is
       unsupported.

@@ -62,6 +62,27 @@ with an AMD/Vulkan hardware summary. It does not claim native Wayland pointer
 or drag input. Native Wayland drag remains a separate capability check requiring
 a private nested compositor and a native Wayland input/drag driver; X11 tools
 are not evidence for that path.
+`scripts/session-isolation-wayland-visual-parity.sh` compares current and
+upstream WGPU binaries using the existing graphics fixture for OSC-4, Kitty,
+Sixel, alternate-screen, cursor, filter, and advanced-underline states. It
+checks dedicated regions with expected-color pixel predicates and AE deltas;
+the unfiltered current/upstream variants additionally check the fixture's known
+Kitty red/green/blue/white quadrants and Sixel red/blue bands at fixed content
+geometry. Filtered variants intentionally retain AE-only graphics evidence
+because the filter changes those canonical colors. The harness does not claim
+whole-window pixel identity. Wayland text-input-v3/input-method-v1 and Qt
+input-method protocol XML plus KWin's `--inputmethod` option are installed,
+but no ready private input-method server or canonical IME helper is available;
+`fcitx5`, `ibus`, `wtype`, `xvkbd`, and a virtual-keyboard injector are absent,
+while `ydotool` is global uinput. A private input-method server remains
+feasible but was not added, so IME preedit/commit and GPU selection remain
+unverified when the private compositor has no suitable input path. Profile
+frames and CPU/RSS/Radeon activity are bounded workload evidence only. The
+repeatable private `vkcube --wsi wayland --display_timing --c 60` probe selected
+the AMD Radeon 780M but reported `VK_GOOGLE_display_timing extension NOT
+AVAILABLE`; MangoHud, PresentMon, vkmark, and RenderDoc are absent. The
+private KWin/Xvfb setup therefore exposes no presentation timestamps, so this
+harness makes no FPS, frame-latency, or input-latency claim.
 `scripts/session-isolation-wayland-x11-pointer-acceptance.sh` is a stricter
 pointer probe: it hosts KWin's X11 backend on a private Xvfb display, applies the
 known private keymap, and injects global XTest events only into that display. It
@@ -71,9 +92,10 @@ Wayland injector.
 `scripts/session-isolation-wayland-dnd-acceptance.sh` separately exercises the
 current native Wayland drag path through that private KWin/Xvfb setup. It records
 target-local drag events, direct-frame readiness, authenticated opaque-token
-commit, source GUI exit, and survival of the transferred worker and shell. It
-does not claim post-drop keyboard ACK delivery because this compositor setup has
-no reliable native keyboard injector.
+commit, source GUI exit, survival of the transferred worker and shell, and a
+fresh post-drop ACK through private primary-selection middle-click input. It
+does not claim native post-drop keyboard ACK delivery because this compositor
+setup has no reliable native keyboard injector.
 `scripts/session-isolation-worker-kill-acceptance.sh` kills one recorded
 session-worker in a private two-tab GUI and verifies the other pane's fresh ACK
 and GUI continuity. It then closes the killed tab and the remaining tab through
