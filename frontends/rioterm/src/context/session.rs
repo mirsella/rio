@@ -25,6 +25,8 @@ use rio_session::protocol::{
     SelectionSide as WireSelectionSide, SessionCommand, SessionDescriptor, SessionEvent,
     SessionReply, StyleFrame, ViMotion as WireViMotion,
 };
+#[cfg(unix)]
+use rio_session::readiness::Readiness;
 use rio_session::{PreparedSessionAttachment, SessionClient, SessionError, SessionSpec};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
@@ -32,6 +34,7 @@ use std::ops::{Index, IndexMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+#[cfg(all(test, unix))]
 use std::time::Duration;
 
 const COMMAND_QUEUE_SIZE: usize = 256;
@@ -40,6 +43,91 @@ const FRAME_UPDATE_QUEUE_SIZE: usize = 64;
 
 type SelectionTextResult = (ClipboardType, Option<String>, bool);
 
+#[cfg(unix)]
+type CommandWakeup = Readiness;
+
+#[cfg(not(unix))]
+struct CommandWakeup;
+
+fn new_command_wakeup() -> Result<Arc<CommandWakeup>, SessionError> {
+    #[cfg(unix)]
+    {
+        Ok(Arc::new(CommandWakeup::new()?))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Arc::new(CommandWakeup))
+    }
+}
+
+struct CommandChannel {
+    sender: Option<mpsc::SyncSender<PumpCommand>>,
+    wakeup: Arc<CommandWakeup>,
+}
+
+impl Drop for CommandChannel {
+    fn drop(&mut self) {
+        // Disconnect the channel before waking the pump so it cannot observe
+        // an empty queue while the last sender is still being destroyed.
+        let sender = self.sender.take();
+        drop(sender);
+        #[cfg(unix)]
+        self.wakeup.signal();
+    }
+}
+
+#[derive(Clone)]
+struct CommandSender {
+    channel: Arc<CommandChannel>,
+}
+
+impl CommandSender {
+    fn new(sender: mpsc::SyncSender<PumpCommand>, wakeup: Arc<CommandWakeup>) -> Self {
+        Self {
+            channel: Arc::new(CommandChannel {
+                sender: Some(sender),
+                wakeup,
+            }),
+        }
+    }
+
+    fn try_send(
+        &self,
+        command: PumpCommand,
+    ) -> Result<(), mpsc::TrySendError<PumpCommand>> {
+        let result = self
+            .channel
+            .sender
+            .as_ref()
+            .expect("command sender missing")
+            .try_send(command);
+        if result.is_ok() {
+            #[cfg(unix)]
+            self.signal();
+        }
+        result
+    }
+
+    #[cfg(all(unix, test))]
+    fn send(&self, command: PumpCommand) -> Result<(), mpsc::SendError<PumpCommand>> {
+        let result = self
+            .channel
+            .sender
+            .as_ref()
+            .expect("command sender missing")
+            .send(command);
+        if result.is_ok() {
+            self.signal();
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    fn signal(&self) {
+        self.channel.wakeup.signal();
+    }
+}
+
 #[derive(Debug)]
 enum PumpCommand {
     Terminal(SessionCommand),
@@ -47,6 +135,12 @@ enum PumpCommand {
         target: ClipboardType,
         copy_to_clipboard: bool,
     },
+}
+
+enum PumpStartup {
+    Frame(Box<FullFrame>),
+    Sequence(u64),
+    Snapshot,
 }
 
 #[derive(Debug, Default)]
@@ -63,15 +157,20 @@ struct FrameMailbox {
 }
 
 #[derive(Debug)]
+enum SessionStatus {
+    Running(Option<String>),
+    Closed(Option<String>),
+}
+
+#[derive(Debug)]
 struct SessionState {
     frames: Mutex<FrameMailbox>,
     events: Mutex<VecDeque<SessionEvent>>,
-    error: Mutex<Option<String>>,
+    status: Mutex<SessionStatus>,
     descriptor: Mutex<Option<SessionDescriptor>>,
     selection_text: Mutex<SelectionTextQueue>,
     search_navigation: Mutex<Option<SearchNavigation>>,
     search_matches: Mutex<Option<Vec<SearchMatch>>>,
-    closed: AtomicBool,
     pump_done: AtomicBool,
     frame_resync_logged: AtomicBool,
 }
@@ -81,43 +180,37 @@ impl SessionState {
         Self {
             frames: Mutex::new(FrameMailbox::default()),
             events: Mutex::new(VecDeque::new()),
-            error: Mutex::new(None),
+            status: Mutex::new(SessionStatus::Running(None)),
             descriptor: Mutex::new(None),
             selection_text: Mutex::new(SelectionTextQueue::default()),
             search_navigation: Mutex::new(None),
             search_matches: Mutex::new(None),
-            closed: AtomicBool::new(false),
             pump_done: AtomicBool::new(false),
             frame_resync_logged: AtomicBool::new(false),
         }
     }
 
     fn fail(&self, error: SessionError) {
-        if let Ok(mut slot) = self.error.lock() {
-            *slot = Some(error.to_string());
-        }
-        self.closed.store(true, Ordering::Release);
+        *self.status.lock().expect("session status lock poisoned") =
+            SessionStatus::Closed(Some(error.to_string()));
     }
 
     fn record_error(&self, error: SessionError) {
-        if let Ok(mut slot) = self.error.lock() {
+        if let SessionStatus::Running(slot) =
+            &mut *self.status.lock().expect("session status lock poisoned")
+        {
             *slot = Some(error.to_string());
+        }
+    }
+
+    fn error(&self) -> Option<String> {
+        match &*self.status.lock().expect("session status lock poisoned") {
+            SessionStatus::Running(error) | SessionStatus::Closed(error) => error.clone(),
         }
     }
 
     fn publish_frame(&self, frame: FullFrame) {
-        if let Ok(mut mailbox) = self.frames.lock() {
-            mailbox.updates.clear();
-            mailbox.pending_full = Some(frame);
-        }
-        self.frame_resync_logged.store(false, Ordering::Release);
-        // A successfully published frame proves that a recoverable command
-        // error is no longer the current state of the pane.
-        if !self.closed.load(Ordering::Acquire) {
-            if let Ok(mut error) = self.error.lock() {
-                *error = None;
-            }
-        }
+        self.publish_frame_update(FrameUpdate::Full(frame));
     }
 
     fn publish_frame_update(&self, update: FrameUpdate) -> bool {
@@ -129,16 +222,22 @@ impl SessionState {
                 mailbox.updates.clear();
                 mailbox.pending_full = Some(frame);
                 self.frame_resync_logged.store(false, Ordering::Release);
-                true
             }
             update => {
                 if mailbox.updates.len() >= FRAME_UPDATE_QUEUE_SIZE {
                     return false;
                 }
                 mailbox.updates.push_back(update);
-                true
             }
         }
+        drop(mailbox);
+        // Both full snapshots and deltas confirm recovery; rejected updates do not.
+        if let SessionStatus::Running(error) =
+            &mut *self.status.lock().expect("session status lock poisoned")
+        {
+            *error = None;
+        }
+        true
     }
 
     fn take_frame_updates(&self) -> (Option<FullFrame>, Vec<FrameUpdate>) {
@@ -175,7 +274,10 @@ impl SessionState {
 
     fn publish_event(&self, event: SessionEvent) {
         if let SessionEvent::Closed = event {
-            self.closed.store(true, Ordering::Release);
+            let mut status = self.status.lock().expect("session status lock poisoned");
+            if let SessionStatus::Running(error) = &mut *status {
+                *status = SessionStatus::Closed(error.take());
+            }
         }
         if let Ok(mut events) = self.events.lock() {
             match &event {
@@ -241,7 +343,7 @@ impl SessionState {
 /// A cloneable command/event handle retained by a GUI context.
 #[derive(Clone)]
 pub struct SessionHandle {
-    commands: mpsc::SyncSender<PumpCommand>,
+    commands: CommandSender,
     state: Arc<SessionState>,
     window_id: Arc<Mutex<WindowId>>,
     // Serializes command admission and the pump's empty-queue/close decision.
@@ -277,6 +379,9 @@ impl SessionHandle {
         let window_for_thread_clone = Arc::clone(&window_for_thread);
         let closed = Arc::new(Mutex::new(false));
         let closed_for_thread = Arc::clone(&closed);
+        let command_wakeup = new_command_wakeup()?;
+        let command_wakeup_for_thread = Arc::clone(&command_wakeup);
+        let commands = CommandSender::new(commands, Arc::clone(&command_wakeup));
         let listener = event_proxy.with_window_target(WindowTarget::dynamic(window_id));
 
         thread::Builder::new()
@@ -296,7 +401,7 @@ impl SessionHandle {
                     }
                 };
                 let client = match SessionClient::spawn_with_worker_path(spec, worker) {
-                    Ok(client) => Arc::new(client),
+                    Ok(client) => client,
                     Err(error) => {
                         state_for_thread.fail(error);
                         state_for_thread.pump_done.store(true, Ordering::Release);
@@ -308,6 +413,23 @@ impl SessionHandle {
                         return;
                     }
                 };
+                let startup = {
+                    #[cfg(unix)]
+                    {
+                        match client
+                            .take_initial_frame()
+                            .expect("session initial frame lock poisoned")
+                        {
+                            Some(frame) => PumpStartup::Frame(Box::new(frame)),
+                            None => PumpStartup::Snapshot,
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        PumpStartup::Snapshot
+                    }
+                };
+                let client = Arc::new(client);
                 state_for_thread.publish_descriptor(client.descriptor().clone());
                 let pump = SessionPump {
                     client,
@@ -317,8 +439,9 @@ impl SessionHandle {
                     route_id,
                     window_id: window_for_thread_clone,
                     closed: closed_for_thread,
+                    command_wakeup: command_wakeup_for_thread,
                 };
-                pump.run(None);
+                pump.run(startup);
             })
             .map_err(SessionError::from)?;
 
@@ -336,11 +459,13 @@ impl SessionHandle {
     pub fn disconnected_with_error(error: SessionError) -> Self {
         let (commands, receiver) = mpsc::sync_channel(1);
         drop(receiver);
+        let command_wakeup =
+            new_command_wakeup().expect("failed to create session command wakeup");
         let state = Arc::new(SessionState::new());
         state.fail(error);
         state.pump_done.store(true, Ordering::Release);
         Self {
-            commands,
+            commands: CommandSender::new(commands, command_wakeup),
             state,
             window_id: Arc::new(Mutex::new(WindowId::from(0))),
             closed: Arc::new(Mutex::new(true)),
@@ -364,19 +489,19 @@ impl SessionHandle {
     }
 
     fn enqueue_command(&self, command: PumpCommand) -> Result<(), SessionError> {
-        let closed = self.closed.lock().expect("session admission lock poisoned");
-        if *closed {
-            return Err(SessionError::Detached);
+        let result = {
+            let closed = self.closed.lock().expect("session admission lock poisoned");
+            if *closed {
+                return Err(SessionError::Detached);
+            }
+            self.commands.try_send(command)
         }
-        let result = self
-            .commands
-            .try_send(command)
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => {
-                    SessionError::Invalid("session command queue is full".to_string())
-                }
-                mpsc::TrySendError::Disconnected(_) => SessionError::Detached,
-            });
+        .map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => {
+                SessionError::Invalid("session command queue is full".to_string())
+            }
+            mpsc::TrySendError::Disconnected(_) => SessionError::Detached,
+        });
         if let Err(error) = &result {
             self.state
                 .record_error(SessionError::Invalid(error.to_string()));
@@ -391,7 +516,19 @@ impl SessionHandle {
     pub fn close(&self) {
         // Close cannot be rejected by a full data queue. The pump drains all
         // admitted commands before issuing it, even if every sender is gone.
-        *self.closed.lock().expect("session admission lock poisoned") = true;
+        let should_wake = {
+            let mut closed = self.closed.lock().expect("session admission lock poisoned");
+            if *closed {
+                false
+            } else {
+                *closed = true;
+                true
+            }
+        };
+        if should_wake {
+            #[cfg(unix)]
+            self.commands.signal();
+        }
     }
 
     pub fn pump_done(&self) -> bool {
@@ -405,7 +542,7 @@ impl SessionHandle {
     }
 
     pub fn error(&self) -> Option<String> {
-        self.state.error.lock().ok().and_then(|error| error.clone())
+        self.state.error()
     }
 
     pub fn descriptor(&self) -> Option<SessionDescriptor> {
@@ -437,6 +574,10 @@ impl SessionHandle {
         let window_for_thread_clone = Arc::clone(&window_for_thread);
         let closed = Arc::new(Mutex::new(false));
         let closed_for_thread = Arc::clone(&closed);
+        let command_wakeup =
+            new_command_wakeup().expect("failed to create session command wakeup");
+        let command_wakeup_for_thread = Arc::clone(&command_wakeup);
+        let commands = CommandSender::new(commands, Arc::clone(&command_wakeup));
         let listener = event_proxy.with_window_target(WindowTarget::dynamic(window_id));
         let state_for_thread = Arc::clone(&state);
         let client = Arc::new(client);
@@ -451,8 +592,9 @@ impl SessionHandle {
                     route_id,
                     window_id: window_for_thread_clone,
                     closed: closed_for_thread,
+                    command_wakeup: command_wakeup_for_thread,
                 }
-                .run(Some(initial_sequence));
+                .run(PumpStartup::Sequence(initial_sequence));
             })
             .expect("failed to start imported session pump");
         Self {
@@ -470,7 +612,7 @@ impl SessionHandle {
         PreparedSession {
             initial_frame: Some(attachment.initial_frame().clone()),
             had_active_owner: attachment.had_active_owner(),
-            attachment: Some(attachment),
+            attachment,
         }
     }
 
@@ -546,13 +688,19 @@ struct SessionPump<T: EventListener + Clone + Send + 'static> {
     route_id: usize,
     window_id: Arc<Mutex<WindowId>>,
     closed: Arc<Mutex<bool>>,
+    command_wakeup: Arc<CommandWakeup>,
 }
 
 impl<T: EventListener + Clone + Send + 'static> SessionPump<T> {
-    fn run(self, initial_sequence: Option<u64>) {
-        let mut frame_sequence = match initial_sequence {
-            Some(sequence) => sequence,
-            None => match self.client.snapshot() {
+    fn run(self, startup: PumpStartup) {
+        let mut frame_sequence = match startup {
+            PumpStartup::Frame(frame) => {
+                let sequence = frame.sequence;
+                self.state.publish_frame(*frame);
+                sequence
+            }
+            PumpStartup::Sequence(sequence) => sequence,
+            PumpStartup::Snapshot => match self.client.snapshot() {
                 Ok(frame) => {
                     let sequence = frame.sequence;
                     self.state.publish_frame(frame);
@@ -569,6 +717,8 @@ impl<T: EventListener + Clone + Send + 'static> SessionPump<T> {
         self.notify();
 
         loop {
+            #[cfg(unix)]
+            self.command_wakeup.clear();
             loop {
                 let command = {
                     let closed =
@@ -634,7 +784,16 @@ impl<T: EventListener + Clone + Send + 'static> SessionPump<T> {
                     self.notify();
                 }
                 Ok(None) => {
-                    thread::sleep(Duration::from_millis(1));
+                    #[cfg(unix)]
+                    if let Err(error) =
+                        self.client.wait_for_activity(&self.command_wakeup)
+                    {
+                        self.state.fail(error);
+                        self.notify();
+                        return;
+                    }
+                    #[cfg(not(unix))]
+                    unreachable!("session workers are unsupported on non-Unix");
                 }
                 Err(error) => {
                     self.state.fail(error);
@@ -772,7 +931,7 @@ fn recoverable_command_rejection(error: &SessionError, poisoned: bool) -> bool {
 }
 
 pub struct PreparedSession {
-    attachment: Option<PreparedSessionAttachment>,
+    attachment: PreparedSessionAttachment,
     initial_frame: Option<FullFrame>,
     had_active_owner: bool,
 }
@@ -794,11 +953,8 @@ impl PreparedSession {
         self.had_active_owner
     }
 
-    pub fn commit(mut self) -> Result<SessionClient, SessionError> {
-        self.attachment
-            .take()
-            .expect("prepared session was already committed")
-            .commit()
+    pub fn commit(self) -> Result<SessionClient, SessionError> {
+        self.attachment.commit()
     }
 }
 
@@ -1485,8 +1641,12 @@ impl RemoteView {
         }
     }
 
-    pub fn paste(&mut self, text: String) {
-        self.enqueue(SessionCommand::Paste(text));
+    pub fn paste(&mut self, text: String, bracketed: bool) {
+        if bracketed {
+            self.enqueue(SessionCommand::Paste(text));
+        } else {
+            self.enqueue(SessionCommand::Write(text.into_bytes()));
+        }
     }
 
     pub fn focus(&mut self, focused: bool) {
@@ -2399,19 +2559,139 @@ mod tests {
         );
     }
 
+    #[test]
+    fn command_sender_disconnects_after_its_last_owner_drops() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let wakeup =
+            new_command_wakeup().expect("failed to create session command wakeup");
+        let first = CommandSender::new(sender, wakeup);
+        let second = first.clone();
+
+        drop(first);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(second);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_last_sender_drops_wake_a_blocked_waiter() {
+        use std::os::fd::{AsFd, AsRawFd};
+        use std::sync::Barrier;
+
+        for _ in 0..16 {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let wakeup =
+                new_command_wakeup().expect("failed to create session command wakeup");
+            let waiter_wakeup = Arc::clone(&wakeup);
+            let owner = CommandSender::new(sender, wakeup);
+            let first = owner.clone();
+            let second = owner.clone();
+            drop(owner);
+
+            let barrier = Arc::new(Barrier::new(3));
+            let first_barrier = Arc::clone(&barrier);
+            let first_thread = thread::spawn(move || {
+                first_barrier.wait();
+                drop(first);
+            });
+            let second_barrier = Arc::clone(&barrier);
+            let second_thread = thread::spawn(move || {
+                second_barrier.wait();
+                drop(second);
+            });
+            barrier.wait();
+
+            let mut poll_fds = [libc::pollfd {
+                fd: waiter_wakeup.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let ready = rio_session::readiness::wait(
+                &mut poll_fds,
+                Some(std::time::Instant::now() + Duration::from_secs(1)),
+            )
+            .unwrap();
+            assert_eq!(ready, 1);
+            assert!(rio_session::readiness::is_readable(poll_fds[0].revents));
+            waiter_wakeup.clear();
+            first_thread.join().unwrap();
+            second_thread.join().unwrap();
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+        }
+    }
+
+    #[test]
+    fn close_preserves_admitted_commands_when_queue_is_full() {
+        let (handle, receiver) = selection_test_handle(1);
+        handle.enqueue(SessionCommand::Snapshot).unwrap();
+        handle.close();
+        assert!(matches!(
+            handle.enqueue(SessionCommand::Snapshot),
+            Err(SessionError::Detached)
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(PumpCommand::Terminal(SessionCommand::Snapshot))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
     fn selection_test_handle(
         capacity: usize,
     ) -> (SessionHandle, mpsc::Receiver<PumpCommand>) {
         let (commands, receiver) = mpsc::sync_channel(capacity);
+        let command_wakeup =
+            new_command_wakeup().expect("failed to create session command wakeup");
         (
             SessionHandle {
-                commands,
+                commands: CommandSender::new(commands, command_wakeup),
                 state: Arc::new(SessionState::new()),
                 window_id: Arc::new(Mutex::new(WindowId::from(1))),
                 closed: Arc::new(Mutex::new(false)),
             },
             receiver,
         )
+    }
+
+    #[test]
+    fn paste_commands_preserve_raw_input_and_delegate_bracketed_paste() {
+        let (handle, receiver) = selection_test_handle(5);
+        let mut view = RemoteView::new(Some(handle), WindowId::from(1), 80, 24);
+
+        view.paste("\x7f".into(), false);
+        view.paste("\x1b[A".into(), false);
+        view.paste("\x1b]1337;SetMark\x07".into(), false);
+        view.paste("line\nraw".into(), false);
+        view.paste("line\ntext".into(), true);
+
+        for expected in [
+            SessionCommand::Write(b"\x7f".to_vec()),
+            SessionCommand::Write(b"\x1b[A".to_vec()),
+            SessionCommand::Write(b"\x1b]1337;SetMark\x07".to_vec()),
+            SessionCommand::Write(b"line\nraw".to_vec()),
+            SessionCommand::Paste("line\ntext".into()),
+        ] {
+            match receiver.try_recv().unwrap() {
+                PumpCommand::Terminal(command) => assert_eq!(command, expected),
+                PumpCommand::SelectionText { .. } => {
+                    panic!("unexpected selection command")
+                }
+            }
+        }
     }
 
     #[test]
@@ -2509,13 +2789,14 @@ mod tests {
                 route_id: 1,
                 window_id: Arc::clone(&handle.window_id),
                 closed: Arc::clone(&handle.closed),
+                command_wakeup: Arc::clone(&handle.commands.channel.wakeup),
             };
             // No sender or queue slot is needed to retain explicit close intent.
             drop(other);
             drop(handle);
             let (done, finished) = mpsc::sync_channel(1);
             let thread = thread::spawn(move || {
-                pump.run(None);
+                pump.run(PumpStartup::Snapshot);
                 done.send(()).unwrap();
             });
             finished
@@ -2570,8 +2851,9 @@ mod tests {
             route_id: 1,
             window_id: Arc::clone(&handle.window_id),
             closed: Arc::clone(&handle.closed),
+            command_wakeup: Arc::clone(&handle.commands.channel.wakeup),
         };
-        let thread = thread::spawn(move || pump.run(None));
+        let thread = thread::spawn(move || pump.run(PumpStartup::Snapshot));
         // All replies must be retained before the GUI consumes any of them.
         wait_for_review_condition(|| {
             handle.state.selection_text.lock().unwrap().replies.len() == 3
@@ -2647,6 +2929,9 @@ mod tests {
         });
         let state = Arc::new(SessionState::new());
         let (commands, receiver) = mpsc::sync_channel(COMMAND_QUEUE_SIZE);
+        let command_wakeup =
+            new_command_wakeup().expect("failed to create session command wakeup");
+        let commands = CommandSender::new(commands, Arc::clone(&command_wakeup));
         let pump = SessionPump {
             client: Arc::clone(&client),
             receiver,
@@ -2655,14 +2940,18 @@ mod tests {
             route_id: 1,
             window_id: Arc::new(Mutex::new(WindowId::from(1))),
             closed: Arc::new(Mutex::new(false)),
+            command_wakeup,
         };
         let (done, finished) = mpsc::sync_channel(1);
         let thread = thread::spawn(move || {
-            pump.run(None);
+            pump.run(PumpStartup::Snapshot);
             done.send(()).unwrap();
         });
-        wait_for_review_condition(|| state.error.lock().unwrap().is_some());
-        assert!(!state.closed.load(Ordering::Acquire));
+        wait_for_review_condition(|| state.error().is_some());
+        assert!(matches!(
+            *state.status.lock().unwrap(),
+            SessionStatus::Running(_)
+        ));
         // Explicit child output resets all graphics, including offscreen spans.
         commands
             .send(PumpCommand::Terminal(SessionCommand::Write(
@@ -2670,7 +2959,7 @@ mod tests {
             )))
             .unwrap();
         wait_for_review_condition(|| state.frames.lock().unwrap().pending_full.is_some());
-        assert!(state.error.lock().unwrap().is_none());
+        assert!(state.error().is_none());
         assert_eq!(client.child_pid().unwrap(), pid);
         drop(commands);
         finished
@@ -2890,6 +3179,73 @@ mod tests {
                 text: "x".into(),
             }],
         ));
-        assert!(state.error.lock().unwrap().is_none());
+        assert!(state.error().is_none());
+
+        state.record_error(SessionError::Invalid("temporary command failure".into()));
+        assert!(state.publish_frame_update(FrameUpdate::Full(frame(
+            2,
+            1,
+            vec![RowFrame {
+                cells: vec![CellFrame {
+                    content: CellContentFrame::Codepoint('y' as u32),
+                    wide: 0,
+                    flags: 0,
+                }],
+                styles: vec![default_style()],
+                extras: vec![None],
+                kitty_virtual_placeholder: false,
+                text: "y".into(),
+            }],
+        ))));
+        assert!(state.error().is_none());
+
+        state.record_error(SessionError::Invalid("temporary command failure".into()));
+        assert!(state.publish_frame_update(FrameUpdate::Delta(delta(2, 1, 2, vec![]))));
+        assert!(state.error().is_none());
+
+        for sequence in 3..(FRAME_UPDATE_QUEUE_SIZE as u64 + 2) {
+            assert!(state.publish_frame_update(FrameUpdate::Delta(delta(
+                2,
+                1,
+                sequence,
+                vec![]
+            ))));
+        }
+        state.record_error(SessionError::Invalid("retry needed".into()));
+        assert!(!state.publish_frame_update(FrameUpdate::Delta(delta(
+            2,
+            1,
+            FRAME_UPDATE_QUEUE_SIZE as u64 + 2,
+            vec![]
+        ))));
+        assert!(state.error().is_some());
+
+        state.take_frame_updates();
+        state.fail(SessionError::Protocol("worker disconnected".into()));
+        let failure = state.error();
+        assert!(state.publish_frame_update(FrameUpdate::Delta(delta(2, 1, 2, vec![]))));
+        state.record_error(SessionError::Invalid("late command rejection".into()));
+        state.publish_event(SessionEvent::Closed);
+        assert_eq!(state.error(), failure);
+    }
+
+    #[test]
+    fn closed_session_preserves_its_final_diagnostic() {
+        for initial_error in [None, Some("last command error")] {
+            let state = SessionState::new();
+            if let Some(error) = initial_error {
+                state.record_error(SessionError::Invalid(error.into()));
+            }
+            let diagnostic = state.error();
+            state.publish_event(SessionEvent::Closed);
+            state.record_error(SessionError::Detached);
+            assert!(state.publish_frame_update(FrameUpdate::Delta(delta(
+                1,
+                1,
+                2,
+                vec![]
+            ))));
+            assert_eq!(state.error(), diagnostic);
+        }
     }
 }
