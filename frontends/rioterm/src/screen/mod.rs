@@ -281,6 +281,7 @@ pub struct ScreenTransfer {
     graphics: RouteGraphics,
 }
 
+#[cfg(all(feature = "wayland", target_os = "linux"))]
 pub struct WindowTransfer {
     tabs: Vec<ScreenTransfer>,
     active_index: usize,
@@ -291,7 +292,7 @@ impl ScreenTransfer {
         self.grid.id()
     }
 
-    pub fn route_ids(&self) -> &[usize] {
+    pub fn route_ids(&self) -> Vec<usize> {
         self.grid.route_ids()
     }
 }
@@ -596,7 +597,7 @@ impl Screen<'_> {
             ScreenContext::Transfer(ScreenTransfer { grid, graphics }) => {
                 if !route_ids_belong_to(
                     graphics.keys().map(|graphic| graphic.route_id),
-                    grid.route_ids(),
+                    &grid.route_ids(),
                 ) {
                     return Err(ScreenBuildFailure::Transfer(ScreenTransferFailure {
                         transfer: ScreenTransfer { grid, graphics },
@@ -696,13 +697,15 @@ impl Screen<'_> {
     /// Extract a tab and all renderer state owned by its split routes.
     pub fn extract_transfer(&mut self, index: usize) -> Option<ScreenTransfer> {
         let grid = self.context_manager.extract_grid(index)?;
-        for route_id in grid.route_ids() {
+        let route_ids = grid.route_ids();
+        for route_id in &route_ids {
             self.grids.remove(route_id);
         }
-        let graphics = self.extract_routes_graphics(grid.route_ids().iter().copied());
+        let graphics = self.extract_routes_graphics(route_ids);
         Some(ScreenTransfer { grid, graphics })
     }
 
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     pub fn extract_window_transfer(&mut self) -> Option<WindowTransfer> {
         let count = self.context_manager.len();
         if count == 0 {
@@ -726,7 +729,7 @@ impl Screen<'_> {
         size: rio_window::dpi::PhysicalSize<u32>,
     ) -> Result<(), ScreenTransfer> {
         let ScreenTransfer { grid, graphics } = transfer;
-        let route_ids = grid.route_ids().to_vec();
+        let route_ids = grid.route_ids();
         if !route_ids_belong_to(graphics.keys().map(|key| key.route_id), &route_ids)
             || self
                 .sugarloaf
@@ -749,6 +752,7 @@ impl Screen<'_> {
         Ok(())
     }
 
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     pub fn insert_window_transfer(
         &mut self,
         index: usize,
@@ -2028,7 +2032,7 @@ impl Screen<'_> {
         self.clear_selection();
         let had_multiple_tabs = self.context_manager.len() > 1;
         if had_multiple_tabs {
-            let route_ids = self.context_manager.current_grid().route_ids().to_vec();
+            let route_ids = self.context_manager.current_grid().route_ids();
             self.discard_routes(route_ids);
         }
         self.context_manager
@@ -3118,9 +3122,13 @@ impl Screen<'_> {
         x_unscaled: f32,
         layout: &TabStripLayout,
     ) {
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
         if self.on_chrome_press(window, prev) {
             return;
         }
+
+        #[cfg(not(all(feature = "wayland", target_os = "linux")))]
+        self.on_chrome_press(window, prev);
 
         #[cfg(all(feature = "wayland", target_os = "linux"))]
         self.start_wayland_window_drag(window, x_unscaled, layout);
@@ -3962,7 +3970,6 @@ impl Screen<'_> {
 
     #[inline]
     pub fn paste(&mut self, text: &str, bracketed: bool) {
-        let _ = bracketed;
         if self.search_active() {
             for c in text.chars() {
                 self.search_input(c);
@@ -3977,7 +3984,7 @@ impl Screen<'_> {
                 .current_mut()
                 .terminal
                 .lock()
-                .paste(text.to_owned());
+                .paste(text.to_owned(), bracketed);
         }
     }
 

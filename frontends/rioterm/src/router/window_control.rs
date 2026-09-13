@@ -10,8 +10,10 @@ use rio_backend::event::RioEvent;
 use rio_backend::event::{EventListener, WindowId};
 #[cfg(unix)]
 use rio_session::codec;
-use rio_session::SessionDescriptor;
 #[cfg(unix)]
+use rio_session::readiness::{self, Readiness};
+use rio_session::SessionDescriptor;
+#[cfg(all(feature = "wayland", target_os = "linux"))]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
@@ -24,12 +26,16 @@ use std::sync::mpsc::SyncSender;
 #[cfg(unix)]
 use std::sync::mpsc::{self, Receiver};
 #[cfg(unix)]
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(all(feature = "wayland", target_os = "linux"))]
+use std::sync::Mutex;
 #[cfg(unix)]
 use std::thread;
 #[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::fd::{AsFd, AsRawFd};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
@@ -163,14 +169,14 @@ impl TransferOffer {
         if self.transfer_id == [0; 16] {
             return Err("transfer id is empty".into());
         }
-        Self::validate_parts(self.panes.iter(), &self.tabs, self.active_pane)
+        Self::validate_parts(self.panes.iter(), &self.tabs, self.active_pane).map(|_| ())
     }
 
     pub(crate) fn validate_parts<'a, I>(
         panes: I,
         tabs: &[TabOffer],
         active_pane: u32,
-    ) -> Result<(), String>
+    ) -> Result<Vec<Vec<u64>>, String>
     where
         I: IntoIterator<Item = &'a PaneOffer> + Clone,
     {
@@ -186,6 +192,7 @@ impl TransferOffer {
         }
         let mut tab_ids = HashSet::with_capacity(tabs.len());
         let mut routes = HashSet::with_capacity(pane_count);
+        let mut routes_by_tab = Vec::with_capacity(tabs.len());
         for tab in tabs {
             if tab.tab_id == 0 || !tab_ids.insert(tab.tab_id) {
                 return Err("transfer tab identity is empty or duplicated".into());
@@ -209,6 +216,7 @@ impl TransferOffer {
             {
                 return Err("transfer layout does not match its panes".into());
             }
+            routes_by_tab.push(layout_routes);
         }
         for pane in panes {
             if pane.route_id == 0 || pane.tab_id == 0 {
@@ -228,7 +236,7 @@ impl TransferOffer {
                 .validate()
                 .map_err(|error| format!("invalid pane session: {error}"))?;
         }
-        Ok(())
+        Ok(routes_by_tab)
     }
 }
 
@@ -298,6 +306,7 @@ enum Request {
 
 #[derive(Debug)]
 pub enum WindowControlEvent {
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     DragResult {
         transfer_id: [u8; 16],
         result: Result<(), String>,
@@ -356,6 +365,7 @@ pub enum WindowControlResponse {
 impl fmt::Display for WindowControlEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             Self::DragResult { .. } => write!(formatter, "foreign drag result"),
             Self::Probe { .. } => write!(formatter, "window probe"),
             Self::Peers { .. } => write!(formatter, "window discovery"),
@@ -403,8 +413,10 @@ pub struct WindowControl {
     registry_path: PathBuf,
     events: Receiver<WindowControlEvent>,
     event_sender: SyncSender<WindowControlEvent>,
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     published: Arc<Mutex<HashMap<[u8; 16], TransferOffer>>>,
     acceptor_stop: Arc<AtomicBool>,
+    acceptor_wakeup: Arc<Readiness>,
     acceptor_stopped: Arc<AtomicBool>,
     acceptor: Option<thread::JoinHandle<()>>,
 }
@@ -420,6 +432,9 @@ impl WindowControl {
     ) -> Result<Self, String> {
         let root = registry_root()?;
         ensure_private_registry(&root)?;
+        let acceptor_wakeup = Arc::new(Readiness::new().map_err(|error| {
+            format!("create window control acceptor wakeup: {error}")
+        })?);
 
         let instance = random_bytes::<16>()?;
         let capability = random_bytes::<32>()?;
@@ -448,14 +463,17 @@ impl WindowControl {
         }
 
         let (event_sender, events) = mpsc::sync_channel(MAX_CONNECTIONS * 2);
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
         let published = Arc::new(Mutex::new(HashMap::new()));
         let wake_proxy = event_proxy
             .with_window_target(rio_backend::event::WindowTarget::dynamic(window_id));
         let accept_sender = event_sender.clone();
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
         let accept_published = published.clone();
         let acceptor_stop = Arc::new(AtomicBool::new(false));
         let acceptor_stopped = Arc::new(AtomicBool::new(false));
         let acceptor_stop_thread = acceptor_stop.clone();
+        let acceptor_wakeup_thread = acceptor_wakeup.clone();
         let acceptor_stopped_thread = acceptor_stopped.clone();
         let acceptor = match thread::Builder::new()
             .name("rio-window-control".into())
@@ -466,10 +484,14 @@ impl WindowControl {
                     wake_proxy,
                     window_id,
                     capability,
+                    #[cfg(all(feature = "wayland", target_os = "linux"))]
                     accept_published,
                     AcceptorState {
                         stop: acceptor_stop_thread,
+                        wakeup: acceptor_wakeup_thread,
                         stopped: acceptor_stopped_thread,
+                        #[cfg(test)]
+                        blocked: None,
                     },
                 )
             }) {
@@ -486,8 +508,10 @@ impl WindowControl {
             registry_path,
             events,
             event_sender,
+            #[cfg(all(feature = "wayland", target_os = "linux"))]
             published,
             acceptor_stop,
+            acceptor_wakeup,
             acceptor_stopped,
             acceptor: Some(acceptor),
         })
@@ -772,6 +796,7 @@ impl WindowControl {
         Ok(())
     }
 
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     pub fn publish_drag_offer(&self, offer: TransferOffer) -> Result<(), String> {
         offer.validate()?;
         let mut published = self
@@ -785,12 +810,14 @@ impl WindowControl {
         Ok(())
     }
 
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     pub fn withdraw_drag_offer(&self, transfer_id: [u8; 16]) {
         if let Ok(mut published) = self.published.lock() {
             published.remove(&transfer_id);
         }
     }
 
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     pub fn take_drag_offer_async<T: EventListener + Clone + Send + 'static>(
         &self,
         transfer_id: [u8; 16],
@@ -868,6 +895,7 @@ impl WindowControl {
 impl Drop for WindowControl {
     fn drop(&mut self) {
         self.acceptor_stop.store(true, Ordering::Release);
+        self.acceptor_wakeup.signal();
         if let Some(acceptor) = self.acceptor.take() {
             let _ = acceptor.join();
             if !self.acceptor_stopped.load(Ordering::Acquire) {
@@ -1028,6 +1056,7 @@ mod tests {
         assert_eq!(results, 3);
     }
 
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     #[test]
     fn published_drag_offer_returns_commit_to_source() {
         let source = WindowControl::new(VoidListener, WindowId::from(11)).unwrap();
@@ -1093,6 +1122,62 @@ mod tests {
         let stopped = control.acceptor_stopped.clone();
         drop(control);
         assert!(stopped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn blocked_acceptor_stops_on_readiness_signal() {
+        let root = test_artifact_dir("rio-window-control-blocked");
+        let endpoint = root.join("control.sock");
+        let listener = UnixListener::bind(&endpoint).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let wakeup = Arc::new(Readiness::new().unwrap());
+        let blocked = Arc::new(Readiness::new().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let acceptor = {
+            let wakeup = wakeup.clone();
+            let blocked = blocked.clone();
+            let stop = stop.clone();
+            let stopped = stopped.clone();
+            thread::spawn(move || {
+                accept_loop(
+                    listener,
+                    sender,
+                    VoidListener,
+                    WindowId::from(14),
+                    [0; 32],
+                    #[cfg(all(feature = "wayland", target_os = "linux"))]
+                    Arc::new(Mutex::new(HashMap::new())),
+                    AcceptorState {
+                        stop,
+                        wakeup,
+                        stopped,
+                        blocked: Some(blocked),
+                    },
+                )
+            })
+        };
+
+        let mut poll_fds = [libc::pollfd {
+            fd: blocked.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let ready = readiness::wait(
+            &mut poll_fds,
+            Some(std::time::Instant::now() + Duration::from_secs(2)),
+        )
+        .unwrap();
+        blocked.clear();
+        stop.store(true, Ordering::Release);
+        wakeup.signal();
+        acceptor.join().unwrap();
+
+        assert_eq!(ready, 1);
+        assert!(stopped.load(Ordering::Acquire));
+        let _ = fs::remove_file(endpoint);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1222,7 +1307,10 @@ impl WindowControl {
 #[cfg(unix)]
 struct AcceptorState {
     stop: Arc<AtomicBool>,
+    wakeup: Arc<Readiness>,
     stopped: Arc<AtomicBool>,
+    #[cfg(test)]
+    blocked: Option<Arc<Readiness>>,
 }
 
 #[cfg(unix)]
@@ -1232,14 +1320,20 @@ fn accept_loop<T: EventListener + Clone + Send + 'static>(
     event_proxy: T,
     window_id: WindowId,
     expected_capability: [u8; 32],
-    published: Arc<Mutex<HashMap<[u8; 16], TransferOffer>>>,
+    #[cfg(all(feature = "wayland", target_os = "linux"))] published: Arc<
+        Mutex<HashMap<[u8; 16], TransferOffer>>,
+    >,
     state: AcceptorState,
 ) {
-    while !state.stop.load(Ordering::Acquire) {
+    'acceptor: loop {
+        if state.stop.load(Ordering::Acquire) {
+            break;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 let sender = sender.clone();
                 let event_proxy = event_proxy.clone();
+                #[cfg(all(feature = "wayland", target_os = "linux"))]
                 let published = published.clone();
                 let _ = thread::Builder::new()
                     .name("rio-window-control-peer".into())
@@ -1250,17 +1344,68 @@ fn accept_loop<T: EventListener + Clone + Send + 'static>(
                             event_proxy,
                             window_id,
                             expected_capability,
+                            #[cfg(all(feature = "wayland", target_os = "linux"))]
                             published,
                         )
                     });
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(10));
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => loop {
+                #[cfg(test)]
+                if let Some(blocked) = &state.blocked {
+                    blocked.signal();
+                }
+                let mut poll_fds = [
+                    libc::pollfd {
+                        fd: listener.as_fd().as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: state.wakeup.as_fd().as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                if let Err(error) = readiness::wait(&mut poll_fds, None) {
+                    tracing::debug!(%error, "window control accept wait failed");
+                    break 'acceptor;
+                }
+                let wakeup_revents = poll_fds[1].revents;
+                if readiness::is_invalid(wakeup_revents) {
+                    tracing::debug!("window control accept wakeup became unusable");
+                    break 'acceptor;
+                }
+                if readiness::is_readable(wakeup_revents)
+                    && wakeup_revents & libc::POLLIN != 0
+                {
+                    state.wakeup.clear();
+                    if state.stop.load(Ordering::Acquire) {
+                        break 'acceptor;
+                    }
+                }
+                if wakeup_revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                    tracing::debug!("window control accept wakeup became unusable");
+                    break 'acceptor;
+                }
+                let listener_revents = poll_fds[0].revents;
+                if readiness::is_invalid(listener_revents) {
+                    tracing::debug!("window control listener became invalid");
+                    break 'acceptor;
+                }
+                if listener_revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+                    tracing::debug!("window control listener became unusable");
+                    break 'acceptor;
+                }
+                if readiness::is_readable(listener_revents)
+                    && listener_revents & libc::POLLIN != 0
+                {
+                    break;
+                }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => {
                 tracing::debug!(%error, "window control accept failed");
-                thread::sleep(Duration::from_millis(10));
+                break;
             }
         }
     }
@@ -1274,7 +1419,9 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
     event_proxy: T,
     window_id: WindowId,
     expected_capability: [u8; 32],
-    published: Arc<Mutex<HashMap<[u8; 16], TransferOffer>>>,
+    #[cfg(all(feature = "wayland", target_os = "linux"))] published: Arc<
+        Mutex<HashMap<[u8; 16], TransferOffer>>,
+    >,
 ) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
@@ -1401,6 +1548,7 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
             };
             (offer, target_index)
         }
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
         Request::Take(transfer_id) => {
             let offer = published
                 .lock()
@@ -1438,6 +1586,14 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
                 result,
             });
             event_proxy.send_event(RioEvent::Render, window_id);
+            return;
+        }
+        #[cfg(not(all(feature = "wayland", target_os = "linux")))]
+        Request::Take(_) => {
+            let _ = codec::write_frame(
+                &mut stream,
+                &WindowControlResponse::Rejected("drag transfer is unavailable".into()),
+            );
             return;
         }
         Request::Probe => {
@@ -1612,7 +1768,7 @@ fn send_selection_event(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "wayland", target_os = "linux"))]
 fn take_offer(
     target: &WindowEndpoint,
     transfer_id: [u8; 16],
