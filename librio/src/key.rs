@@ -704,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn kitty_disambiguates_only_what_legacy_loses() {
+    fn kitty_disambiguates_ambiguous_keys() {
         let ctx = kitty(KittyFlags::DISAMBIGUATE);
 
         // Escape and ctrl combos become CSI u.
@@ -714,6 +714,33 @@ mod tests {
         );
         let ctrl_i = with_mods(Key::Char('i'), Modifiers::CTRL);
         assert_eq!(encode(&ctrl_i, &ctx), Some(b"\x1b[105;5u".to_vec()));
+
+        // Kitty disambiguation keeps these crash-safe shell controls in their
+        // legacy form. Report-all below is the mode that reports them as CSI-u.
+        for (key, legacy, shifted) in [
+            (Key::Backspace, b"\x7f".as_slice(), b"\x7f".as_slice()),
+            (Key::Enter, b"\r".as_slice(), b"\r".as_slice()),
+            (Key::Tab, b"\t".as_slice(), b"\x1b[Z".as_slice()),
+        ] {
+            assert_eq!(encode(&press(key), &ctx), Some(legacy.to_vec()));
+            assert_eq!(
+                encode(&with_mods(key, Modifiers::SHIFT), &ctx),
+                Some(shifted.to_vec())
+            );
+        }
+
+        for (mods, suffix) in [
+            (Modifiers::ALT, ";3u"),
+            (Modifiers::CTRL, ";5u"),
+            (Modifiers::SHIFT | Modifiers::ALT | Modifiers::CTRL, ";8u"),
+        ] {
+            let event = with_mods(Key::Backspace, mods);
+            assert_eq!(
+                encode(&event, &ctx),
+                Some(format!("\x1b[127{suffix}").into_bytes()),
+                "backspace+{mods:?}"
+            );
+        }
 
         // A plain text key still sends its text: disambiguation alone does not
         // ask for everything as an escape sequence.
@@ -768,6 +795,47 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(encode(&plain, &ctx), Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn kitty_control_keys_report_all_and_events_as_bytes() {
+        let all = kitty(KittyFlags::REPORT_ALL_AS_ESC);
+        for (key, expected) in [
+            (Key::Backspace, b"\x1b[127u".as_slice()),
+            (Key::Enter, b"\x1b[13u".as_slice()),
+            (Key::Tab, b"\x1b[9u".as_slice()),
+            (Key::Escape, b"\x1b[27u".as_slice()),
+        ] {
+            assert_eq!(encode(&press(key), &all), Some(expected.to_vec()));
+        }
+
+        let events = kitty(KittyFlags::REPORT_EVENT_TYPES);
+        assert_eq!(
+            encode(&press(Key::Backspace), &events),
+            Some(b"\x7f".to_vec())
+        );
+        assert_eq!(
+            encode(
+                &KeyEvent {
+                    key: Some(Key::Backspace),
+                    action: KeyAction::Repeat,
+                    ..Default::default()
+                },
+                &events,
+            ),
+            Some(b"\x1b[127;1:2u".to_vec())
+        );
+        assert_eq!(
+            encode(
+                &KeyEvent {
+                    key: Some(Key::Backspace),
+                    action: KeyAction::Release,
+                    ..Default::default()
+                },
+                &events,
+            ),
+            Some(b"\x1b[127;1:3u".to_vec())
+        );
     }
 
     #[test]

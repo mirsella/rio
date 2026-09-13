@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::io::Read;
 use std::path::PathBuf;
 
 pub const PROTOCOL_VERSION: u16 = 4;
@@ -24,7 +25,7 @@ pub const MAX_SCROLLBACK: usize = 10_000_000;
 
 #[cfg(unix)]
 fn recovery_directory() -> Result<PathBuf, crate::SessionError> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::DirBuilderExt;
 
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -32,15 +33,7 @@ fn recovery_directory() -> Result<PathBuf, crate::SessionError> {
     let directory = base.join("rio-sessions");
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(0o700).create(&directory)?;
-    let metadata = std::fs::symlink_metadata(&directory)?;
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(crate::SessionError::protocol(
-            "session recovery directory is not private",
-        ));
-    }
+    crate::private_directory_identity(&directory)?;
     Ok(directory)
 }
 
@@ -53,6 +46,31 @@ fn recovery_directory() -> Result<PathBuf, crate::SessionError> {
 
 fn recovery_path(session_id: SessionId) -> Result<PathBuf, crate::SessionError> {
     Ok(recovery_directory()?.join(format!("{}.session", session_id.hex())))
+}
+
+#[cfg(unix)]
+pub(crate) fn remove_file_if_open_file(
+    path: &std::path::Path,
+    original: &std::fs::File,
+) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let original_metadata = original.metadata()?;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if (metadata.dev(), metadata.ino())
+        != (original_metadata.dev(), original_metadata.ino())
+    {
+        return Ok(false);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, bincode::Encode, bincode::Decode)]
@@ -84,7 +102,7 @@ impl EnvVar {
         }
     }
 
-    fn validate(&self) -> Result<(&str, &str), crate::SessionError> {
+    fn validate(&self) -> Result<(), crate::SessionError> {
         if self.key.is_empty()
             || self.key.contains(&0)
             || self.key.contains(&b'=')
@@ -94,9 +112,9 @@ impl EnvVar {
                 "environment keys cannot be empty, contain NUL or '=', and values cannot contain NUL",
             ));
         }
-        let key = std::str::from_utf8(&self.key).map_err(|_| Self::non_utf8())?;
-        let value = std::str::from_utf8(&self.value).map_err(|_| Self::non_utf8())?;
-        Ok((key, value))
+        std::str::from_utf8(&self.key).map_err(|_| Self::non_utf8())?;
+        std::str::from_utf8(&self.value).map_err(|_| Self::non_utf8())?;
+        Ok(())
     }
 
     fn non_utf8() -> crate::SessionError {
@@ -189,6 +207,7 @@ impl SessionSpec {
         for value in &self.args {
             validate_string(value)?;
         }
+        let mut keys = HashSet::with_capacity(self.environment.len());
         for env in &self.environment {
             if env.key.len() > MAX_STRING_BYTES || env.value.len() > MAX_STRING_BYTES {
                 return Err(crate::SessionError::invalid(
@@ -196,9 +215,6 @@ impl SessionSpec {
                 ));
             }
             env.validate()?;
-        }
-        let mut keys = HashSet::with_capacity(self.environment.len());
-        for env in &self.environment {
             if !keys.insert(&env.key) {
                 return Err(crate::SessionError::invalid(
                     "environment contains duplicate keys",
@@ -249,42 +265,57 @@ impl SessionDescriptor {
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
             let parent = self.endpoint.parent().ok_or_else(|| {
                 crate::SessionError::invalid("session endpoint has no parent")
             })?;
-            let metadata = std::fs::symlink_metadata(parent)?;
-            if !metadata.is_dir()
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.mode() & 0o077 != 0
-            {
-                return Err(crate::SessionError::protocol(
-                    "session endpoint directory is not private",
-                ));
-            }
+            crate::private_directory_identity(parent)?;
         }
         Ok(())
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<(), crate::SessionError> {
         self.validate()?;
-        let bytes = crate::codec::encode(self)?;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-            options.custom_flags(libc::O_NOFOLLOW);
+            self.save_file_with_open_file(path)?;
         }
-        use std::io::Write;
-        let mut file = options.open(path)?;
-        if let Err(error) = file.write_all(&bytes) {
-            drop(file);
-            let _ = std::fs::remove_file(path);
-            return Err(error.into());
+        #[cfg(not(unix))]
+        {
+            let bytes = crate::codec::encode(self)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            use std::io::Write;
+            let mut file = options.open(path)?;
+            if let Err(error) = file.write_all(&bytes) {
+                drop(file);
+                let _ = std::fs::remove_file(path);
+                return Err(error.into());
+            }
         }
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn save_file_with_open_file(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<std::fs::File, crate::SessionError> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let bytes = crate::codec::encode(self)?;
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(path)?;
+        if let Err(error) = file.write_all(&bytes) {
+            let _ = remove_file_if_open_file(path, &file);
+            return Err(error.into());
+        }
+        Ok(file)
     }
 
     pub fn load(path: &std::path::Path) -> Result<Self, crate::SessionError> {
@@ -292,50 +323,33 @@ impl SessionDescriptor {
         options.read(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::MetadataExt;
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW);
-            let file = options.open(path)?;
-            let metadata = file.metadata()?;
-            if !metadata.is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.mode() & 0o077 != 0
-            {
-                return Err(crate::SessionError::protocol(
-                    "session descriptor is not private",
-                ));
-            }
-            if metadata.len() > MAX_FRAME_SIZE as u64 {
-                return Err(crate::SessionError::protocol(
-                    "session descriptor is too large",
-                ));
-            }
-            let mut bytes = Vec::with_capacity(metadata.len() as usize);
-            use std::io::Read;
-            file.take((MAX_FRAME_SIZE + 1) as u64)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() > MAX_FRAME_SIZE {
-                return Err(crate::SessionError::protocol(
-                    "session descriptor is too large",
-                ));
-            }
-            let descriptor: Self = crate::codec::decode(&bytes)?;
-            descriptor.validate()?;
-            Ok(descriptor)
         }
-        #[cfg(not(unix))]
-        {
-            let metadata = options.open(path)?.metadata()?;
-            if metadata.len() > MAX_FRAME_SIZE as u64 {
-                return Err(crate::SessionError::protocol(
-                    "session descriptor is too large",
-                ));
-            }
-            let bytes = std::fs::read(path)?;
-            let descriptor: Self = crate::codec::decode(&bytes)?;
-            descriptor.validate()?;
-            Ok(descriptor)
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        #[cfg(unix)]
+        if !crate::is_private_file(&metadata) {
+            return Err(crate::SessionError::protocol(
+                "session descriptor is not private",
+            ));
         }
+        if metadata.len() > MAX_FRAME_SIZE as u64 {
+            return Err(crate::SessionError::protocol(
+                "session descriptor is too large",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take((MAX_FRAME_SIZE + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > MAX_FRAME_SIZE {
+            return Err(crate::SessionError::protocol(
+                "session descriptor is too large",
+            ));
+        }
+        let descriptor: Self = crate::codec::decode(&bytes)?;
+        descriptor.validate()?;
+        Ok(descriptor)
     }
 
     /// Persist this descriptor in the private per-user recovery registry.
@@ -343,6 +357,12 @@ impl SessionDescriptor {
     /// The file contains the capability, so it is protected like the session
     /// endpoint itself. It intentionally remains after an attachment drops;
     /// explicit `SessionClient::close` removes it.
+    #[cfg(unix)]
+    pub fn save_recovery(&self) -> Result<PathBuf, crate::SessionError> {
+        self.save_recovery_with_file().map(|(path, _)| path)
+    }
+
+    #[cfg(not(unix))]
     pub fn save_recovery(&self) -> Result<PathBuf, crate::SessionError> {
         self.validate()?;
         let directory = recovery_directory()?;
@@ -351,10 +371,46 @@ impl SessionDescriptor {
         Ok(path)
     }
 
-    pub fn remove_recovery(&self) {
-        if let Ok(path) = recovery_path(self.session_id) {
-            let _ = std::fs::remove_file(path);
+    #[cfg(unix)]
+    pub(crate) fn save_recovery_with_file(
+        &self,
+    ) -> Result<(PathBuf, std::fs::File), crate::SessionError> {
+        self.validate()?;
+        let directory = recovery_directory()?;
+        let path = directory.join(format!("{}.session", self.session_id.hex()));
+        let file = self.save_file_with_open_file(&path)?;
+        Ok((path, file))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn open_recovery_file(&self) -> Option<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = recovery_path(self.session_id).ok()?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !crate::is_private_file(&metadata) {
+            return None;
         }
+        Some(file)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn remove_recovery_if_file(&self, file: &std::fs::File) {
+        if let Ok(path) = recovery_path(self.session_id) {
+            let _ = remove_file_if_open_file(&path, file);
+        }
+    }
+
+    pub fn remove_recovery(&self) {
+        #[cfg(unix)]
+        if let Some(file) = self.open_recovery_file() {
+            self.remove_recovery_if_file(&file);
+        }
+        #[cfg(not(unix))]
+        let _ = self;
     }
 
     pub fn discover_recovery() -> Result<Vec<Self>, crate::SessionError> {
@@ -826,7 +882,7 @@ impl SessionCommand {
                 ..
             } => {
                 validate_string(pattern)?;
-                validate_position(*origin_line, *origin_column)?;
+                validate_position(*origin_line, *origin_column as usize)?;
                 if *origin_display_offset > MAX_SCROLLBACK as u32 {
                     return Err(crate::SessionError::invalid(
                         "search origin display offset exceeds the session limit",
@@ -856,15 +912,10 @@ impl SessionCommand {
                 ..
             } => {
                 validate_scroll(*delta_lines)?;
-                validate_position(*line, *column as u16)?;
-                if *column > MAX_COLUMNS as usize {
-                    return Err(crate::SessionError::invalid(
-                        "selection column is outside the session limit",
-                    ));
-                }
+                validate_position(*line, *column)?;
             }
             Self::ViScroll { delta_lines } => validate_scroll(*delta_lines)?,
-            Self::ViGoto { line, column } => validate_position(*line, *column)?,
+            Self::ViGoto { line, column } => validate_position(*line, *column as usize)?,
             Self::MouseWheel {
                 lines, modifiers, ..
             } => {
@@ -893,12 +944,7 @@ impl SessionCommand {
             }
             Self::SelectionBegin { line, column, .. }
             | Self::SelectionUpdate { line, column, .. } => {
-                validate_position(*line, (*column).try_into().unwrap_or(u16::MAX))?;
-                if *column > MAX_COLUMNS as usize {
-                    return Err(crate::SessionError::invalid(
-                        "selection column is outside the supported range",
-                    ));
-                }
+                validate_position(*line, *column)?;
             }
             Self::SelectionClear
             | Self::SelectAll
@@ -981,8 +1027,8 @@ impl SessionCommand {
     }
 }
 
-fn validate_position(line: i32, column: u16) -> Result<(), crate::SessionError> {
-    if line.unsigned_abs() > MAX_SCROLLBACK as u32 || column > MAX_COLUMNS {
+fn validate_position(line: i32, column: usize) -> Result<(), crate::SessionError> {
+    if line.unsigned_abs() > MAX_SCROLLBACK as u32 || column > MAX_COLUMNS as usize {
         return Err(crate::SessionError::invalid(
             "terminal position is outside the supported range",
         ));
@@ -1028,29 +1074,7 @@ impl SessionReply {
                     validate_string(text)?;
                 }
             }
-            Self::SearchMatches(matches) => {
-                if matches.len() > MAX_ARGUMENTS * 1024 {
-                    return Err(crate::SessionError::protocol("too many search matches"));
-                }
-                let max_line = MAX_SCROLLBACK
-                    .checked_add(usize::from(MAX_LINES))
-                    .ok_or_else(|| {
-                        crate::SessionError::protocol("search line limit overflows")
-                    })?;
-                for search_match in matches {
-                    if usize::try_from(search_match.start_line).unwrap_or(usize::MAX)
-                        > max_line
-                        || usize::try_from(search_match.end_line).unwrap_or(usize::MAX)
-                            > max_line
-                        || search_match.start_column > MAX_COLUMNS
-                        || search_match.end_column > MAX_COLUMNS
-                    {
-                        return Err(crate::SessionError::protocol(
-                            "search match is outside the session dimensions",
-                        ));
-                    }
-                }
-            }
+            Self::SearchMatches(matches) => validate_search_matches(matches)?,
             Self::SearchNavigation(navigation) => navigation.validate()?,
             Self::Accepted | Self::NoChange | Self::ChildPid(_) | Self::Closed => {}
         }
@@ -1260,18 +1284,35 @@ impl SearchNavigation {
             ));
         }
         if let Some(search_match) = &self.matched {
-            if search_match.start_line > MAX_SCROLLBACK as u32 + u32::from(MAX_LINES)
-                || search_match.end_line > MAX_SCROLLBACK as u32 + u32::from(MAX_LINES)
-                || search_match.start_column > MAX_COLUMNS
-                || search_match.end_column > MAX_COLUMNS
-            {
-                return Err(crate::SessionError::protocol(
-                    "search match is outside the session dimensions",
-                ));
-            }
+            validate_search_match(search_match)?;
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn validate_search_match(search_match: &SearchMatch) -> Result<(), crate::SessionError> {
+    let max_line = MAX_SCROLLBACK
+        .checked_add(usize::from(MAX_LINES))
+        .ok_or_else(|| crate::SessionError::protocol("search line limit overflows"))?;
+    if usize::try_from(search_match.start_line).unwrap_or(usize::MAX) > max_line
+        || usize::try_from(search_match.end_line).unwrap_or(usize::MAX) > max_line
+        || usize::from(search_match.start_column) > MAX_COLUMNS as usize
+        || usize::from(search_match.end_column) > MAX_COLUMNS as usize
+    {
+        return Err(crate::SessionError::protocol(
+            "search match is outside the session dimensions",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_search_matches(matches: &[SearchMatch]) -> Result<(), crate::SessionError> {
+    if matches.len() > MAX_ARGUMENTS * 1024 {
+        return Err(crate::SessionError::protocol("too many search matches"));
+    }
+    matches.iter().try_for_each(validate_search_match)
 }
 
 #[derive(Clone, Debug, PartialEq, bincode::Encode, bincode::Decode)]
@@ -1953,7 +1994,7 @@ fn validate_graphic_extent(value: u32) -> Result<(), crate::SessionError> {
     Ok(())
 }
 
-fn validate_graphic_rect(rect: [u32; 4]) -> Result<(), crate::SessionError> {
+fn validate_graphic_rect(rect: [u32; 4]) -> Result<(u32, u32), crate::SessionError> {
     validate_graphic_extent(rect[0])?;
     validate_graphic_extent(rect[1])?;
     let right = rect[0].checked_add(rect[2]).ok_or_else(|| {
@@ -1967,14 +2008,14 @@ fn validate_graphic_rect(rect: [u32; 4]) -> Result<(), crate::SessionError> {
             "graphic source rectangle exceeds the session limit",
         ));
     }
-    Ok(())
+    Ok((right, bottom))
 }
 
 fn validate_graphic_source(
     rect: [u32; 4],
     image: Option<&(u32, u32)>,
 ) -> Result<(), crate::SessionError> {
-    validate_graphic_rect(rect)?;
+    let (right, bottom) = validate_graphic_rect(rect)?;
     if rect[2] == 0 || rect[3] == 0 {
         return Err(crate::SessionError::protocol(
             "graphic source rectangle is empty",
@@ -1985,12 +2026,6 @@ fn validate_graphic_source(
             "graphic placement references a missing image",
         ));
     };
-    let right = rect[0].checked_add(rect[2]).ok_or_else(|| {
-        crate::SessionError::protocol("graphic source rectangle overflows")
-    })?;
-    let bottom = rect[1].checked_add(rect[3]).ok_or_else(|| {
-        crate::SessionError::protocol("graphic source rectangle overflows")
-    })?;
     if right > width || bottom > height {
         return Err(crate::SessionError::protocol(
             "graphic source rectangle exceeds its image",
@@ -2144,5 +2179,26 @@ mod tests {
         assert!(update.apply_to(&mut cached).is_err());
         assert_eq!(cached.sequence, 9);
         assert_eq!(cached.rows[0].text, "a");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditional_file_cleanup_preserves_replacement() {
+        let directory = std::env::temp_dir().join(format!(
+            "rio-session-recovery-cleanup-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("session");
+        std::fs::write(&path, b"original").unwrap();
+        let original = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        assert!(!remove_file_if_open_file(&path, &original).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 }

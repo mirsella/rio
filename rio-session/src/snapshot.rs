@@ -11,7 +11,7 @@ use rio_graphics::{atlas_image_key, kitty_image_key, ColorType, GraphicData};
 use rio_vt::ansi::graphics::UpdateQueues;
 use rio_vt::ansi::CursorShape;
 use rio_vt::config::colors::AnsiColor;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 fn check_image_size(size: usize) -> Result<(), SessionError> {
     if size > MAX_IMAGE_BYTES {
@@ -28,7 +28,7 @@ fn check_image_size(size: usize) -> Result<(), SessionError> {
 pub(crate) struct Snapshotter {
     render_state: RenderState,
     atlas_images: HashMap<u64, GraphicData>,
-    published_atlas_keys: HashSet<u64>,
+    published_atlas_keys: Vec<u64>,
     sequence: u64,
     published_dimensions: Option<(u16, u16)>,
     /// Retained graphics state changed before a publication failed. The next
@@ -42,7 +42,7 @@ impl Snapshotter {
         Self {
             render_state: RenderState::new(surface),
             atlas_images: HashMap::new(),
-            published_atlas_keys: HashSet::new(),
+            published_atlas_keys: Vec::new(),
             sequence: 0,
             published_dimensions: None,
             graphics_resync_required: false,
@@ -176,19 +176,17 @@ impl Snapshotter {
         if snapshot.graphics_changed {
             self.graphics_resync_required = true;
         }
-        if let Err(error) = self.remember_graphics_updates(
+        let retained_bytes = match self.remember_graphics_updates(
             snapshot.graphics_updates.take(),
+            &snapshot.graphics_invalidated_keys,
+            snapshot.graphics_invalidate_all,
             &snapshot.atlas_keys,
         ) {
-            self.render_state.restore_graphics_dirty();
-            return Err(error);
-        }
-        let retained_bytes = match self.atlas_bytes() {
-            Ok(bytes) => bytes,
             Err(error) => {
                 self.render_state.restore_graphics_dirty();
                 return Err(error);
             }
+            Ok(bytes) => bytes,
         };
         if retained_bytes.saturating_add(snapshot.graphics_bytes)
             > MAX_FRAME_GRAPHICS_BYTES
@@ -238,16 +236,17 @@ impl Snapshotter {
             working_dir: snapshot.working_dir,
         };
 
+        let retained_keys = snapshot.atlas_keys;
         let graphics = snapshot.graphics.ok_or_else(|| {
             SessionError::protocol("full snapshot is missing graphics state")
         })?;
-        frame.graphics = self.graphics_frame(graphics)?;
+        frame.graphics = self.graphics_frame(graphics, &retained_keys)?;
         frame.validate()?;
         validate_encoded_size(
             &frame,
             "structured terminal snapshot exceeds frame budget",
         )?;
-        self.published_atlas_keys = self.atlas_images.keys().copied().collect();
+        self.published_atlas_keys = retained_keys;
         self.sequence = sequence;
         self.published_dimensions = Some((frame.columns, frame.lines));
         self.graphics_resync_required = false;
@@ -350,33 +349,31 @@ impl Snapshotter {
         }
     }
 
-    fn atlas_bytes(&self) -> Result<usize, SessionError> {
-        self.atlas_images
-            .values()
-            .try_fold(0usize, |bytes, graphic| {
-                check_image_size(graphic.pixels.len())?;
-                bytes.checked_add(graphic.pixels.len()).ok_or_else(|| {
-                    SessionError::unsupported("retained graphics size overflow")
-                })
-            })
-    }
-
     fn remember_graphics_updates(
         &mut self,
         updates: Option<UpdateQueues>,
+        invalidated_keys: &[u64],
+        invalidate_all: bool,
         retained_keys: &[u64],
-    ) -> Result<(), SessionError> {
-        let retained: HashSet<_> = retained_keys.iter().copied().collect();
-        if retained.len() > MAX_GRAPHICS_ITEMS {
+    ) -> Result<usize, SessionError> {
+        if retained_keys.len() > MAX_GRAPHICS_ITEMS {
             return Err(SessionError::unsupported(
                 "retained Atlas image count exceeds the session limit",
             ));
         }
-        self.atlas_images.retain(|key, _| retained.contains(key));
+        if invalidate_all {
+            self.atlas_images.clear();
+        } else {
+            for key in invalidated_keys {
+                self.atlas_images.remove(key);
+            }
+        }
+        self.atlas_images
+            .retain(|key, _| retained_keys.binary_search(key).is_ok());
         if let Some(updates) = updates {
             for graphic in updates.pending {
                 let key = atlas_image_key(graphic.id.get());
-                if !retained.contains(&key) {
+                if retained_keys.binary_search(&key).is_err() {
                     continue;
                 }
                 if check_image_size(graphic.pixels.len()).is_ok() {
@@ -387,18 +384,24 @@ impl Snapshotter {
                 }
             }
         }
-        if retained
-            .iter()
-            .any(|key| !self.atlas_images.contains_key(key))
-        {
+        // The map is a subset of `retained_keys` after the retain/update steps,
+        // so equal lengths prove that every retained key has pixels.
+        if self.atlas_images.len() != retained_keys.len() {
             return Err(SessionError::unsupported("retained Atlas image pixels are missing or exceed the session budget; clear the affected image to resume snapshots"));
         }
-        Ok(())
+        self.atlas_images
+            .values()
+            .try_fold(0usize, |bytes, graphic| {
+                bytes.checked_add(graphic.pixels.len()).ok_or_else(|| {
+                    SessionError::unsupported("retained graphics size overflow")
+                })
+            })
     }
 
     fn graphics_frame(
         &self,
         snapshot: GraphicsSnapshot,
+        retained_keys: &[u64],
     ) -> Result<GraphicsFrame, SessionError> {
         let image_capacity = snapshot
             .kitty_images
@@ -500,18 +503,20 @@ impl Snapshotter {
         atlas_placements
             .sort_by_key(|placement| (placement.key, placement.row, placement.column));
 
+        let removed_keys = self
+            .published_atlas_keys
+            .iter()
+            .filter(|key| retained_keys.binary_search(key).is_err())
+            .copied()
+            .collect::<Vec<_>>();
+
         Ok(GraphicsFrame {
             images,
             kitty_placements,
             virtual_placements,
             atlas_placements,
             // Hints cover only published images; transient removals need no state.
-            removed_keys: self
-                .published_atlas_keys
-                .iter()
-                .filter(|key| !self.atlas_images.contains_key(*key))
-                .copied()
-                .collect(),
+            removed_keys,
         })
     }
 }
@@ -539,7 +544,6 @@ fn graphic_frame(
     key: u64,
     graphic: GraphicData,
 ) -> Result<GraphicFrame, SessionError> {
-    check_image_size(graphic.pixels.len())?;
     Ok(GraphicFrame {
         kind,
         key,

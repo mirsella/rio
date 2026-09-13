@@ -100,11 +100,7 @@ impl FiltersBrush {
 
     fn ensure_intermediates(&mut self, ctx: &WgpuContext) {
         let size = context_size(ctx);
-        let intermediate_count = if self.filter_chains.len() % 2 == 1 {
-            self.filter_chains.len().saturating_sub(1)
-        } else {
-            self.filter_chains.len()
-        };
+        let intermediate_count = intermediate_count_for_filters(self.filter_chains.len());
         if self.intermediate_size == Some(size)
             && self.filter_intermediates.len() == intermediate_count
         {
@@ -232,13 +228,12 @@ fn create_intermediates(
     ctx: &WgpuContext,
     filter_count: usize,
 ) -> Vec<Arc<wgpu::Texture>> {
-    let skip = usize::from(filter_count % 2 == 1);
     let size = wgpu::Extent3d {
         depth_or_array_layers: 1,
         width: ctx.size.width as u32,
         height: ctx.size.height as u32,
     };
-    (0..filter_count.saturating_sub(skip))
+    (0..intermediate_count_for_filters(filter_count))
         .map(|_| {
             Arc::new(ctx.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Filter Intermediate Texture"),
@@ -255,4 +250,9 @@ fn create_intermediates(
             }))
         })
         .collect()
+}
+
+#[inline]
+fn intermediate_count_for_filters(filter_count: usize) -> usize {
+    filter_count - filter_count % 2
 }

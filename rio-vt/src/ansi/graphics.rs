@@ -817,22 +817,26 @@ impl Graphics {
     fn recount_atlas_keys_for(
         placements: &[AtlasPlacement],
         key_refs: &mut FxHashMap<u64, u32>,
-        texture_operations: &std::sync::Arc<parking_lot::Mutex<Vec<u64>>>,
+        texture_operations: &parking_lot::Mutex<Vec<u64>>,
     ) -> Vec<u64> {
-        let mut refs: FxHashMap<u64, u32> = FxHashMap::default();
+        for count in key_refs.values_mut() {
+            *count = 0;
+        }
         for placement in placements {
-            *refs.entry(placement.image_key).or_insert(0) += 1;
+            *key_refs.entry(placement.image_key).or_insert(0) += 1;
         }
         let mut lost = Vec::new();
         let mut removals = texture_operations.lock();
-        for key in key_refs.keys() {
-            if !refs.contains_key(key) {
+        key_refs.retain(|key, count| {
+            if *count == 0 {
                 removals.push(*key);
                 lost.push(*key);
+                false
+            } else {
+                true
             }
-        }
+        });
         drop(removals);
-        *key_refs = refs;
         lost
     }
 

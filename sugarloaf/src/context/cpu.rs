@@ -94,8 +94,8 @@ impl<'a> CpuRenderTarget<'a> {
     }
 
     #[inline]
-    pub(crate) fn parts_mut(&mut self) -> (&mut [u32], u32, u32, u32) {
-        (self.pixels, self.width, self.height, self.stride_pixels)
+    pub(crate) fn pixels_mut(&mut self) -> &mut [u32] {
+        self.pixels
     }
 }
 

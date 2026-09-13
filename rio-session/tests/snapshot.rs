@@ -7,7 +7,7 @@
 ))]
 
 use rio_session::protocol::{EnvVar, MAX_PENDING_INPUT_BYTES};
-use rio_session::{FrameUpdate, FullFrame, SessionClient, SessionSpec};
+use rio_session::{FrameDelta, FrameUpdate, FullFrame, SessionClient, SessionSpec};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -89,6 +89,21 @@ fn update_until(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn assert_delta_metadata(delta: &FrameDelta, frame: &FullFrame) {
+    assert_eq!(delta.columns, frame.columns);
+    assert_eq!(delta.lines, frame.lines);
+    assert_eq!(delta.display_offset, frame.display_offset);
+    assert_eq!(delta.history_size, frame.history_size);
+    assert_eq!(delta.lines_evicted, frame.lines_evicted);
+    assert_eq!(delta.alternate_screen, frame.alternate_screen);
+    assert_eq!(delta.modes, frame.modes);
+    assert_eq!(delta.cursor, frame.cursor);
+    assert_eq!(delta.selection, frame.selection);
+    assert_eq!(delta.colors, frame.colors);
+    assert_eq!(delta.title, frame.title);
+    assert_eq!(delta.working_dir, frame.working_dir);
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -403,6 +418,21 @@ fn snapshot_since_covers_damage_metadata_and_full_resynchronization() {
     );
     assert!(matches!(selection, FrameUpdate::Delta(delta) if delta.selection.is_some()));
 
+    let scrollback = (0..32)
+        .map(|line| format!("scroll-{line}\r\n"))
+        .collect::<String>();
+    client.write(scrollback.into_bytes()).unwrap();
+    let _ = update_until("scrollback", &client, &mut cached, |update| match update {
+        FrameUpdate::Full(frame) => {
+            frame.rows.iter().any(|row| row.text.contains("scroll-31"))
+        }
+        FrameUpdate::Delta(delta) => delta
+            .rows
+            .iter()
+            .any(|row| row.row.text.contains("scroll-31")),
+    });
+
+    let prior_display_offset = cached.display_offset;
     client.scroll(1).unwrap();
     let scroll = update_until("scroll", &client, &mut cached, |update| match update {
         FrameUpdate::Full(_) => true,
@@ -412,6 +442,7 @@ fn snapshot_since_covers_damage_metadata_and_full_resynchronization() {
         scroll,
         FrameUpdate::Delta(_) | FrameUpdate::Full(_)
     ));
+    assert_ne!(cached.display_offset, prior_display_offset);
 
     let prior_colors = cached.colors.clone();
     client.write(b"\x1b]4;1;rgb:ff/00/00\x07".to_vec()).unwrap();
@@ -460,4 +491,92 @@ fn snapshot_since_covers_damage_metadata_and_full_resynchronization() {
     assert_eq!(reattached.columns, 40);
     assert_eq!(reattached.lines, 12);
     attached.close().unwrap();
+}
+
+#[test]
+fn snapshot_since_no_change_preserves_metadata_and_rendered_rows() {
+    let client =
+        SessionClient::spawn_with_worker_path(session_spec(), worker_path()).unwrap();
+    client
+        .write(b"quiet row\r\n\x1b]2;quiet-title\x07\x1b[3;7H".to_vec())
+        .unwrap();
+    let baseline = snapshot_until(&client, |frame| {
+        frame.title == "quiet-title"
+            && frame.rows.iter().any(|row| row.text.contains("quiet row"))
+    });
+    assert_eq!((baseline.cursor.line, baseline.cursor.column), (2, 6));
+    assert!(baseline.rows.iter().any(|row| {
+        row.text.contains("quiet row")
+            && row.cells.iter().any(|cell| {
+                matches!(cell.content, rio_session::CellContentFrame::Codepoint(codepoint) if codepoint == 'q' as u32)
+            })
+    }));
+
+    let mut cached = baseline.clone();
+    let update = update_until("no-change", &client, &mut cached, |update| {
+        matches!(update, FrameUpdate::Delta(delta)
+            if delta.rows.is_empty()
+                && delta.cursor == baseline.cursor
+                && delta.title == baseline.title
+                && delta.colors == baseline.colors)
+    });
+    let delta = match update {
+        FrameUpdate::Delta(delta) => delta,
+        FrameUpdate::Full(_) => {
+            panic!("quiet snapshot unexpectedly required a full frame")
+        }
+    };
+    assert_delta_metadata(&delta, &baseline);
+    assert_eq!(cached.rows, baseline.rows);
+    assert_eq!(cached.title, baseline.title);
+    assert_eq!(cached.cursor, baseline.cursor);
+    client.close().unwrap();
+}
+
+#[test]
+fn snapshot_since_cursor_only_preserves_rendered_rows() {
+    let client =
+        SessionClient::spawn_with_worker_path(session_spec(), worker_path()).unwrap();
+    client
+        .write(b"cursor row\r\n\x1b]2;cursor-title\x07".to_vec())
+        .unwrap();
+    let baseline = snapshot_until(&client, |frame| {
+        frame.title == "cursor-title"
+            && frame.rows.iter().any(|row| row.text.contains("cursor row"))
+    });
+    let mut cached = baseline.clone();
+    let prior_rows = baseline.rows.clone();
+    let prior_cursor = baseline.cursor.clone();
+
+    client.write(b"\x1b[4;9H".to_vec()).unwrap();
+    let update = update_until("cursor-only", &client, &mut cached, |update| {
+        matches!(update, FrameUpdate::Delta(delta)
+            if delta.rows.is_empty() && delta.cursor != prior_cursor)
+    });
+    let delta = match update {
+        FrameUpdate::Delta(delta) => delta,
+        FrameUpdate::Full(_) => {
+            panic!("cursor-only update unexpectedly required a full frame")
+        }
+    };
+    assert_eq!((delta.cursor.line, delta.cursor.column), (3, 8));
+    assert_eq!(delta.columns, baseline.columns);
+    assert_eq!(delta.lines, baseline.lines);
+    assert_eq!(delta.display_offset, baseline.display_offset);
+    assert_eq!(delta.history_size, baseline.history_size);
+    assert_eq!(delta.lines_evicted, baseline.lines_evicted);
+    assert_eq!(delta.alternate_screen, baseline.alternate_screen);
+    assert_eq!(delta.modes, baseline.modes);
+    assert_eq!(delta.selection, baseline.selection);
+    assert_eq!(delta.colors, baseline.colors);
+    assert_eq!(delta.title, baseline.title);
+    assert_eq!(delta.working_dir, baseline.working_dir);
+    assert_eq!(cached.rows, prior_rows);
+    assert_eq!(cached.cursor, delta.cursor);
+    assert_eq!(cached.title, "cursor-title");
+    assert!(cached
+        .rows
+        .iter()
+        .any(|row| row.text.contains("cursor row")));
+    client.close().unwrap();
 }
