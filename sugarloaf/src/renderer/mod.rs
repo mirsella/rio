@@ -1174,9 +1174,10 @@ impl Renderer {
         // overlays for hidden panels (callers `clear_image_overlays_for`
         // on hide / panel removal). The renderer just drains whatever
         // `image_overlays` currently holds.
-        let overlays: Vec<_> = image_overlays.values().flat_map(|v| v.iter()).collect();
+        let mut overlays: Vec<_> =
+            image_overlays.values().flat_map(|v| v.iter()).collect();
         if !overlays.is_empty() {
-            self.render_graphic_overlays(context, image_data, &overlays);
+            self.render_graphic_overlays(context, image_data, &mut overlays);
         } else {
             // No overlays visible — clear draw commands so stale images
             // don't keep rendering. Keep image_textures and image_data
@@ -1265,12 +1266,12 @@ impl Renderer {
     #[allow(clippy::too_many_arguments)]
     fn render_graphic_overlays(
         &mut self,
-        context: &mut crate::context::Context,
-        image_data: &mut rustc_hash::FxHashMap<
+        context: &crate::context::Context,
+        image_data: &rustc_hash::FxHashMap<
             crate::sugarloaf::graphics::GraphicKey,
             crate::sugarloaf::graphics::GraphicDataEntry,
         >,
-        overlays: &[&crate::sugarloaf::graphics::GraphicOverlay],
+        overlays: &mut [&crate::sugarloaf::graphics::GraphicOverlay],
     ) {
         // Off-screen textures are kept until the byte budget below
         // forces the least-recently-drawn ones out; they re-upload
@@ -1279,7 +1280,7 @@ impl Renderer {
         let current_frame = self.image_frame_counter;
 
         // Upload/update per-image textures
-        for overlay in overlays {
+        for overlay in overlays.iter() {
             let entry = match image_data.get(&overlay.image_id) {
                 Some(e) => e,
                 None => continue,
@@ -1472,10 +1473,9 @@ impl Renderer {
 
         // Build image draw commands (one instance per image placement). Keep
         // painter order independent of which panel produced the overlay.
-        let mut overlays = overlays.to_vec();
         overlays.sort_by_key(|overlay| overlay.z_index);
         self.image_draws.clear();
-        for overlay in overlays {
+        for overlay in overlays.iter() {
             if !self.image_textures.contains_key(&overlay.image_id) {
                 continue;
             }

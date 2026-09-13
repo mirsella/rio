@@ -53,6 +53,12 @@ pub struct SurfaceSnapshot {
     /// Atlas uploads/removals drained while the terminal lock was held. The
     /// session snapshotter incorporates these into its retained asset store.
     pub graphics_updates: Option<UpdateQueues>,
+    /// Atlas keys whose newest pixels were rejected by the bounded update
+    /// store. Consumers must discard any older cached pixels for these keys.
+    pub graphics_invalidated_keys: Vec<u64>,
+    /// The invalidation set exceeded its own bound, so all retained Atlas
+    /// pixels must be discarded before applying any accepted updates.
+    pub graphics_invalidate_all: bool,
     /// Graphics changes require a complete publication because deltas do not
     /// carry image pixels or placement state. Full-snapshot consumers reconcile
     /// against `atlas_keys` when a removal delta was discarded.
@@ -151,9 +157,8 @@ impl RenderState {
     }
 
     /// Update the render cache and capture all terminal-facing metadata under
-    /// one terminal lock. Active image pixels are counted before they are
-    /// cloned, so callers can reject an over-budget frame without allocating
-    /// a second copy of its graphics.
+    /// one terminal lock. Active image pixels are validated while the graphics
+    /// snapshot is cloned, avoiding a second traversal of Kitty images.
     pub fn update_with_surface_state(
         &mut self,
         surface: &Surface,
@@ -216,40 +221,38 @@ impl RenderState {
                 required_bytes: usize::MAX,
                 limit_bytes: graphics_item_limit,
             })?;
-        let retained_atlas_count = term
-            .graphics
-            .atlas_key_refs
-            .len()
-            .saturating_add(term.graphics.kitty_inactive_screen.atlas_key_refs.len());
-        if graphics_count > graphics_item_limit
-            || retained_atlas_count > graphics_item_limit
-        {
+        if graphics_count > graphics_item_limit {
             return Err(GraphicsSnapshotError {
                 required_bytes: usize::MAX,
                 limit_bytes: graphics_item_limit,
             });
         }
-        if let Some(required_bytes) = term
-            .graphics
-            .kitty_images
-            .values()
-            .map(|image| image.data.pixels.len())
-            .find(|&bytes| bytes > per_image_budget)
-        {
+        let atlas_keys = crate::atlas_keys_locked(&term);
+        if atlas_keys.len() > graphics_item_limit {
             return Err(GraphicsSnapshotError {
-                required_bytes,
-                limit_bytes: per_image_budget,
+                required_bytes: usize::MAX,
+                limit_bytes: graphics_item_limit,
             });
         }
-        let graphics_bytes = crate::active_graphics_bytes_locked(&term, graphics_budget)?;
-        let (
-            graphics_updates,
-            graphics_updates_over_budget,
-            graphics_removals_over_budget,
-        ) = {
-            let mut graphics_store = surface.graphics_updates.lock().unwrap();
-            graphics_store.take_with_over_budget()
-        };
+        let mut graphics_store = surface.graphics_updates.lock().unwrap();
+        let graphics_changed = kitty_graphics_changed || graphics_store.has_updates();
+        let dimensions_changed =
+            previous_columns != self.columns || previous_lines != self.rows.len();
+        let (graphics_bytes, graphics) =
+            if include_graphics || dimensions_changed || graphics_changed {
+                let (graphics, graphics_bytes) = crate::graphics_snapshot_locked(
+                    &term,
+                    graphics_budget,
+                    per_image_budget,
+                )?;
+                (graphics_bytes, Some(graphics))
+            } else {
+                (0, None)
+            };
+        // A rejected capture must leave uploads available for the next snapshot.
+        let (graphics_updates, _, graphics_invalidated_keys, graphics_invalidate_all) =
+            graphics_store.take_with_over_budget();
+        drop(graphics_store);
         let working_dir = term
             .current_directory
             .as_ref()
@@ -270,18 +273,6 @@ impl RenderState {
                     None
                 }
             });
-        let graphics_changed = kitty_graphics_changed
-            || graphics_updates.is_some()
-            || graphics_updates_over_budget
-            || graphics_removals_over_budget;
-        let dimensions_changed =
-            previous_columns != self.columns || previous_lines != self.rows.len();
-        let atlas_keys = crate::atlas_keys_locked(&term);
-        let graphics = if include_graphics || dimensions_changed || graphics_changed {
-            Some(crate::graphics_snapshot_locked(&term))
-        } else {
-            None
-        };
         // Consume the flag only after complete graphics state and update
         // queues have been captured under the terminal lock.
         term.graphics.kitty_graphics_dirty = false;
@@ -294,6 +285,8 @@ impl RenderState {
             graphics,
             atlas_keys,
             graphics_updates,
+            graphics_invalidated_keys,
+            graphics_invalidate_all,
             graphics_changed,
         })
     }
@@ -306,12 +299,13 @@ impl RenderState {
     }
 
     fn update_locked(&mut self, term: &mut Crosswords<Listener>) {
-        let damage = if self.rows.is_empty() {
+        let viewport_changed = term.display_offset() != self.display_offset;
+        let damage = if self.rows.is_empty() || viewport_changed {
             TerminalDamage::Full
         } else {
             match term.peek_damage_event() {
                 Some(damage) => damage,
-                None => TerminalDamage::Full,
+                None => TerminalDamage::Noop,
             }
         };
         term.snapshot_visible(
@@ -330,23 +324,25 @@ impl RenderState {
         self.lines_evicted = term.lines_evicted();
         self.history_size = self.lines_evicted as i64 + term.history_size() as i64;
         self.alt_screen = term.mode().contains(rio_vt::crosswords::Mode::ALT_SCREEN);
-        let mut kitty = std::mem::take(&mut self.kitty);
-        kitty.clear();
-        for placement in term.graphics.kitty_placements.values() {
-            if let Some(image) = term.graphics.get_kitty_image(placement.image_id) {
-                kitty.push(KittyEntry::Direct {
-                    placement: placement.clone(),
-                    image_width: image.data.width,
-                    image_height: image.data.height,
-                });
+        if !matches!(damage, TerminalDamage::Noop) || term.graphics.kitty_graphics_dirty {
+            let mut kitty = std::mem::take(&mut self.kitty);
+            kitty.clear();
+            for placement in term.graphics.kitty_placements.values() {
+                if let Some(image) = term.graphics.get_kitty_image(placement.image_id) {
+                    kitty.push(KittyEntry::Direct {
+                        placement: placement.clone(),
+                        image_width: image.data.width,
+                        image_height: image.data.height,
+                    });
+                }
             }
+            self.collect_virtual_runs(term, &mut kitty);
+            // Under-background placements (z < i32::MIN / 2) first, then
+            // under-text (z < 0), then over-text: drawing in order layers
+            // correctly, and the host can split the list at those bounds.
+            kitty.sort_by_key(KittyEntry::z_index);
+            self.kitty = kitty;
         }
-        self.collect_virtual_runs(term, &mut kitty);
-        // Under-background placements (z < i32::MIN / 2) first, then
-        // under-text (z < 0), then over-text: drawing in order layers
-        // correctly, and the host can split the list at those bounds.
-        kitty.sort_by_key(KittyEntry::z_index);
-        self.kitty = kitty;
         self.term_colors = *term.colors();
         let cursor = term.cursor();
         self.cursor_line = cursor.pos.row.0.max(0) as usize;
@@ -791,5 +787,83 @@ impl RenderState {
             text.push(if c == '\0' { ' ' } else { c });
         }
         text.trim_end().to_string()
+    }
+}
+
+#[cfg(all(test, feature = "pty", not(target_os = "windows")))]
+mod tests {
+    use super::*;
+    use crate::{Engine, SurfaceDelegate, SurfaceDesc, SurfaceId};
+    use std::sync::Arc;
+
+    struct NoopDelegate;
+
+    impl SurfaceDelegate for NoopDelegate {
+        fn wakeup(&self, _surface: SurfaceId) {}
+    }
+
+    #[cfg(feature = "graphics")]
+    #[test]
+    fn rejected_kitty_snapshot_preserves_pending_atlas_pixels() {
+        let engine = Engine::new(Arc::new(NoopDelegate));
+        let surface = engine.create_surface(&SurfaceDesc::default()).unwrap();
+        let mut state = RenderState::new(&surface);
+        surface.inject_output(b"\x1bPq\"1;1;1;1#0;2;100;0;0#0~\x1b\\");
+        surface.inject_output(b"\x1b_Gf=32,s=1,v=1,i=9;/////w==\x1b\\");
+
+        assert!(state
+            .update_with_surface_state(&surface, 0, usize::MAX, usize::MAX)
+            .is_err());
+        let recovered = state
+            .update_with_surface_state(&surface, usize::MAX, usize::MAX, usize::MAX)
+            .unwrap();
+        let updates = recovered.graphics_updates.expect("pending Sixel upload");
+        assert_eq!(updates.pending.len(), 1);
+        assert!(!updates.pending[0].pixels.is_empty());
+        assert_eq!(recovered.graphics.unwrap().kitty_images.len(), 1);
+    }
+
+    #[test]
+    fn noop_snapshot_refreshes_a_dirty_row_after_damage_is_consumed() {
+        let engine = Engine::new(Arc::new(NoopDelegate));
+        let surface = engine
+            .create_surface(&SurfaceDesc::default())
+            .expect("spawn shell");
+        let mut state = RenderState::new(&surface);
+
+        surface.inject_output(b"before\r\nkeep\x1b]2;dirty-row\x07");
+        let initial = state
+            .update_with_surface_state(&surface, usize::MAX, usize::MAX, usize::MAX)
+            .expect("capture initial state");
+        assert_eq!(initial.title, "dirty-row");
+        assert_eq!(state.text_row(0), "before");
+        assert_eq!(state.text_row(1), "keep");
+        let initial_cursor = state.cursor();
+        state.reset_dirty();
+
+        surface.inject_output(b"\x1b[1;1H\x1b[2Kafter");
+        {
+            let mut term = state.terminal.lock();
+            assert!(term.peek_damage_event().is_some());
+            term.reset_damage();
+            assert!(term.peek_damage_event().is_none());
+        }
+
+        let snapshot = state
+            .update_with_surface_state_for_delta(
+                &surface,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("capture dirty row after damage was consumed");
+        assert_eq!(snapshot.title, "dirty-row");
+        assert_eq!(initial_cursor, (1, 4));
+        assert_eq!(state.cursor(), (0, 5));
+        assert_eq!(state.text_row(0), "after");
+        assert_eq!(state.text_row(1), "keep");
+        assert!(state.rows()[0].inner.iter().any(|square| square.c() == 'a'));
+        assert!(state.row_dirty(0));
+        assert!(!state.row_dirty(1));
     }
 }

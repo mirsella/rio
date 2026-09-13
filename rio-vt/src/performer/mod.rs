@@ -153,18 +153,8 @@ impl State {
     }
 
     #[inline]
-    fn take_current(&mut self) -> Option<Writing> {
-        self.writing.take()
-    }
-
-    #[inline]
     fn needs_write(&self) -> bool {
         self.writing.is_some() || !self.write_list.is_empty()
-    }
-
-    #[inline]
-    fn set_current(&mut self, new: Option<Writing>) {
-        self.writing = new;
     }
 }
 
@@ -248,7 +238,7 @@ where
         let mut result = Ok(ReadOutcome::Budget);
 
         // Reserve the next terminal lock for PTY reading.
-        let _terminal_lease = Some(self.terminal.lease());
+        let _terminal_lease = self.terminal.lease();
         let mut terminal = None;
 
         loop {
@@ -346,11 +336,11 @@ where
     fn pty_write(&mut self, state: &mut State) -> io::Result<()> {
         state.ensure_next();
 
-        'write_many: while let Some(mut current) = state.take_current() {
+        'write_many: while let Some(mut current) = state.writing.take() {
             'write_one: loop {
                 match self.pty.writer().write(current.remaining_bytes()) {
                     Ok(0) => {
-                        state.set_current(Some(current));
+                        state.writing = Some(current);
                         break 'write_many;
                     }
                     Ok(n) => {
@@ -361,7 +351,7 @@ where
                         }
                     }
                     Err(err) => {
-                        state.set_current(Some(current));
+                        state.writing = Some(current);
                         match err.kind() {
                             ErrorKind::Interrupted | ErrorKind::WouldBlock => {
                                 break 'write_many
