@@ -59,10 +59,6 @@ pub struct SurfaceSnapshot {
     /// The invalidation set exceeded its own bound, so all retained Atlas
     /// pixels must be discarded before applying any accepted updates.
     pub graphics_invalidate_all: bool,
-    /// Graphics changes require a complete publication because deltas do not
-    /// carry image pixels or placement state. Full-snapshot consumers reconcile
-    /// against `atlas_keys` when a removal delta was discarded.
-    pub graphics_changed: bool,
 }
 
 /// One drawable kitty item: a direct overlay placement, or one row-run
@@ -120,10 +116,24 @@ pub struct RenderState {
     /// Baseline for image change stamps (Instants aren't representable
     /// over the C ABI; nanoseconds relative to this are).
     epoch: rio_vt::time::Instant,
+    /// Session snapshots do not use the renderer's resolved Kitty geometry.
+    /// Avoid rebuilding that cache and scanning placeholder rows there.
+    collect_kitty_geometry: bool,
 }
 
 impl RenderState {
     pub fn new(surface: &Surface) -> Self {
+        Self::new_with_kitty_geometry(surface, true)
+    }
+
+    /// Build render state for a consumer that serializes terminal state rather
+    /// than drawing Kitty overlays. The terminal graphics snapshot still owns
+    /// all protocol-visible images and placements.
+    pub fn new_for_snapshot(surface: &Surface) -> Self {
+        Self::new_with_kitty_geometry(surface, false)
+    }
+
+    fn new_with_kitty_geometry(surface: &Surface, collect_kitty_geometry: bool) -> Self {
         let terminal = surface.terminal();
         let (columns, term_colors) = {
             let term = terminal.lock();
@@ -147,6 +157,7 @@ impl RenderState {
             alt_screen: false,
             kitty: Vec::new(),
             epoch: rio_vt::time::Instant::now(),
+            collect_kitty_geometry,
         }
     }
 
@@ -287,7 +298,6 @@ impl RenderState {
             graphics_updates,
             graphics_invalidated_keys,
             graphics_invalidate_all,
-            graphics_changed,
         })
     }
 
@@ -324,7 +334,10 @@ impl RenderState {
         self.lines_evicted = term.lines_evicted();
         self.history_size = self.lines_evicted as i64 + term.history_size() as i64;
         self.alt_screen = term.mode().contains(rio_vt::crosswords::Mode::ALT_SCREEN);
-        if !matches!(damage, TerminalDamage::Noop) || term.graphics.kitty_graphics_dirty {
+        if self.collect_kitty_geometry
+            && (!matches!(damage, TerminalDamage::Noop)
+                || term.graphics.kitty_graphics_dirty)
+        {
             let mut kitty = std::mem::take(&mut self.kitty);
             kitty.clear();
             for placement in term.graphics.kitty_placements.values() {
@@ -802,11 +815,22 @@ mod tests {
         fn wakeup(&self, _surface: SurfaceId) {}
     }
 
+    fn quiet_surface() -> Surface {
+        // Tests inject terminal output directly; login scripts must not mutate it.
+        Engine::new(Arc::new(NoopDelegate))
+            .create_surface(&SurfaceDesc {
+                shell: Some("/bin/sh".into()),
+                args: vec!["-c".into(), "read -r _".into()],
+                clear_environment: true,
+                ..SurfaceDesc::default()
+            })
+            .expect("spawn quiet shell")
+    }
+
     #[cfg(feature = "graphics")]
     #[test]
     fn rejected_kitty_snapshot_preserves_pending_atlas_pixels() {
-        let engine = Engine::new(Arc::new(NoopDelegate));
-        let surface = engine.create_surface(&SurfaceDesc::default()).unwrap();
+        let surface = quiet_surface();
         let mut state = RenderState::new(&surface);
         surface.inject_output(b"\x1bPq\"1;1;1;1#0;2;100;0;0#0~\x1b\\");
         surface.inject_output(b"\x1b_Gf=32,s=1,v=1,i=9;/////w==\x1b\\");
@@ -825,10 +849,7 @@ mod tests {
 
     #[test]
     fn noop_snapshot_refreshes_a_dirty_row_after_damage_is_consumed() {
-        let engine = Engine::new(Arc::new(NoopDelegate));
-        let surface = engine
-            .create_surface(&SurfaceDesc::default())
-            .expect("spawn shell");
+        let surface = quiet_surface();
         let mut state = RenderState::new(&surface);
 
         surface.inject_output(b"before\r\nkeep\x1b]2;dirty-row\x07");
@@ -865,5 +886,21 @@ mod tests {
         assert!(state.rows()[0].inner.iter().any(|square| square.c() == 'a'));
         assert!(state.row_dirty(0));
         assert!(!state.row_dirty(1));
+    }
+
+    #[cfg(feature = "graphics")]
+    #[test]
+    fn snapshot_state_skips_renderer_kitty_geometry() {
+        let surface = quiet_surface();
+        let mut state = RenderState::new_for_snapshot(&surface);
+        surface.inject_output(
+            b"\x1b[6;5H\x1b_Gf=32,s=2,v=2,i=7,a=T;/wAA/wD/AP8AAP///////w==\x1b\\",
+        );
+
+        let snapshot = state
+            .update_with_surface_state(&surface, usize::MAX, usize::MAX, usize::MAX)
+            .expect("capture snapshot graphics");
+        assert!(state.kitty.is_empty());
+        assert_eq!(snapshot.graphics.unwrap().kitty_placements.len(), 1);
     }
 }

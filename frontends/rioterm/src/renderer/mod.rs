@@ -486,7 +486,7 @@ impl Renderer {
         // resident Sugarloaf grid can publish a usable first frame.
         let force_full_damage = has_active_changed || self.is_game_mode_enabled;
         for grid in context_manager.contexts_mut().iter_mut() {
-            if grid.route_ids().contains(&active_route) {
+            if grid.contains_route_id(active_route) {
                 continue;
             }
             for grid_context in grid.contexts_mut().values_mut() {

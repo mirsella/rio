@@ -71,9 +71,7 @@ pub trait GridPalette {
     fn ignore_selection_fg_color(&self) -> bool;
 }
 
-/// A single hint-mode label overlaid on a cell (leader-key jump
-/// target). Mirrors the frontend's own `HintLabel`; the frontend
-/// copies its fields into this at the call sites.
+/// A single hint-mode label overlaid on a cell (leader-key jump target).
 pub struct HintLabel {
     pub position: Pos,
     pub label: char,

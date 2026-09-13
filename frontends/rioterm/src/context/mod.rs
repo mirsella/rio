@@ -1018,7 +1018,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     fn grid_index_for_route(&self, route_id: usize) -> Option<usize> {
         self.contexts
             .iter()
-            .position(|grid| grid.route_ids().contains(&route_id))
+            .position(|grid| grid.contains_route_id(route_id))
     }
 
     #[cfg(all(feature = "wayland", target_os = "linux"))]
