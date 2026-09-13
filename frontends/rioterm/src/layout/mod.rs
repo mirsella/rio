@@ -632,7 +632,13 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             let contexts = recover_contexts(by_route, inner);
             return Err((contexts, "transfer layout active route is missing".into()));
         };
-        let root = inner.keys().next().copied();
+        let root = Some(
+            inner
+                .keys()
+                .next()
+                .copied()
+                .expect("validated transfer layout has no panes"),
+        );
         let border_config = BorderConfig {
             width: panel_config.border_width,
             color: border_color,
@@ -1025,12 +1031,15 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     ) -> Result<NodeId, TaffyError> {
         // Current is already the NodeId
         let current_node = self.current;
-        if !self.inner.contains_key(&current_node) {
-            return Err(TaffyError::InvalidInputNode(self.root_node));
-        }
+        self.inner
+            .get(&current_node)
+            .expect("grid current node is missing");
 
         // Find the parent of the current node
-        let parent_node = self.tree.parent(current_node).unwrap_or(self.root_node);
+        let parent_node = self
+            .tree
+            .parent(current_node)
+            .expect("grid current node has no parent");
 
         // Inherit the current panel's flex properties so the container
         // keeps the same proportion in its parent (e.g. 80/20 split).
@@ -1062,7 +1071,10 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
         // Get the index of current_node in its parent
         let children = self.tree.children(parent_node)?;
-        let current_index = children.iter().position(|&n| n == current_node);
+        let current_index = children
+            .iter()
+            .position(|&n| n == current_node)
+            .expect("grid current node is not in its parent");
 
         // Remove current_node from parent
         self.tree.remove_child(parent_node, current_node)?;
@@ -1072,12 +1084,8 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         self.tree.add_child(container_node, new_node)?;
 
         // Insert container at the same position in parent
-        if let Some(idx) = current_index {
-            self.tree
-                .insert_child_at_index(parent_node, idx, container_node)?;
-        } else {
-            self.tree.add_child(parent_node, container_node)?;
-        }
+        self.tree
+            .insert_child_at_index(parent_node, current_index, container_node)?;
 
         Ok(new_node)
     }
@@ -1380,12 +1388,14 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
 
         let keys = self.get_ordered_keys();
-        if let Some(current_pos) = keys.iter().position(|&k| k == self.current) {
-            if current_pos >= keys.len() - 1 {
-                self.current = keys[0];
-            } else {
-                self.current = keys[current_pos + 1];
-            }
+        let current_pos = keys
+            .iter()
+            .position(|&k| k == self.current)
+            .expect("grid current node is missing");
+        if current_pos >= keys.len() - 1 {
+            self.current = keys[0];
+        } else {
+            self.current = keys[current_pos + 1];
         }
     }
 
@@ -1396,15 +1406,16 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
 
         let keys = self.get_ordered_keys();
-        if let Some(current_pos) = keys.iter().position(|&k| k == self.current) {
-            if current_pos >= keys.len() - 1 {
-                return false;
-            } else {
-                self.current = keys[current_pos + 1];
-                return true;
-            }
+        let current_pos = keys
+            .iter()
+            .position(|&k| k == self.current)
+            .expect("grid current node is missing");
+        if current_pos >= keys.len() - 1 {
+            false
+        } else {
+            self.current = keys[current_pos + 1];
+            true
         }
-        false
     }
 
     #[inline]
@@ -1414,12 +1425,14 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
 
         let keys = self.get_ordered_keys();
-        if let Some(current_pos) = keys.iter().position(|&k| k == self.current) {
-            if current_pos == 0 {
-                self.current = keys[keys.len() - 1];
-            } else {
-                self.current = keys[current_pos - 1];
-            }
+        let current_pos = keys
+            .iter()
+            .position(|&k| k == self.current)
+            .expect("grid current node is missing");
+        if current_pos == 0 {
+            self.current = keys[keys.len() - 1];
+        } else {
+            self.current = keys[current_pos - 1];
         }
     }
 
@@ -1430,15 +1443,16 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
 
         let keys = self.get_ordered_keys();
-        if let Some(current_pos) = keys.iter().position(|&k| k == self.current) {
-            if current_pos == 0 {
-                return false;
-            } else {
-                self.current = keys[current_pos - 1];
-                return true;
-            }
+        let current_pos = keys
+            .iter()
+            .position(|&k| k == self.current)
+            .expect("grid current node is missing");
+        if current_pos == 0 {
+            false
+        } else {
+            self.current = keys[current_pos - 1];
+            true
         }
-        false
     }
 
     #[inline]
@@ -1447,84 +1461,44 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     }
 
     pub fn current(&self) -> &Context<T> {
-        if let Some(item) = self.inner.get(&self.current) {
-            &item.val
-        } else {
-            // This should never happen, but if it does, return the first context
-            tracing::error!("Current key {:?} not found in grid", self.current);
-            if let Some(root) = self.root {
-                if let Some(item) = self.inner.get(&root) {
-                    return &item.val;
-                }
-            }
-            // If even root is not found, panic as this indicates a serious bug
-            panic!("Grid is in an invalid state - no contexts available");
-        }
+        &self
+            .inner
+            .get(&self.current)
+            .expect("grid current node is missing")
+            .val
     }
 
     #[inline]
     pub fn current_mut(&mut self) -> &mut Context<T> {
-        let current_key = self.current;
-
-        // Check if current key exists, if not try to fix it
-        if !self.inner.contains_key(&current_key) {
-            tracing::error!("Current key {:?} not found in grid", current_key);
-            if let Some(root) = self.root {
-                self.current = root;
-            } else if let Some(first_key) = self.inner.keys().next() {
-                self.current = *first_key;
-                self.root = Some(*first_key);
-            } else {
-                panic!("Grid is in an invalid state - no contexts available");
-            }
-        }
-
-        // Now get the mutable reference
-        let current_key = self.current;
-        if let Some(item) = self.inner.get_mut(&current_key) {
-            &mut item.val
-        } else {
-            panic!(
-                "Grid is in an invalid state - current key not found after fix attempt"
-            );
-        }
+        &mut self
+            .inner
+            .get_mut(&self.current)
+            .expect("grid current node is missing")
+            .val
     }
 
     pub fn current_context_with_computed_dimension(&self) -> (&Context<T>, Margin) {
+        let current_item = self
+            .inner
+            .get(&self.current)
+            .expect("grid current node is missing");
         let len = self.inner.len();
         if len <= 1 {
-            if let Some(item) = self.inner.get(&self.current) {
-                return (&item.val, self.scaled_margin);
-            } else if let Some(root) = self.root {
-                if let Some(item) = self.inner.get(&root) {
-                    return (&item.val, self.scaled_margin);
-                }
-            }
-            panic!("Grid is in an invalid state - no contexts available");
+            return (&current_item.val, self.scaled_margin);
         }
 
-        if let Some(current_item) = self.inner.get(&self.current) {
-            // For multi-panel layouts, the margin must include the panel's
-            // absolute offset so that mouse coordinates (which are relative
-            // to the window) are correctly translated to panel-local grid
-            // positions.
-            let [abs_x, abs_y, _, _] = current_item.layout_rect;
-            let margin = Margin {
-                left: self.scaled_margin.left + abs_x,
-                top: self.scaled_margin.top + abs_y,
-                right: self.scaled_margin.right,
-                bottom: self.scaled_margin.bottom,
-            };
-            (&current_item.val, margin)
-        } else {
-            tracing::error!("Current key {:?} not found in grid", self.current);
-            if let Some(root) = self.root {
-                if let Some(item) = self.inner.get(&root) {
-                    return (&item.val, self.scaled_margin);
-                }
-            }
-            panic!("Grid is in an invalid state - no contexts available");
-        }
+        // For multi-panel layouts, the margin must include the panel's
+        // absolute offset so that mouse coordinates (which are relative
+        // to the window) are correctly translated to panel-local grid
+        // positions.
+        let [abs_x, abs_y, _, _] = current_item.layout_rect;
+        let margin = Margin {
+            left: self.scaled_margin.left + abs_x,
+            top: self.scaled_margin.top + abs_y,
+            right: self.scaled_margin.right,
+            bottom: self.scaled_margin.bottom,
+        };
+        (&current_item.val, margin)
     }
 
     #[inline]
@@ -1551,35 +1525,30 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
     #[inline]
     pub fn grid_dimension(&self) -> ContextDimension {
-        if let Some(current_item) = self.inner.get(&self.current) {
-            let current_context_dimension = current_item.val.dimension;
-            let scale = current_context_dimension.dimension.scale;
-            // scaled_margin is already in physical pixels, but
-            // ContextDimension::build scales the margin again via compute(),
-            // so unscale it here to avoid double-scaling.
-            let unscaled_margin = if scale > 0.0 {
-                Margin::new(
-                    self.scaled_margin.top / scale,
-                    self.scaled_margin.right / scale,
-                    self.scaled_margin.bottom / scale,
-                    self.scaled_margin.left / scale,
-                )
-            } else {
-                self.scaled_margin
-            };
-            ContextDimension::build(
-                self.width,
-                self.height,
-                current_context_dimension.dimension,
-                current_context_dimension.cell,
-                current_context_dimension.line_height,
-                current_context_dimension.font_size,
-                unscaled_margin,
+        let current_context_dimension = self.current().dimension;
+        let scale = current_context_dimension.dimension.scale;
+        // scaled_margin is already in physical pixels, but
+        // ContextDimension::build scales the margin again via compute(),
+        // so unscale it here to avoid double-scaling.
+        let unscaled_margin = if scale > 0.0 {
+            Margin::new(
+                self.scaled_margin.top / scale,
+                self.scaled_margin.right / scale,
+                self.scaled_margin.bottom / scale,
+                self.scaled_margin.left / scale,
             )
         } else {
-            tracing::error!("Current key {:?} not found in grid", self.current);
-            ContextDimension::default()
-        }
+            self.scaled_margin
+        };
+        ContextDimension::build(
+            self.width,
+            self.height,
+            current_context_dimension.dimension,
+            current_context_dimension.cell,
+            current_context_dimension.line_height,
+            current_context_dimension.font_size,
+            unscaled_margin,
+        )
     }
 
     pub fn update_scaled_margin(&mut self, scaled_margin: Margin) {
@@ -1686,7 +1655,11 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         let previous = self.current;
         self.current = key;
         self.remove_current(sugarloaf);
-        if previous != key && self.inner.contains_key(&previous) {
+        if previous != key {
+            assert!(
+                self.inner.contains_key(&previous),
+                "grid selection disappeared while removing a route"
+            );
             self.current = previous;
         }
         true
@@ -1706,38 +1679,23 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
         let to_remove = self.current;
 
-        if !self.inner.contains_key(&to_remove) {
-            tracing::error!("Current key {:?} not found in grid", to_remove);
-            return;
-        }
-
         // Get rich text ID before removing
-        let rich_text_id = self.inner.get(&to_remove).map(|item| item.val.rich_text_id);
-        let route_id = self.inner.get(&to_remove).map(|item| item.val.route_id);
+        let item = self
+            .inner
+            .get(&to_remove)
+            .expect("grid current node is missing");
+        let rich_text_id = item.val.rich_text_id;
+        let route_id = item.val.route_id;
 
         // Select next panel before removing (use visual ordering)
         let ordered_keys = self.get_ordered_keys();
         let current_pos = ordered_keys.iter().position(|&k| k == to_remove);
-        let next_current = if let Some(pos) = current_pos {
-            // Try next panel, or previous if we're at the end
-            if pos + 1 < ordered_keys.len() {
-                ordered_keys[pos + 1]
-            } else if pos > 0 {
-                ordered_keys[pos - 1]
-            } else {
-                // Fallback to any other panel
-                *ordered_keys
-                    .iter()
-                    .find(|&&k| k != to_remove)
-                    .unwrap_or(&to_remove)
-            }
+        let current_pos =
+            current_pos.expect("grid current node is missing from layout order");
+        let next_current = if current_pos + 1 < ordered_keys.len() {
+            ordered_keys[current_pos + 1]
         } else {
-            // Fallback to first panel
-            *self
-                .inner
-                .keys()
-                .find(|&&k| k != to_remove)
-                .unwrap_or(&to_remove)
+            ordered_keys[current_pos - 1]
         };
 
         // Remove from Taffy - to_remove IS the NodeId
@@ -1748,16 +1706,18 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
         // Drop image overlays for the removed panel — sugarloaf has
         // no other panel state to clean up post-Content removal.
-        if let Some(id) = rich_text_id {
-            sugarloaf.clear_image_overlays_for(id);
-        }
-        if let Some(route_id) = route_id {
-            sugarloaf.remove_route_images(route_id);
-        }
+        sugarloaf.clear_image_overlays_for(rich_text_id);
+        sugarloaf.remove_route_images(route_id);
 
         // Update root if necessary
         if Some(to_remove) == self.root {
-            self.root = self.inner.keys().next().copied();
+            self.root = Some(
+                self.inner
+                    .keys()
+                    .next()
+                    .copied()
+                    .expect("grid root disappeared while removing a panel"),
+            );
         }
 
         // Set new current
@@ -1794,15 +1754,19 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         self.current = to_remove;
         self.remove_current(sugarloaf);
         if selected != to_remove {
+            assert!(
+                self.inner.contains_key(&selected),
+                "grid selection disappeared while removing a route"
+            );
             self.current = selected;
         }
         true
     }
 
     pub fn split_right(&mut self, context: Context<T>) {
-        if !self.inner.contains_key(&self.current) {
-            return;
-        }
+        self.inner
+            .get(&self.current)
+            .expect("grid current node is missing");
 
         // Create taffy node first, then item
         if let Ok(new_node) = self.try_split_right() {
@@ -1815,9 +1779,9 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
 
     /// Split down - create new panel below using Taffy
     pub fn split_down(&mut self, context: Context<T>) {
-        if !self.inner.contains_key(&self.current) {
-            return;
-        }
+        self.inner
+            .get(&self.current)
+            .expect("grid current node is missing");
 
         // Create taffy node first, then item
         if let Ok(new_node) = self.try_split_down() {

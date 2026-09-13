@@ -232,6 +232,14 @@ fn transfer_exit_ready(
     transferred && windows == 0 && pending == 0 && !bootstrap
 }
 
+fn current_route_if_contexts_remain<
+    T: rio_backend::event::EventListener + Clone + Send + 'static,
+>(
+    context_manager: &crate::context::ContextManager<T>,
+) -> Option<usize> {
+    (!context_manager.is_empty()).then(|| context_manager.current_route())
+}
+
 fn validate_committed_routes(
     source_routes: &[u64],
     committed_routes: Vec<u64>,
@@ -277,6 +285,25 @@ mod outgoing_transfer_tests {
     #[test]
     fn committed_routes_reject_large_unknown_ids() {
         assert!(validate_committed_routes(&[11, 22], vec![u64::MAX]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pending_transfer_tests {
+    use super::current_route_if_contexts_remain;
+    use crate::context::ContextManager;
+    use rio_backend::event::{VoidListener, WindowId};
+
+    #[test]
+    fn empty_transfer_target_has_no_route_to_redraw() {
+        let mut context_manager =
+            ContextManager::start_with_capacity(1, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        context_manager
+            .extract_grid(0)
+            .expect("the bootstrap grid should be removable");
+
+        assert_eq!(current_route_if_contexts_remain(&context_manager), None);
     }
 }
 
@@ -2132,6 +2159,7 @@ impl<'a> Application<'a> {
 }
 
 impl<'a> Application<'a> {
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     fn transfer_window_to_target(
         &mut self,
         source_id: rio_backend::event::WindowId,
@@ -3328,6 +3356,7 @@ impl Application<'_> {
             .unwrap_or_default();
         for event in events {
             match event {
+                #[cfg(all(feature = "wayland", target_os = "linux"))]
                 crate::router::window_control::WindowControlEvent::DragResult {
                     transfer_id,
                     result,
@@ -3361,8 +3390,6 @@ impl Application<'_> {
                             self.show_merge_error(drag.window.into(), error);
                         }
                     }
-                    #[cfg(not(all(feature = "wayland", target_os = "linux")))]
-                    let _ = (transfer_id, result);
                 }
                 crate::router::window_control::WindowControlEvent::Probe {
                     window_id,
@@ -3639,6 +3666,7 @@ impl Application<'_> {
                     &[placeholder],
                     &mut route.window.screen.sugarloaf,
                 );
+            route.window.screen.discard_routes([placeholder]);
         }
         route.window.screen.refresh_after_tab_transfer(size);
         let routes = source_routes
@@ -3787,19 +3815,28 @@ impl Application<'_> {
         window_id: rio_backend::event::WindowId,
         routes: &[usize],
     ) -> Option<usize> {
-        let route = self.router.routes.get_mut(&window_id)?;
-        route
-            .window
-            .screen
-            .context_manager
-            .remove_transferred_routes(routes, &mut route.window.screen.sugarloaf);
-        if !route.window.screen.context_manager.is_empty() {
-            let size = route.window.winit_window.inner_size();
-            route.window.screen.refresh_after_tab_transfer(size);
+        let current_route = {
+            let route = self.router.routes.get_mut(&window_id)?;
+            route
+                .window
+                .screen
+                .context_manager
+                .remove_transferred_routes(routes, &mut route.window.screen.sugarloaf);
+            route.window.screen.discard_routes(routes.iter().copied());
+            let current_route =
+                current_route_if_contexts_remain(&route.window.screen.context_manager);
+            if current_route.is_some() {
+                let size = route.window.winit_window.inner_size();
+                route.window.screen.refresh_after_tab_transfer(size);
+                route.request_redraw();
+            }
+            current_route
+        };
+        if current_route.is_none() {
+            self.clear_merge_if_window(window_id);
+            self.router.remove_route(window_id);
         }
-        let current_route = route.window.screen.context_manager.current_route();
-        route.request_redraw();
-        Some(current_route)
+        current_route
     }
 
     fn finish_ready_prepared(
