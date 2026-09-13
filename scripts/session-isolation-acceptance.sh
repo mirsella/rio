@@ -198,6 +198,21 @@ wait_for_image_change() {
     die "timed out waiting for $description"
 }
 
+wait_for_region_change() {
+    local description=$1 first=$2 second=$3 geometry=$4 output=$5
+    local window=${6:-$destination_window} deadline=$((SECONDS + 6))
+    while ((SECONDS < deadline)); do
+        capture_window "$window" "$second"
+        capture_region "$second" "$output" "$geometry"
+        if image_changed "$first" "$output"; then
+            log "$description observed"
+            return 0
+        fi
+        sleep 0.2
+    done
+    die "timed out waiting for $description"
+}
+
 image_dimensions_changed() {
     local before=$1 after=$2
     [[ -f "$before" && -f "$after" ]] || return 1
@@ -330,6 +345,11 @@ merge_before="$RUN_DIR/merge-target-before.png"
 merge_armed="$RUN_DIR/merge-target-armed.png"
 merge_highlight="$RUN_DIR/merge-target-highlight.png"
 merge_cancelled="$RUN_DIR/merge-target-cancelled.png"
+merge_overlay_geometry='400x300+200+100'
+merge_before_overlay="$RUN_DIR/merge-target-before-overlay.png"
+merge_armed_overlay="$RUN_DIR/merge-target-armed-overlay.png"
+merge_highlight_overlay="$RUN_DIR/merge-target-highlight-overlay.png"
+merge_cancelled_overlay="$RUN_DIR/merge-target-cancelled-overlay.png"
 "$XDOTTOOL" windowraise "$destination_window" 2>/dev/null || true
 "$XDOTTOOL" windowfocus --sync "$destination_window" 2>/dev/null || true
 sleep 0.4
@@ -337,21 +357,23 @@ capture_window "$destination_window" "$merge_before"
 palette_action "$source_window" "Merge Tab"
 sleep 1
 capture_window "$destination_window" "$merge_armed"
-capture_region "$merge_before" "$RUN_DIR/merge-target-before-tabs.png" '800x48+0+0'
-capture_region "$merge_armed" "$RUN_DIR/merge-target-armed-tabs.png" '800x48+0+0'
+capture_region "$merge_before" "$merge_before_overlay" "$merge_overlay_geometry"
+capture_region "$merge_armed" "$merge_armed_overlay" "$merge_overlay_geometry"
 assert_region_unchanged "no target highlight before pointer entry" \
-    "$RUN_DIR/merge-target-before-tabs.png" "$RUN_DIR/merge-target-armed-tabs.png"
+    "$merge_before_overlay" "$merge_armed_overlay"
 "$XDOTTOOL" mousemove --window "$destination_window" 120 20
 wait_until "target-local pointer event" 6 \
     "[[ -f \"$destination_rio_log\" ]] && grep -Eq 'native merge target pointer (entered|moved)' \"$destination_rio_log\""
-wait_for_image_change "authenticated target highlight" "$merge_before" "$merge_highlight"
+wait_for_region_change "authenticated target highlight" "$merge_before_overlay" \
+    "$merge_highlight" "$merge_overlay_geometry" "$merge_highlight_overlay"
 "$XDOTTOOL" windowraise "$source_window" 2>/dev/null || true
 "$XDOTTOOL" windowfocus --sync "$source_window" 2>/dev/null || true
 "$XDOTTOOL" windowactivate --sync "$source_window" 2>/dev/null || true
 "$XDOTTOOL" key --window "$source_window" --clearmodifiers Escape
 wait_until "authenticated target cancellation" 6 \
     "[[ -f \"$destination_rio_log\" ]] && (( \$(grep -Fc 'window overlay state updated' \"$destination_rio_log\") >= 2 ))"
-wait_for_image_change "target highlight cancellation cleanup" "$merge_highlight" "$merge_cancelled"
+wait_for_region_change "target highlight cancellation cleanup" "$merge_highlight_overlay" \
+    "$merge_cancelled" "$merge_overlay_geometry" "$merge_cancelled_overlay"
 
 # Repeat the public action and complete it with a target-local X11 click.
 merge_commit_before="$RUN_DIR/merge-commit-before.png"

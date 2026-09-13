@@ -61,6 +61,13 @@ start_gui() {
     PIDS+=("$STARTED_PID")
 }
 
+wait_for_process_window() {
+    local pid=$1 result
+    wait_until "window for process $pid" 15 \
+        "result=\$(window_for_pid \"$pid\" 2>/dev/null || true); [[ -n \"\$result\" ]]"
+    window_for_pid "$pid"
+}
+
 palette_action() {
     local window=$1 query=$2
     "$XDOTTOOL" windowactivate --sync "$window" 2>/dev/null || true
@@ -96,7 +103,7 @@ source_ack="$RUN_DIR/source-ack.txt"
 wait_for_text "$source_ack" READY "source shell startup"
 source_worker=$(session_worker "$source_gui") || die "source worker not found"
 source_shell=$(shell_child "$source_worker") || die "source shell not found"
-source_window=$(window_for_pid "$source_gui") || die "source window not found"
+source_window=$(wait_for_process_window "$source_gui") || die "source window not found"
 "$XDOTTOOL" windowactivate --sync "$source_window" 2>/dev/null || true
 "$XDOTTOOL" windowfocus --sync "$source_window" 2>/dev/null || true
 "$XDOTTOOL" type --clearmodifiers --delay 2 --window "$source_window" a
@@ -115,7 +122,11 @@ start_gui recovery
 recovery_gui=$STARTED_PID
 recovery_ack="$RUN_DIR/recovery-ack.txt"
 wait_for_text "$recovery_ack" READY "recovery GUI shell startup"
-recovery_window=$(window_for_pid "$recovery_gui") || die "recovery window not found"
+recovery_worker=$(session_worker "$recovery_gui") || die "recovery worker not found"
+recovery_shell=$(shell_child "$recovery_worker") || die "recovery shell not found"
+ORPHANS+=("$recovery_worker" "$recovery_shell")
+log "recorded recovery gui=$recovery_gui worker=$recovery_worker shell=$recovery_shell"
+recovery_window=$(wait_for_process_window "$recovery_gui") || die "recovery window not found"
 palette_action "$recovery_window" "Recover Saved Session"
 
 # Recovery candidates are prepared asynchronously. The application opens the
