@@ -30,12 +30,12 @@ use rio_vt::event::Msg;
 use rio_vt::event::WindowSize;
 use rio_vt::event::{EventListener, RioEvent, WindowId};
 #[cfg(feature = "pty")]
-use rio_vt::event::{InputBudget, InputBudgetError};
+use rio_vt::event::{InputBudget, InputBudgetError, InputReservation};
 #[cfg(feature = "pty")]
 use rio_vt::performer::Machine;
 use rio_vt::selection::{Selection, SelectionType};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::error::Error;
 #[cfg(feature = "pty")]
 use std::sync::atomic::AtomicU8;
@@ -153,6 +153,53 @@ impl std::fmt::Display for InputError {
 
 impl Error for InputError {}
 
+/// A parser-generated reply that is still carrying its input-budget
+/// reservation. Worker transports can retain it until earlier terminal
+/// replies are ready without losing the bounded-input accounting.
+pub struct PtyWrite {
+    bytes: Cow<'static, [u8]>,
+    #[cfg(feature = "pty")]
+    reservation: Option<InputReservation>,
+}
+
+impl PtyWrite {
+    #[cfg(feature = "pty")]
+    fn reserved(bytes: Cow<'static, [u8]>, reservation: InputReservation) -> Self {
+        Self {
+            bytes,
+            reservation: Some(reservation),
+        }
+    }
+
+    fn unreserved(bytes: Cow<'static, [u8]>) -> Self {
+        Self {
+            bytes,
+            #[cfg(feature = "pty")]
+            reservation: None,
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[cfg(feature = "pty")]
+    fn into_message(mut self) -> Msg {
+        match self.reservation.take() {
+            Some(reservation) => Msg::InputBounded {
+                input: self.bytes,
+                reservation,
+            },
+            None => Msg::Input(self.bytes),
+        }
+    }
+}
+
+pub enum PtyWriteResult {
+    Handled,
+    Passthrough(PtyWrite),
+}
+
 /// A copy of active terminal graphics metadata for a session frontend.
 /// Process-local timestamps are deliberately omitted; frame sequences and
 /// image identity are the cache keys across a process boundary.
@@ -176,37 +223,80 @@ const MAX_RETAINED_GRAPHICS_ITEMS: usize = 4096;
 pub(crate) struct GraphicsUpdateStore {
     atlas: HashMap<u64, rio_graphics::GraphicData>,
     removed: HashSet<u64>,
+    invalidated: HashSet<u64>,
+    invalidate_all: bool,
     bytes: usize,
     over_budget: bool,
-    removals_over_budget: bool,
 }
 
 impl GraphicsUpdateStore {
+    fn has_updates(&self) -> bool {
+        !self.atlas.is_empty()
+            || !self.removed.is_empty()
+            || !self.invalidated.is_empty()
+            || self.over_budget
+            || self.invalidate_all
+    }
+
+    fn remove_atlas(&mut self, key: u64) {
+        if let Some(graphic) = self.atlas.remove(&key) {
+            self.bytes = self
+                .bytes
+                .checked_sub(graphic.pixels.len())
+                .expect("graphics store byte accounting underflow");
+        }
+    }
+
+    fn invalidate(&mut self, key: u64) {
+        self.remove_atlas(key);
+        if self.invalidate_all || !self.invalidated.insert(key) {
+            return;
+        }
+        if self.invalidated.len() > MAX_RETAINED_GRAPHICS_ITEMS {
+            self.invalidated.clear();
+            self.invalidate_all = true;
+        }
+    }
+
     fn merge(&mut self, queues: rio_vt::ansi::graphics::UpdateQueues) {
         for graphic in queues.pending {
             let key = rio_graphics::atlas_image_key(graphic.id.get());
-            let old_bytes = self.atlas.get(&key).map_or(0, |old| old.pixels.len());
-            if !self.atlas.contains_key(&key)
-                && self.atlas.len() >= MAX_RETAINED_GRAPHICS_ITEMS
-            {
-                self.over_budget = true;
-                continue;
-            }
-            let Some(bytes) = self
-                .bytes
-                .checked_sub(old_bytes)
-                .and_then(|bytes| bytes.checked_add(graphic.pixels.len()))
-            else {
-                self.over_budget = true;
-                continue;
+            let has_capacity = self.atlas.len() < MAX_RETAINED_GRAPHICS_ITEMS;
+            let accepted = {
+                let entry = self.atlas.entry(key);
+                let old_bytes = match &entry {
+                    Entry::Occupied(entry) => Some(entry.get().pixels.len()),
+                    Entry::Vacant(_) => None,
+                };
+                let bytes = (old_bytes.is_some() || has_capacity)
+                    .then(|| {
+                        self.bytes
+                            .checked_sub(old_bytes.unwrap_or(0))
+                            .and_then(|bytes| bytes.checked_add(graphic.pixels.len()))
+                    })
+                    .flatten();
+                if let Some(bytes) =
+                    bytes.filter(|bytes| *bytes <= MAX_RETAINED_GRAPHICS_BYTES)
+                {
+                    self.bytes = bytes;
+                    match entry {
+                        Entry::Occupied(mut entry) => {
+                            entry.insert(graphic);
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(graphic);
+                        }
+                    }
+                    self.removed.remove(&key);
+                    true
+                } else {
+                    false
+                }
             };
-            if bytes > MAX_RETAINED_GRAPHICS_BYTES {
+            if !accepted {
                 self.over_budget = true;
-                continue;
+                self.invalidate(key);
             }
-            self.bytes = bytes;
-            self.atlas.insert(key, graphic);
-            self.removed.remove(&key);
         }
 
         // Kitty uploads remain authoritative in Crosswords::kitty_images and
@@ -215,55 +305,50 @@ impl GraphicsUpdateStore {
         drop(queues.pending_images);
 
         for key in queues.remove_queue {
-            if let Some(graphic) = self.atlas.remove(&key) {
-                self.bytes =
-                    self.bytes
-                        .checked_sub(graphic.pixels.len())
-                        .unwrap_or_else(|| {
-                            self.over_budget = true;
-                            0
-                        });
-            }
-            if !self.removed.contains(&key)
-                && self.removed.len() >= MAX_RETAINED_GRAPHICS_ITEMS
+            self.remove_atlas(key);
+            if self.removed.insert(key)
+                && self.removed.len() > MAX_RETAINED_GRAPHICS_ITEMS
             {
+                self.removed.remove(&key);
                 self.over_budget = true;
-                self.removals_over_budget = true;
                 continue;
             }
-            self.removed.insert(key);
         }
-    }
-
-    fn take(&mut self) -> Option<rio_vt::ansi::graphics::UpdateQueues> {
-        if self.atlas.is_empty() && self.removed.is_empty() {
-            return None;
-        }
-        self.bytes = 0;
-        let mut pending = self
-            .atlas
-            .drain()
-            .map(|(_, graphic)| graphic)
-            .collect::<Vec<_>>();
-        pending.sort_by_key(|graphic| graphic.id.get());
-        let mut remove_queue = self.removed.drain().collect::<Vec<_>>();
-        remove_queue.sort_unstable();
-        Some(rio_vt::ansi::graphics::UpdateQueues {
-            pending,
-            pending_images: Vec::new(),
-            remove_queue,
-        })
     }
 
     fn take_with_over_budget(
         &mut self,
-    ) -> (Option<rio_vt::ansi::graphics::UpdateQueues>, bool, bool) {
+    ) -> (
+        Option<rio_vt::ansi::graphics::UpdateQueues>,
+        bool,
+        Vec<u64>,
+        bool,
+    ) {
         let over_budget = self.over_budget;
-        let removals_over_budget = self.removals_over_budget;
-        let updates = self.take();
+        let updates = if self.atlas.is_empty() && self.removed.is_empty() {
+            None
+        } else {
+            self.bytes = 0;
+            let mut pending = self
+                .atlas
+                .drain()
+                .map(|(_, graphic)| graphic)
+                .collect::<Vec<_>>();
+            pending.sort_by_key(|graphic| graphic.id.get());
+            let mut remove_queue = self.removed.drain().collect::<Vec<_>>();
+            remove_queue.sort_unstable();
+            Some(rio_vt::ansi::graphics::UpdateQueues {
+                pending,
+                pending_images: Vec::new(),
+                remove_queue,
+            })
+        };
+        let mut invalidated = self.invalidated.drain().collect::<Vec<_>>();
+        invalidated.sort_unstable();
+        let invalidate_all = self.invalidate_all;
         self.over_budget = false;
-        self.removals_over_budget = false;
-        (updates, over_budget, removals_over_budget)
+        self.invalidate_all = false;
+        (updates, over_budget, invalidated, invalidate_all)
     }
 }
 
@@ -285,54 +370,62 @@ impl std::fmt::Display for GraphicsSnapshotError {
 
 impl Error for GraphicsSnapshotError {}
 
-fn active_graphics_bytes_locked(
+fn graphics_snapshot_locked(
     terminal: &Crosswords<Listener>,
-    limit_bytes: usize,
-) -> Result<usize, GraphicsSnapshotError> {
+    graphics_limit: usize,
+    per_image_limit: usize,
+) -> Result<(GraphicsSnapshot, usize), GraphicsSnapshotError> {
     let mut required_bytes = 0usize;
-    for image in terminal.graphics.kitty_images.values() {
-        required_bytes = required_bytes.checked_add(image.data.pixels.len()).ok_or(
-            GraphicsSnapshotError {
-                required_bytes: usize::MAX,
-                limit_bytes,
-            },
-        )?;
-        if required_bytes > limit_bytes {
+    let mut graphics_error = None;
+    let mut kitty_images = Vec::with_capacity(terminal.graphics.kitty_images.len());
+    for (id, image) in &terminal.graphics.kitty_images {
+        let image_bytes = image.data.pixels.len();
+        if image_bytes > per_image_limit {
             return Err(GraphicsSnapshotError {
-                required_bytes,
-                limit_bytes,
+                required_bytes: image_bytes,
+                limit_bytes: per_image_limit,
             });
         }
+        if graphics_error.is_none() {
+            match required_bytes.checked_add(image_bytes) {
+                Some(total) if total <= graphics_limit => {
+                    required_bytes = total;
+                    kitty_images.push((*id, image.data.clone()));
+                }
+                Some(total) => graphics_error = Some(total),
+                None => graphics_error = Some(usize::MAX),
+            }
+        }
     }
-    Ok(required_bytes)
-}
-
-fn graphics_snapshot_locked(terminal: &Crosswords<Listener>) -> GraphicsSnapshot {
-    GraphicsSnapshot {
-        kitty_images: terminal
-            .graphics
-            .kitty_images
-            .iter()
-            .map(|(id, image)| (*id, image.data.clone()))
-            .collect(),
-        kitty_placements: terminal
-            .graphics
-            .kitty_placements
-            .iter()
-            .map(|(key, placement)| (*key, placement.clone()))
-            .collect(),
-        kitty_virtual_placements: terminal
-            .graphics
-            .kitty_virtual_placements
-            .iter()
-            .map(|(key, placement)| (*key, placement.clone()))
-            .collect(),
-        atlas_placements: terminal.graphics.atlas_placements.clone(),
+    if let Some(required_bytes) = graphics_error {
+        return Err(GraphicsSnapshotError {
+            required_bytes,
+            limit_bytes: graphics_limit,
+        });
     }
+    Ok((
+        GraphicsSnapshot {
+            kitty_images,
+            kitty_placements: terminal
+                .graphics
+                .kitty_placements
+                .iter()
+                .map(|(key, placement)| (*key, placement.clone()))
+                .collect(),
+            kitty_virtual_placements: terminal
+                .graphics
+                .kitty_virtual_placements
+                .iter()
+                .map(|(key, placement)| (*key, placement.clone()))
+                .collect(),
+            atlas_placements: terminal.graphics.atlas_placements.clone(),
+        },
+        required_bytes,
+    ))
 }
 
 fn atlas_keys_locked(terminal: &Crosswords<Listener>) -> Vec<u64> {
-    terminal
+    let mut keys = terminal
         .graphics
         .atlas_key_refs
         .keys()
@@ -344,7 +437,10 @@ fn atlas_keys_locked(terminal: &Crosswords<Listener>) -> Vec<u64> {
                 .keys(),
         )
         .copied()
-        .collect()
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
 }
 
 /// `Send + Sync` everywhere threads exist. On wasm there is one thread and
@@ -401,6 +497,17 @@ pub trait SurfaceDelegate: MaybeSendSync + 'static {
     }
     fn close_surface(&self, _surface: SurfaceId) {}
     fn child_exited(&self, _surface: SurfaceId, _status: Option<i32>) {}
+    /// A parser-generated PTY reply. Returning `Passthrough` preserves the
+    /// historical direct-to-PTY behavior; transports that need to order
+    /// replies with GUI-backed requests can retain the reserved write and
+    /// return `Handled`.
+    fn pty_write(
+        &self,
+        _surface: SurfaceId,
+        write: PtyWrite,
+    ) -> Result<PtyWriteResult, InputError> {
+        Ok(PtyWriteResult::Passthrough(write))
+    }
     /// Bytes the terminal wants delivered to the child process. Only called
     /// on non-`pty` builds, where the host owns the transport (a WebSocket
     /// to a real shell, an in-page demo interpreter, ...); with a PTY the
@@ -422,6 +529,39 @@ pub(crate) struct Listener {
 }
 
 impl Listener {
+    #[cfg(feature = "pty")]
+    fn record_input_error(&self, error: InputError) {
+        let code = match error {
+            InputError::WouldBlock => 1,
+            InputError::Disconnected => 2,
+        };
+        let _ = self.input_error.compare_exchange(
+            0,
+            code,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.delegate.wakeup(self.surface_id);
+    }
+
+    fn passthrough_pty_write(&self, write: PtyWrite) -> Result<(), InputError> {
+        #[cfg(feature = "pty")]
+        {
+            let Some(channel) = self.pty_writer.get() else {
+                debug_assert!(false, "PTY writer must be initialized before dispatch");
+                return Err(InputError::Disconnected);
+            };
+            channel
+                .send(write.into_message())
+                .map_err(|_| InputError::Disconnected)
+        }
+        #[cfg(not(feature = "pty"))]
+        {
+            self.delegate.output(self.surface_id, write.as_bytes());
+            Ok(())
+        }
+    }
+
     fn dispatch(&self, event: RioEvent) {
         match event {
             RioEvent::TerminalDamaged(_)
@@ -458,46 +598,47 @@ impl Listener {
                     self.delegate.wakeup(self.surface_id);
                     return;
                 }
+                let input: Cow<'static, [u8]> = Cow::Owned(text.into_bytes());
                 #[cfg(feature = "pty")]
-                {
-                    let Some(channel) = self.pty_writer.get() else {
-                        debug_assert!(
-                            false,
-                            "PTY writer must be initialized before dispatch"
-                        );
-                        return;
-                    };
-                    let input: Cow<'static, [u8]> = Cow::Owned(text.into_bytes());
-                    let result = if let Some(budget) = &self.input_budget {
+                let write = {
+                    if let Some(budget) = &self.input_budget {
                         match budget.try_reserve(input.len()) {
-                            Ok(reservation) => channel
-                                .send(Msg::InputBounded { input, reservation })
-                                .map_err(|_| InputError::Disconnected),
+                            Ok(reservation) => PtyWrite::reserved(input, reservation),
                             Err(InputBudgetError::WouldBlock) => {
-                                Err(InputError::WouldBlock)
+                                self.record_input_error(InputError::WouldBlock);
+                                return;
                             }
                         }
                     } else {
-                        channel
-                            .send(Msg::Input(input))
-                            .map_err(|_| InputError::Disconnected)
-                    };
-                    if let Err(error) = result {
-                        let code = match error {
-                            InputError::WouldBlock => 1,
-                            InputError::Disconnected => 2,
-                        };
-                        let _ = self.input_error.compare_exchange(
-                            0,
-                            code,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        );
-                        self.delegate.wakeup(self.surface_id);
+                        PtyWrite::unreserved(input)
+                    }
+                };
+                #[cfg(not(feature = "pty"))]
+                let write = PtyWrite::unreserved(input);
+
+                match self.delegate.pty_write(self.surface_id, write) {
+                    Ok(PtyWriteResult::Handled) => {}
+                    Ok(PtyWriteResult::Passthrough(write)) => {
+                        if let Err(error) = self.passthrough_pty_write(write) {
+                            #[cfg(feature = "pty")]
+                            self.record_input_error(error);
+                            #[cfg(not(feature = "pty"))]
+                            {
+                                tracing::error!(error = %error, "PTY reply handler rejected output");
+                                self.delegate.wakeup(self.surface_id);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        #[cfg(feature = "pty")]
+                        self.record_input_error(error);
+                        #[cfg(not(feature = "pty"))]
+                        {
+                            tracing::error!(error = %error, "PTY reply handler rejected output");
+                            self.delegate.wakeup(self.surface_id);
+                        }
                     }
                 }
-                #[cfg(not(feature = "pty"))]
-                self.delegate.output(self.surface_id, text.as_bytes());
             }
             RioEvent::ClipboardLoad(route_id, kind, format) => {
                 self.delegate
@@ -843,7 +984,7 @@ impl Surface {
         engine: &Engine,
         desc: &SurfaceDesc,
     ) -> Result<Surface, Box<dyn Error + Send + Sync>> {
-        let id = engine.next_surface_id.fetch_add(1, Ordering::SeqCst);
+        let id = engine.next_surface_id.fetch_add(1, Ordering::Relaxed);
         let graphics_updates = Arc::new(Mutex::new(GraphicsUpdateStore::default()));
         #[cfg(feature = "pty")]
         let pty_writer = Arc::new(OnceLock::new());
@@ -1033,22 +1174,48 @@ impl Surface {
         }
     }
 
-    #[cfg(feature = "pty")]
-    fn enqueue_input(&self, bytes: Cow<'static, [u8]>) -> Result<(), InputError> {
-        let message = if let Some(budget) = &self.input_budget {
-            let reservation = budget
-                .try_reserve(bytes.len())
-                .map_err(|InputBudgetError::WouldBlock| InputError::WouldBlock)?;
-            Msg::InputBounded {
-                input: bytes,
-                reservation,
-            }
-        } else {
-            Msg::Input(bytes)
-        };
-        self.channel
-            .send(message)
-            .map_err(|_| InputError::Disconnected)
+    /// Reserve input capacity for a terminal-generated reply without sending
+    /// it. The reservation can be retained while an ordered worker reply is
+    /// waiting for earlier terminal traffic.
+    pub fn try_reserve_response<B: Into<Cow<'static, [u8]>>>(
+        &self,
+        bytes: B,
+    ) -> Result<PtyWrite, InputError> {
+        let bytes = bytes.into();
+        #[cfg(feature = "pty")]
+        {
+            let reservation = self
+                .input_budget
+                .as_ref()
+                .map(|budget| {
+                    budget
+                        .try_reserve(bytes.len())
+                        .map_err(|InputBudgetError::WouldBlock| InputError::WouldBlock)
+                })
+                .transpose()?;
+            Ok(match reservation {
+                Some(reservation) => PtyWrite::reserved(bytes, reservation),
+                None => PtyWrite::unreserved(bytes),
+            })
+        }
+        #[cfg(not(feature = "pty"))]
+        Ok(PtyWrite::unreserved(bytes))
+    }
+
+    /// Send a previously reserved parser reply. Dropping the write on an
+    /// error releases its input-budget reservation.
+    pub fn send_pty_write(&self, write: PtyWrite) -> Result<(), InputError> {
+        #[cfg(feature = "pty")]
+        {
+            self.channel
+                .send(write.into_message())
+                .map_err(|_| InputError::Disconnected)
+        }
+        #[cfg(not(feature = "pty"))]
+        {
+            self.delegate.output(self.id, write.as_bytes());
+            Ok(())
+        }
     }
 
     /// Fallible PTY input enqueue. A worker configures an input queue budget;
@@ -1082,13 +1249,8 @@ impl Surface {
         &self,
         bytes: B,
     ) -> Result<(), InputError> {
-        let bytes = bytes.into();
-        #[cfg(feature = "pty")]
-        self.enqueue_input(bytes)?;
-        #[cfg(not(feature = "pty"))]
-        self.delegate.output(self.id, &bytes);
-
-        Ok(())
+        let write = self.try_reserve_response(bytes)?;
+        self.send_pty_write(write)
     }
 
     pub fn write<B: Into<Cow<'static, [u8]>>>(&self, bytes: B) {
@@ -2877,5 +3039,37 @@ mod tests {
         // The RGBA copy path serves virtual images the same way.
         let mut buf = [0u8; 16];
         assert_eq!(state.kitty_image_rgba(7, &mut buf), 16);
+    }
+
+    #[test]
+    fn over_budget_atlas_replacement_invalidates_cached_pixels() {
+        let key = rio_graphics::atlas_image_key(7);
+        let graphic = |pixels| rio_graphics::GraphicData {
+            id: rio_graphics::GraphicId::new(7),
+            width: 1,
+            height: 1,
+            color_type: rio_graphics::ColorType::Rgb,
+            pixels,
+            is_opaque: true,
+            resize: None,
+            display_width: None,
+            display_height: None,
+            transmit_time: rio_graphics::time::Instant::now(),
+        };
+        let mut store = GraphicsUpdateStore::default();
+        store.atlas.insert(key, graphic(vec![1, 2, 3]));
+        // Keep the store at its byte limit so the replacement is rejected.
+        store.bytes = MAX_RETAINED_GRAPHICS_BYTES;
+        store.merge(rio_vt::ansi::graphics::UpdateQueues {
+            pending: vec![graphic(vec![4, 5, 6, 7])],
+            pending_images: Vec::new(),
+            remove_queue: Vec::new(),
+        });
+
+        let (_, over_budget, invalidated, invalidate_all) = store.take_with_over_budget();
+        assert!(over_budget);
+        assert!(!invalidate_all);
+        assert_eq!(invalidated, vec![key]);
+        assert!(!store.atlas.contains_key(&key));
     }
 }
