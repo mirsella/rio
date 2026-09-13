@@ -28,19 +28,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-fn transfer_layout_routes(
-    node: &crate::router::window_control::LayoutNodeOffer,
-    routes: &mut Vec<u64>,
-) {
-    if node.children.is_empty() {
-        routes.push(node.route_id);
-    } else {
-        for child in &node.children {
-            transfer_layout_routes(child, routes);
-        }
-    }
-}
-
 // Global atomic counter for generating unique route IDs
 static ROUTE_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
@@ -188,14 +175,12 @@ pub struct ContextManager<T: EventListener> {
 
 /// Ownership bundle for moving a complete grid and all of its split routes.
 pub struct GridTransfer<T: EventListener> {
-    route_ids: Vec<usize>,
     grid: Box<ContextGrid<T>>,
 }
 
 impl<T: EventListener> GridTransfer<T> {
     fn new(grid: ContextGrid<T>) -> Self {
         Self {
-            route_ids: grid.route_ids(),
             grid: Box::new(grid),
         }
     }
@@ -204,8 +189,8 @@ impl<T: EventListener> GridTransfer<T> {
         self.grid.id()
     }
 
-    pub fn route_ids(&self) -> &[usize] {
-        &self.route_ids
+    pub fn route_ids(&self) -> Vec<usize> {
+        self.grid.route_ids()
     }
 }
 
@@ -1199,6 +1184,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         })
     }
 
+    #[cfg(all(feature = "wayland", target_os = "linux"))]
     pub fn transfer_window_offer(
         &self,
         transfer_id: [u8; 16],
@@ -1278,30 +1264,25 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return Err(prepared);
         }
 
-        let active_pane_index = active_pane;
-        let Ok(active_pane) = u32::try_from(active_pane_index) else {
+        let active_source = prepared[active_pane].0.route_id;
+        let Ok(active_pane) = u32::try_from(active_pane) else {
             return Err(prepared);
         };
-        if let Err(error) = crate::router::window_control::TransferOffer::validate_parts(
-            prepared.iter().map(|(pane, _)| pane),
-            &tabs,
-            active_pane,
-        ) {
-            tracing::warn!(%error, "rejecting invalid prepared transfer");
-            return Err(prepared);
-        }
+        let source_tab_routes =
+            match crate::router::window_control::TransferOffer::validate_parts(
+                prepared.iter().map(|(pane, _)| pane),
+                &tabs,
+                active_pane,
+            ) {
+                Ok(routes) => routes,
+                Err(error) => {
+                    tracing::warn!(%error, "rejecting invalid prepared transfer");
+                    return Err(prepared);
+                }
+            };
 
-        let active_source = prepared[active_pane_index].0.route_id;
         let source_order: Vec<_> =
             prepared.iter().map(|(pane, _)| pane.route_id).collect();
-        let source_tab_routes = tabs
-            .iter()
-            .map(|tab| {
-                let mut routes = Vec::new();
-                transfer_layout_routes(&tab.layout, &mut routes);
-                routes
-            })
-            .collect::<Vec<_>>();
         let mut panes = prepared
             .into_iter()
             .map(|(pane, prepared)| (pane.route_id, (pane, prepared)))
@@ -2282,7 +2263,7 @@ pub mod test {
         source.set_custom_color(0, Some([1.0, 0.5, 0.0, 1.0]));
         let transfer = source.extract_grid(0).unwrap();
         let id = transfer.id();
-        let routes = transfer.route_ids().to_vec();
+        let routes = transfer.route_ids();
 
         let mut full =
             ContextManager::start_with_capacity(1, VoidListener {}, window_id).unwrap();
