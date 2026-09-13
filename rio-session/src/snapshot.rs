@@ -30,22 +30,15 @@ pub(crate) struct Snapshotter {
     atlas_images: HashMap<u64, GraphicData>,
     published_atlas_keys: Vec<u64>,
     sequence: u64,
-    published_dimensions: Option<(u16, u16)>,
-    /// Retained graphics state changed before a publication failed. The next
-    /// successful update must be a full frame because the worker keeps no
-    /// publication history.
-    graphics_resync_required: bool,
 }
 
 impl Snapshotter {
     pub(crate) fn new(surface: &Surface) -> Self {
         Self {
-            render_state: RenderState::new(surface),
+            render_state: RenderState::new_for_snapshot(surface),
             atlas_images: HashMap::new(),
             published_atlas_keys: Vec::new(),
             sequence: 0,
-            published_dimensions: None,
-            graphics_resync_required: false,
         }
     }
 
@@ -53,12 +46,10 @@ impl Snapshotter {
         &mut self,
         surface: &Surface,
     ) -> Result<FullFrame, SessionError> {
-        let snapshot = self.capture(surface, true)?;
-        let result = self.full_frame_from_snapshot(snapshot);
-        if result.is_err() {
-            self.render_state.restore_graphics_dirty();
-        }
-        result
+        let result = self
+            .capture(surface, true)
+            .and_then(|snapshot| self.full_frame_from_snapshot(snapshot));
+        self.restore_graphics_dirty_on_failure(result)
     }
 
     pub(crate) fn snapshot_since(
@@ -75,29 +66,28 @@ impl Snapshotter {
             return self.full_frame(surface).map(FrameUpdate::Full);
         }
 
-        let capture_graphics = self.graphics_resync_required || self.dimensions_changed();
-        let snapshot = self.capture(surface, capture_graphics)?;
-        let dimensions_changed = self.dimensions_changed();
-        let result = if dimensions_changed
-            || snapshot.graphics_changed
-            || self.graphics_resync_required
-        {
-            self.full_frame_from_snapshot(snapshot)
-                .map(FrameUpdate::Full)
-        } else {
-            self.delta_from_snapshot(snapshot, base_sequence)
-                .map(FrameUpdate::Delta)
-        };
+        let result = self.capture(surface, false).and_then(|snapshot| {
+            if snapshot.graphics.is_some() {
+                self.full_frame_from_snapshot(snapshot)
+                    .map(FrameUpdate::Full)
+            } else {
+                self.delta_from_snapshot(snapshot, base_sequence)
+                    .map(FrameUpdate::Delta)
+            }
+        });
+        self.restore_graphics_dirty_on_failure(result)
+    }
+
+    fn restore_graphics_dirty_on_failure<T>(
+        &self,
+        result: Result<T, SessionError>,
+    ) -> Result<T, SessionError> {
         if result.is_err() {
+            // The next capture must include full graphics after a failed
+            // publication; dirty rows are retained until publication succeeds.
             self.render_state.restore_graphics_dirty();
         }
         result
-    }
-
-    fn dimensions_changed(&self) -> bool {
-        self.published_dimensions
-            .map(|(columns, lines)| (usize::from(columns), usize::from(lines)))
-            != Some((self.render_state.columns(), self.render_state.lines()))
     }
 
     fn dimensions(&self) -> Result<(u16, u16), SessionError> {
@@ -149,7 +139,7 @@ impl Snapshotter {
         surface: &Surface,
         include_graphics: bool,
     ) -> Result<librio::SurfaceSnapshot, SessionError> {
-        let snapshot = match if include_graphics {
+        let mut snapshot = if include_graphics {
             self.render_state.update_with_surface_state(
                 surface,
                 MAX_FRAME_SIZE,
@@ -163,35 +153,21 @@ impl Snapshotter {
                 crate::protocol::MAX_IMAGE_BYTES,
                 MAX_GRAPHICS_ITEMS,
             )
-        } {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.graphics_resync_required = true;
-                return Err(SessionError::unsupported(format!(
-                    "terminal graphics snapshot rejected: {error}"
-                )));
-            }
-        };
-        let mut snapshot = snapshot;
-        if snapshot.graphics_changed {
-            self.graphics_resync_required = true;
         }
-        let retained_bytes = match self.remember_graphics_updates(
+        .map_err(|error| {
+            SessionError::unsupported(format!(
+                "terminal graphics snapshot rejected: {error}"
+            ))
+        })?;
+        let retained_bytes = self.remember_graphics_updates(
             snapshot.graphics_updates.take(),
             &snapshot.graphics_invalidated_keys,
             snapshot.graphics_invalidate_all,
             &snapshot.atlas_keys,
-        ) {
-            Err(error) => {
-                self.render_state.restore_graphics_dirty();
-                return Err(error);
-            }
-            Ok(bytes) => bytes,
-        };
+        )?;
         if retained_bytes.saturating_add(snapshot.graphics_bytes)
             > MAX_FRAME_GRAPHICS_BYTES
         {
-            self.render_state.restore_graphics_dirty();
             return Err(SessionError::unsupported(
                 "terminal graphics exceed the session frame budget",
             ));
@@ -248,8 +224,6 @@ impl Snapshotter {
         )?;
         self.published_atlas_keys = retained_keys;
         self.sequence = sequence;
-        self.published_dimensions = Some((frame.columns, frame.lines));
-        self.graphics_resync_required = false;
         self.render_state.reset_dirty();
         Ok(frame)
     }
@@ -304,7 +278,6 @@ impl Snapshotter {
         delta.validate()?;
         validate_encoded_size(&delta, "structured terminal delta exceeds frame budget")?;
         self.sequence = sequence;
-        self.published_dimensions = Some((delta.columns, delta.lines));
         self.render_state.reset_dirty();
         Ok(delta)
     }
