@@ -1409,11 +1409,7 @@ impl RemoteView {
                     row.has_extras = true;
                 }
             }
-            let style = source
-                .styles
-                .get(column)
-                .map(decode_style)
-                .unwrap_or_default();
+            let style = decode_style(&source.styles[column]);
             row_styles.push(style);
             let style_id = if let Some(id) = state.styles_by_value.get(&style) {
                 *id

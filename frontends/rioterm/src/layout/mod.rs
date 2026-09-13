@@ -409,6 +409,13 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         route_ids
     }
 
+    #[inline]
+    pub fn contains_route_id(&self, route_id: usize) -> bool {
+        self.inner
+            .values()
+            .any(|item| item.val.route_id == route_id)
+    }
+
     pub(crate) fn take_contexts(self) -> Vec<Context<T>> {
         self.inner.into_values().map(|item| item.val).collect()
     }
