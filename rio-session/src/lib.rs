@@ -1997,7 +1997,6 @@ fn connect_until_ready(
                         }
                     }
                 };
-                frame.validate()?;
                 if !commit {
                     return Ok(ConnectedSession {
                         stream,

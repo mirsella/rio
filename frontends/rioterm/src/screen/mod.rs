@@ -4217,7 +4217,7 @@ impl Screen<'_> {
                 rio_backend::crosswords::pos::Pos,
                 rio_backend::crosswords::pos::Pos,
             )>,
-            hint_labels: Option<Vec<crate::context::renderable::HintLabel>>,
+            hint_labels: Option<Vec<rio_grid::HintLabel>>,
             pending_session: bool,
         }
 
@@ -4233,7 +4233,11 @@ impl Screen<'_> {
             let context = &mut item.val;
             let content = &mut context.renderable_content;
             let mut terminal = context.terminal.lock();
-            terminal.refresh_renderable(content);
+            // Normal rendering already refreshes passive frames in
+            // Renderer::run; preparation runs this path directly.
+            if prepare_only {
+                terminal.refresh_renderable(content);
+            }
             let render_buffers = terminal.grid.take_render_buffers();
             let graphics = terminal.take_render_graphics();
             let graphics_dirty = terminal.graphics_dirty();
@@ -4285,7 +4289,7 @@ impl Screen<'_> {
                     None
                 },
                 hint_labels: if context.route_id == active_route {
-                    std::mem::take(&mut content.hint_labels)
+                    content.hint_labels.take()
                 } else {
                     None
                 },
@@ -4325,6 +4329,10 @@ impl Screen<'_> {
         let font_library = self.sugarloaf.font_library().clone();
         let renderer = &self.renderer;
         let background_color = renderer.named_colors.background.0;
+        let hint_label_styles = rio_grid::hint_label_styles(
+            renderer.named_colors.hint_foreground,
+            renderer.named_colors.hint_background,
+        );
         let mut frame_grids = Vec::with_capacity(panels.len());
         let panel_indices: rustc_hash::FxHashMap<usize, usize> = panels
             .iter()
@@ -4373,23 +4381,9 @@ impl Screen<'_> {
                     .get(row_index)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
-                let label_styles = rio_grid::hint_label_styles(
-                    self.renderer.named_colors.hint_foreground,
-                    self.renderer.named_colors.hint_background,
-                );
-                let hint_labels = panel.hint_labels.as_deref().map(|labels| {
-                    labels
-                        .iter()
-                        .map(|label| rio_grid::HintLabel {
-                            position: label.position,
-                            label: label.label,
-                            is_first: label.is_first,
-                        })
-                        .collect::<Vec<_>>()
-                });
                 let mut label_row = None;
                 let mut label_styles_owned = None;
-                if let Some(labels) = hint_labels.as_deref() {
+                if let Some(labels) = panel.hint_labels.as_deref() {
                     if let Some((overlay_row, overlay_styles)) =
                         rio_grid::overlay_hint_labels(
                             row,
@@ -4397,7 +4391,7 @@ impl Screen<'_> {
                             labels,
                             row_index,
                             panel.display_offset,
-                            label_styles,
+                            hint_label_styles,
                             &mut hints,
                         )
                     {
@@ -5003,7 +4997,7 @@ impl Screen<'_> {
     }
 
     fn update_hint_labels(&mut self) {
-        use crate::context::renderable::HintLabel;
+        use rio_grid::HintLabel;
 
         let hint_labels = if self.hint_state.is_active() {
             let matches = self.hint_state.matches();
