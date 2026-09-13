@@ -27,13 +27,6 @@ pub struct Cursor {
     pub content: char,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct HintLabel {
-    pub position: rio_backend::crosswords::pos::Pos,
-    pub label: char,
-    pub is_first: bool,
-}
-
 #[derive(Default)]
 pub struct RenderableContent {
     // TODO: Should not use default
@@ -41,7 +34,7 @@ pub struct RenderableContent {
     pub has_blinking_enabled: bool,
     pub is_blinking_cursor_visible: bool,
     pub selection_range: Option<SelectionRange>,
-    pub hint_labels: Option<Vec<HintLabel>>,
+    pub hint_labels: Option<Vec<rio_grid::HintLabel>>,
     pub highlighted_hint: Option<crate::hints::HintMatch>,
     pub hint_matches: Option<Vec<rio_backend::crosswords::search::Match>>,
     pub last_typing: Option<Instant>,
