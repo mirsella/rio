@@ -6,11 +6,13 @@ use rio_session::protocol::{
     SelectionSide, ServerMessage, SessionCommand, SessionEvent, SessionReply,
     SessionSpec, ViMotion, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
+use rio_session::readiness;
 use rio_session::{FullFrame, SessionClient, SessionDescriptor, SessionError};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,11 +22,13 @@ fn worker_path() -> PathBuf {
     }
     let current = std::env::current_exe().unwrap();
     current
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("rio-session-worker")
+        .ancestors()
+        .skip(1)
+        .map(|directory| directory.join("rio-session-worker"))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| {
+            panic!("rio-session-worker not found near {}", current.display())
+        })
 }
 
 fn control_path() -> PathBuf {
@@ -33,11 +37,11 @@ fn control_path() -> PathBuf {
     }
     let current = std::env::current_exe().unwrap();
     current
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("rio-sessionctl")
+        .ancestors()
+        .skip(1)
+        .map(|directory| directory.join("rio-sessionctl"))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("rio-sessionctl not found near {}", current.display()))
 }
 
 fn temporary_directory() -> PathBuf {
@@ -284,6 +288,76 @@ fn worker_io_cwd_env_and_structured_frame() {
     client.close().unwrap();
     wait_for_endpoint_removal(client.descriptor());
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn process_socket_fds(pid: u32) -> Vec<PathBuf> {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .filter(|target| target.to_string_lossy().starts_with("socket:["))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inherited_listener_is_not_kept_by_shell_after_worker_exit() {
+    struct Cleanup {
+        worker: i32,
+        child: i32,
+        endpoint_dir: PathBuf,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if self.worker > 0 {
+                unsafe {
+                    libc::kill(self.worker, libc::SIGKILL);
+                }
+            }
+            if self.child > 0 {
+                unsafe {
+                    libc::kill(self.child, libc::SIGKILL);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.endpoint_dir);
+        }
+    }
+
+    let client = SessionClient::spawn_with_worker_path(
+        spec("trap 'exit 0' TERM; while :; do sleep 1; done", None),
+        worker_path(),
+    )
+    .unwrap();
+    let descriptor = client.descriptor().clone();
+    let worker = client.worker_pid().unwrap() as i32;
+    let child = client.child_pid().unwrap() as i32;
+    let mut cleanup = Cleanup {
+        worker,
+        child,
+        endpoint_dir: descriptor.endpoint.parent().unwrap().to_path_buf(),
+    };
+
+    assert!(
+        process_socket_fds(child as u32).is_empty(),
+        "shell inherited a socket before worker exit"
+    );
+    unsafe {
+        assert_eq!(libc::kill(worker, libc::SIGKILL), 0);
+    }
+    client.wait_worker().unwrap().unwrap();
+    cleanup.worker = -1;
+    assert!(
+        process_socket_fds(child as u32).is_empty(),
+        "shell retained the worker accept socket after worker exit"
+    );
+    unsafe {
+        libc::kill(child, libc::SIGTERM);
+    }
+    drop(client);
+    std::fs::remove_dir_all(&cleanup.endpoint_dir).unwrap();
 }
 
 #[test]
@@ -647,6 +721,87 @@ fn codec_frame_deadline_does_not_reset_for_partial_reads() {
 }
 
 #[test]
+fn activity_wait_releases_for_worker_event_without_client_query() {
+    let client = Arc::new(
+        SessionClient::spawn_with_worker_path(
+            spec("sleep 1; printf 'activity-event\\n'; sleep 10", None),
+            worker_path(),
+        )
+        .unwrap(),
+    );
+    let initial_wakeup = readiness::Readiness::new().unwrap();
+    client.wait_for_activity(&initial_wakeup).unwrap();
+    assert!(matches!(
+        client.poll_event().unwrap(),
+        Some(SessionEvent::FrameReady)
+    ));
+    initial_wakeup.clear();
+    let wakeup = Arc::new(readiness::Readiness::new().unwrap());
+    let waiter_client = Arc::clone(&client);
+    let waiter_wakeup = Arc::clone(&wakeup);
+    let (started, started_receiver) = std::sync::mpsc::sync_channel(1);
+    let (finished, finished_receiver) = std::sync::mpsc::sync_channel(1);
+    let waiter = thread::spawn(move || {
+        started.send(()).unwrap();
+        finished
+            .send(
+                waiter_client
+                    .wait_for_activity(&waiter_wakeup)
+                    .map_err(|error| error.to_string()),
+            )
+            .unwrap();
+    });
+    started_receiver.recv().unwrap();
+    assert_eq!(
+        finished_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap(),
+        Ok(())
+    );
+    waiter.join().unwrap();
+    assert!(matches!(
+        client.poll_event().unwrap(),
+        Some(SessionEvent::FrameReady)
+    ));
+    client.close().unwrap();
+    wait_for_endpoint_removal(client.descriptor());
+}
+
+#[test]
+fn activity_wait_releases_for_caller_command_wakeup() {
+    let client = Arc::new(
+        SessionClient::spawn_with_worker_path(spec("sleep 10", None), worker_path())
+            .unwrap(),
+    );
+    let wakeup = Arc::new(readiness::Readiness::new().unwrap());
+    let waiter_client = Arc::clone(&client);
+    let waiter_wakeup = Arc::clone(&wakeup);
+    let (started, started_receiver) = std::sync::mpsc::sync_channel(1);
+    let (finished, finished_receiver) = std::sync::mpsc::sync_channel(1);
+    let waiter = thread::spawn(move || {
+        started.send(()).unwrap();
+        finished
+            .send(
+                waiter_client
+                    .wait_for_activity(&waiter_wakeup)
+                    .map_err(|error| error.to_string()),
+            )
+            .unwrap();
+    });
+    started_receiver.recv().unwrap();
+    wakeup.signal();
+    assert_eq!(
+        finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap(),
+        Ok(())
+    );
+    waiter.join().unwrap();
+    client.close().unwrap();
+    wait_for_endpoint_removal(client.descriptor());
+}
+
+#[test]
 fn reply_contract_no_change_and_rejection_preserve_attachment() {
     let client = SessionClient::spawn_with_worker_path(
         spec("while :; do sleep 1; done", None),
@@ -996,6 +1151,54 @@ fn worker_routes_terminal_requests_without_wire_closures() {
     let after = client.snapshot().unwrap();
     assert_eq!(after.display_offset, before.display_offset);
     assert_eq!(after.selection, before.selection);
+    client.close().unwrap();
+    wait_for_endpoint_removal(client.descriptor());
+}
+
+#[test]
+fn worker_does_not_send_cpr_ahead_of_held_color_response() {
+    let client = SessionClient::spawn_with_worker_path(
+        spec(
+            "stty -echo -icanon min 1 time 0; printf '\\033]11;?\\007\\033[6n'; first=$(dd bs=1 count=6 2>/dev/null | od -An -tx1 | tr -d '[:space:]'); printf 'first:%s\\n' \"$first\"; second=$(dd bs=1 count=24 2>/dev/null | od -An -tx1 | tr -d '[:space:]'); if [ \"$first\" = 1b5d31313b72 ] && [ \"$second\" = 67623a303130312f303230322f30333033071b5b313b3152 ]; then printf 'ordered\\n'; else printf 'reordered:%s:%s\\n' \"$first\" \"$second\"; fi; stty echo icanon; IFS= read -r value; printf 'input:%s\\n' \"$value\"; while :; do sleep 1; done",
+            None,
+        ),
+        worker_path(),
+    )
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (request_id, route_id) = loop {
+        if let Some(SessionEvent::ColorRequest {
+            request_id,
+            route_id,
+            index,
+        }) = client.poll_event().unwrap()
+        {
+            assert_eq!(index, 257);
+            break (request_id, route_id);
+        }
+        assert!(Instant::now() < deadline, "color request event timed out");
+        thread::sleep(Duration::from_millis(5));
+    };
+
+    thread::sleep(Duration::from_millis(100));
+    let held = client.snapshot().unwrap();
+    assert!(
+        !frame_text(&held).contains("first:1b5b313b3152"),
+        "CPR escaped while the color response was held: {}",
+        frame_text(&held)
+    );
+
+    client
+        .color_response(request_id, route_id, Some([1, 2, 3]))
+        .unwrap();
+    snapshot_until(&client, |frame| frame_text(frame).contains("ordered"));
+
+    client.write(b"ordinary-input\n".to_vec()).unwrap();
+    snapshot_until(&client, |frame| {
+        frame_text(frame).contains("input:ordinary-input")
+    });
+
     client.close().unwrap();
     wait_for_endpoint_removal(client.descriptor());
 }

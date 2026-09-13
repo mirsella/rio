@@ -470,7 +470,7 @@ fn render_cpu_target(
     let buf_w = target_width as i32;
     let buf_h = target_height as i32;
     let stride = target_stride as usize;
-    let (buffer, _, _, _) = target.parts_mut();
+    let buffer = target.pixels_mut();
 
     let bg_u32 = match background {
         Some(c) => {
@@ -523,7 +523,7 @@ fn render_cpu_target(
             stride,
             renderer.background_image_pixels(),
         );
-        draw_image_overlays(buf_slice, buf_w, buf_h, stride, below_bg, images.data)?;
+        draw_image_overlays(buf_slice, buf_w, buf_h, stride, below_bg, images.data);
         for (grid, uniforms) in grids.iter() {
             grid.render_bg_cpu_strided(
                 buf_slice,
@@ -533,7 +533,7 @@ fn render_cpu_target(
                 uniforms,
             );
         }
-        draw_image_overlays(buf_slice, buf_w, buf_h, stride, below_text, images.data)?;
+        draw_image_overlays(buf_slice, buf_w, buf_h, stride, below_text, images.data);
         for (grid, uniforms) in grids.iter() {
             grid.render_text_cpu_strided(
                 buf_slice,
@@ -543,7 +543,7 @@ fn render_cpu_target(
                 uniforms,
             );
         }
-        draw_image_overlays(buf_slice, buf_w, buf_h, stride, above_text, images.data)?;
+        draw_image_overlays(buf_slice, buf_w, buf_h, stride, above_text, images.data);
     }
 
     // QuadInstance pass: split borders, panel rects, scrollbar, dim
@@ -695,32 +695,23 @@ fn draw_image_overlays(
     stride: usize,
     overlays: &[&GraphicOverlay],
     data: &FxHashMap<GraphicKey, GraphicDataEntry>,
-) -> Result<(), CpuRenderError> {
+) {
     for overlay in overlays {
-        let entry =
-            data.get(&overlay.image_id)
-                .ok_or(CpuRenderError::MissingImageData {
-                    route_id: overlay.image_id.route_id,
-                    image_id: overlay.image_id.image_id,
-                })?;
+        let entry = data
+            .get(&overlay.image_id)
+            .expect("validated image overlay must have image data");
         let (width, height, pixels) = match &entry.handle.data {
             crate::components::core::image::Data::Rgba {
                 width,
                 height,
                 pixels,
             } => (*width, *height, pixels.as_ref()),
-            _ => {
-                return Err(CpuRenderError::UnsupportedImageData {
-                    route_id: overlay.image_id.route_id,
-                    image_id: overlay.image_id.image_id,
-                });
-            }
+            _ => unreachable!("validated image overlay must contain RGBA pixels"),
         };
         draw_image_overlay_strided(
             buf, buf_w, buf_h, stride, overlay, width, height, pixels,
         );
     }
-    Ok(())
 }
 
 fn validate_image_layers(
@@ -829,11 +820,35 @@ pub fn draw_image_overlay(
     image_height: u32,
     rgba: &[u8],
 ) {
+    if buf_w <= 0 || buf_h <= 0 {
+        return;
+    }
+    let stride = buf_w as usize;
+    let required_target = match (buf_h as usize - 1)
+        .checked_mul(stride)
+        .and_then(|offset| offset.checked_add(stride))
+    {
+        Some(required) => required,
+        None => return,
+    };
+    if buf.len() < required_target || image_width == 0 || image_height == 0 {
+        return;
+    }
+    let required_source = match (image_width as usize)
+        .checked_mul(image_height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    {
+        Some(required) => required,
+        None => return,
+    };
+    if rgba.len() < required_source {
+        return;
+    }
     draw_image_overlay_strided(
         buf,
         buf_w,
         buf_h,
-        buf_w.max(0) as usize,
+        stride,
         overlay,
         image_width,
         image_height,
@@ -852,32 +867,6 @@ fn draw_image_overlay_strided(
     image_height: u32,
     rgba: &[u8],
 ) {
-    if buf_w <= 0 || buf_h <= 0 || stride < buf_w as usize {
-        return;
-    }
-    let required_target = match (buf_h as usize - 1)
-        .checked_mul(stride)
-        .and_then(|offset| offset.checked_add(buf_w as usize))
-    {
-        Some(required) => required,
-        None => return,
-    };
-    if buf.len() < required_target {
-        return;
-    }
-    if image_width == 0 || image_height == 0 {
-        return;
-    }
-    let required_source = match (image_width as usize)
-        .checked_mul(image_height as usize)
-        .and_then(|pixels| pixels.checked_mul(4))
-    {
-        Some(required) => required,
-        None => return,
-    };
-    if rgba.len() < required_source {
-        return;
-    }
     if overlay.width <= 0.0 || overlay.height <= 0.0 {
         return;
     }
@@ -1138,13 +1127,12 @@ fn draw_color_glyph(
         });
     }
     let mask_atlas = if q.mask_layer > 0 {
+        let mask = images.cpu_mask_atlas_buffer();
         let required_mask = atlas_size.checked_mul(atlas_size);
-        if required_mask
-            .is_none_or(|required| images.cpu_mask_atlas_buffer().len() < required)
-        {
+        if required_mask.is_none_or(|required| mask.len() < required) {
             return Err(CpuRenderError::InvalidMaskAtlas);
         }
-        Some(images.cpu_mask_atlas_buffer())
+        Some(mask)
     } else {
         None
     };

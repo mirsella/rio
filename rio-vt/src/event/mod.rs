@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fmt::Formatter;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[cfg(feature = "rio-window")]
@@ -111,12 +111,12 @@ impl From<WindowId> for WindowTarget {
 #[derive(Clone, Debug)]
 pub struct InputBudget {
     state: Arc<InputBudgetState>,
-    limit: usize,
 }
 
 #[derive(Debug)]
 struct InputBudgetState {
-    in_flight: std::sync::atomic::AtomicUsize,
+    in_flight: AtomicUsize,
+    limit: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,9 +137,9 @@ impl InputBudget {
     pub fn new(limit: usize) -> Self {
         Self {
             state: Arc::new(InputBudgetState {
-                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                in_flight: AtomicUsize::new(0),
+                limit,
             }),
-            limit,
         }
     }
 
@@ -147,22 +147,19 @@ impl InputBudget {
         &self,
         bytes: usize,
     ) -> Result<InputReservation, InputBudgetError> {
-        let mut current = self
-            .state
-            .in_flight
-            .load(std::sync::atomic::Ordering::Acquire);
+        let mut current = self.state.in_flight.load(Ordering::Acquire);
         loop {
             let Some(next) = current.checked_add(bytes) else {
                 return Err(InputBudgetError::WouldBlock);
             };
-            if next > self.limit {
+            if next > self.state.limit {
                 return Err(InputBudgetError::WouldBlock);
             }
             match self.state.in_flight.compare_exchange_weak(
                 current,
                 next,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             ) {
                 Ok(_) => {
                     return Ok(InputReservation {
@@ -190,17 +187,17 @@ impl InputReservation {
     }
 
     fn release(&self, bytes: usize) {
-        let mut current = self
-            .state
-            .in_flight
-            .load(std::sync::atomic::Ordering::Acquire);
+        if bytes == 0 {
+            return;
+        }
+        let mut current = self.state.in_flight.load(Ordering::Acquire);
         loop {
             assert!(bytes <= current, "input budget underflow");
             match self.state.in_flight.compare_exchange_weak(
                 current,
                 current - bytes,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
+                Ordering::AcqRel,
+                Ordering::Acquire,
             ) {
                 Ok(_) => return,
                 Err(next) => current = next,

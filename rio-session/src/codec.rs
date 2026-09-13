@@ -44,9 +44,6 @@ pub fn write_frame<W: Write, T: Encode>(
     value: &T,
 ) -> Result<(), SessionError> {
     let payload = encode(value)?;
-    if payload.len() > MAX_FRAME_SIZE {
-        return Err(SessionError::protocol("frame exceeds maximum size"));
-    }
     let length = u32::try_from(payload.len())
         .map_err(|_| SessionError::protocol("frame length overflows protocol"))?;
     writer.write_all(&length.to_le_bytes())?;
