@@ -16,7 +16,12 @@ mod unix {
         SessionReply, SessionSpec, MAX_PENDING_INPUT_BYTES, MAX_PENDING_REQUESTS,
         MAX_SELECTION_LINES, PROTOCOL_VERSION,
     };
-    use crate::{SessionError, PREPARED_ATTACHMENT_TIMEOUT};
+    use crate::readiness;
+    use crate::{
+        cleanup_endpoint_if_owned, cleanup_listener, private_directory_identity,
+        queue_event, terminal_request_event_id, SessionError,
+        PREPARED_ATTACHMENT_TIMEOUT,
+    };
     use librio::{
         Action, Engine, SelectionKind as RioSelectionKind, Side, Surface,
         SurfaceDelegate, SurfaceDesc,
@@ -24,14 +29,17 @@ mod unix {
     use rio_vt::crosswords::pos::{Column as PosColumn, Direction, Line, Pos};
     use rio_vt::crosswords::vi_mode::ViMotion as RioViMotion;
     use std::collections::VecDeque;
+    #[cfg(test)]
     use std::fs;
     use std::io::{self, Read};
-    use std::os::fd::{AsRawFd, RawFd};
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
+    #[cfg(test)]
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::mpsc::{self, Receiver, SyncSender};
+    #[cfg(test)]
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -43,7 +51,7 @@ mod unix {
     const TERMINAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn release_request_slot(slots: &AtomicUsize) {
-        let previous = slots.fetch_sub(1, Ordering::AcqRel);
+        let previous = slots.fetch_sub(1, Ordering::Relaxed);
         assert!(previous > 0, "terminal request budget underflow");
     }
 
@@ -70,6 +78,11 @@ mod unix {
             route_id: usize,
             cp: u32,
         },
+    }
+
+    enum TerminalReply {
+        Request(TerminalRequest),
+        PtyWrite(librio::PtyWrite),
     }
 
     impl TerminalRequest {
@@ -101,45 +114,41 @@ mod unix {
         }
     }
 
-    struct PendingRequest {
-        request: TerminalRequest,
-        expires_at: Instant,
+    enum PendingReply {
+        Request {
+            request: TerminalRequest,
+            expires_at: Instant,
+            response: Option<librio::PtyWrite>,
+        },
+        PtyWrite(librio::PtyWrite),
     }
 
-    fn terminal_request_event(
-        request: &TerminalRequest,
-    ) -> Result<SessionEvent, SessionError> {
+    fn terminal_request_event(request: &TerminalRequest) -> Option<SessionEvent> {
         let request_id = request.id();
-        let protocol_route_id = u64::try_from(request.route_id()).map_err(|_| {
-            SessionError::invalid("terminal route id exceeds protocol range")
-        })?;
+        let protocol_route_id = u64::try_from(request.route_id()).ok()?;
         match request {
             TerminalRequest::ClipboardLoad { kind, .. } => {
-                Ok(SessionEvent::ClipboardLoad {
+                Some(SessionEvent::ClipboardLoad {
                     request_id,
                     route_id: protocol_route_id,
                     kind: *kind as u8,
                 })
             }
             TerminalRequest::ColorRequest { index, .. } => {
-                Ok(SessionEvent::ColorRequest {
+                Some(SessionEvent::ColorRequest {
                     request_id,
                     route_id: protocol_route_id,
-                    index: (*index).try_into().map_err(|_| {
-                        SessionError::invalid(
-                            "color request index exceeds protocol range",
-                        )
-                    })?,
+                    index: (*index).try_into().ok()?,
                 })
             }
             TerminalRequest::TextAreaSizeRequest { .. } => {
-                Ok(SessionEvent::TextAreaSizeRequest {
+                Some(SessionEvent::TextAreaSizeRequest {
                     request_id,
                     route_id: protocol_route_id,
                 })
             }
             TerminalRequest::GlyphProtocolQuery { cp, .. } => {
-                Ok(SessionEvent::GlyphProtocolQuery {
+                Some(SessionEvent::GlyphProtocolQuery {
                     request_id,
                     route_id: protocol_route_id,
                     codepoint: *cp,
@@ -166,7 +175,6 @@ mod unix {
             index: usize,
             color: Option<librio::ColorRgb>,
         },
-        TerminalRequest(TerminalRequest),
         RequestRefused {
             request_id: u64,
             kind: RequestKind,
@@ -174,22 +182,47 @@ mod unix {
         },
     }
 
+    impl Notification {
+        fn is_critical(&self) -> bool {
+            matches!(
+                self,
+                Self::Closed | Self::ChildExited(_) | Self::RequestRefused { .. }
+            )
+        }
+    }
+
     #[derive(Default)]
     struct DeferredNotifications {
+        queued: VecDeque<Notification>,
         title: Option<String>,
         progress: Option<(u8, u8)>,
         bell: bool,
         cursor_blinking: bool,
+        clipboard_store: [Option<String>; 2],
         clipboard_overflow: bool,
         child_exited: Option<Option<i32>>,
         closed: bool,
-        terminal_requests: VecDeque<TerminalRequest>,
+        terminal_replies: VecDeque<TerminalReply>,
         request_refused: VecDeque<(u64, RequestKind, RequestRefusalReason)>,
         desktop_notifications: VecDeque<(String, String)>,
         color_changes: VecDeque<(usize, usize, Option<librio::ColorRgb>)>,
     }
 
     impl DeferredNotifications {
+        fn has_deferred_notifications(&self) -> bool {
+            self.title.is_some()
+                || self.progress.is_some()
+                || self.bell
+                || self.cursor_blinking
+                || self.clipboard_store.iter().any(Option::is_some)
+                || self.clipboard_overflow
+                || self.child_exited.is_some()
+                || self.closed
+                || !self.request_refused.is_empty()
+                || !self.desktop_notifications.is_empty()
+                || !self.color_changes.is_empty()
+        }
+
         fn drain_into(
             &mut self,
             critical_notifications: &mut Vec<Notification>,
@@ -213,6 +246,17 @@ mod unix {
                 self.cursor_blinking = false;
                 notifications.push(Notification::Action(Action::CursorBlinkingChange));
             }
+            for (kind, pending) in [
+                librio::ClipboardType::Clipboard,
+                librio::ClipboardType::Selection,
+            ]
+            .into_iter()
+            .zip(&mut self.clipboard_store)
+            {
+                if let Some(text) = pending.take() {
+                    notifications.push(Notification::ClipboardStore { kind, text });
+                }
+            }
             if self.clipboard_overflow {
                 self.clipboard_overflow = false;
                 notifications.push(Notification::ClipboardOverflow);
@@ -224,11 +268,6 @@ mod unix {
                 self.closed = false;
                 critical_notifications.push(Notification::Closed);
             }
-            notifications.extend(
-                self.terminal_requests
-                    .drain(..)
-                    .map(Notification::TerminalRequest),
-            );
             critical_notifications.extend(self.request_refused.drain(..).map(
                 |(request_id, kind, reason)| Notification::RequestRefused {
                     request_id,
@@ -251,21 +290,19 @@ mod unix {
         }
     }
 
-    #[derive(Clone)]
     struct Delegate {
-        sender: SyncSender<Notification>,
-        critical_sender: SyncSender<Notification>,
-        wakeup_pending: Arc<AtomicBool>,
-        deferred: Arc<Mutex<DeferredNotifications>>,
-        next_request_id: Arc<AtomicU64>,
+        wakeup_pending: AtomicBool,
+        wakeup: readiness::Readiness,
+        deferred: Mutex<DeferredNotifications>,
+        next_request_id: AtomicU64,
         pending_requests: Arc<AtomicUsize>,
     }
 
     impl Delegate {
         fn allocate_request(&self) -> Option<u64> {
             let reserved = self.pending_requests.try_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
                 |current| (current < MAX_PENDING_REQUESTS).then_some(current + 1),
             );
             if reserved.is_err() {
@@ -273,7 +310,7 @@ mod unix {
             }
             match self
                 .next_request_id
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     current.checked_add(1)
                 })
                 .ok()
@@ -288,7 +325,7 @@ mod unix {
 
         fn fresh_request_id(&self) -> Option<u64> {
             self.next_request_id
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     current.checked_add(1)
                 })
                 .ok()
@@ -317,149 +354,123 @@ mod unix {
             kind: RequestKind,
             reason: RequestRefusalReason,
         ) {
-            self.send_critical(Notification::RequestRefused {
+            self.send(Notification::RequestRefused {
                 request_id,
                 kind,
                 reason,
             });
         }
 
-        fn send_request(&self, request: TerminalRequest) {
-            let kind = request.kind();
-            let request_id = request.id();
-            self.wakeup_pending.store(true, Ordering::Release);
-            if let Err(error) =
-                self.sender.try_send(Notification::TerminalRequest(request))
-            {
-                let notification = match error {
-                    mpsc::TrySendError::Full(notification)
-                    | mpsc::TrySendError::Disconnected(notification) => notification,
-                };
-                let Notification::TerminalRequest(request) = notification else {
-                    unreachable!("terminal request sender returned another notification")
-                };
-                if let Ok(mut deferred) = self.deferred.lock() {
-                    if deferred.terminal_requests.len() < MAX_PENDING_REQUESTS {
-                        deferred.terminal_requests.push_back(request);
-                        return;
-                    }
-                }
-                self.release_request();
-                self.request_refused(request_id, kind, RequestRefusalReason::Capacity);
+        fn wake(&self) {
+            if !self.wakeup_pending.swap(true, Ordering::Relaxed) {
+                self.wakeup.signal();
             }
+        }
+
+        fn enqueue_terminal_reply(
+            &self,
+            reply: TerminalReply,
+        ) -> Result<(), librio::InputError> {
+            let mut deferred = self
+                .deferred
+                .lock()
+                .map_err(|_| librio::InputError::Disconnected)?;
+            if deferred.terminal_replies.len() >= MAX_PENDING_REQUESTS {
+                return Err(librio::InputError::WouldBlock);
+            }
+            deferred.terminal_replies.push_back(reply);
+            drop(deferred);
+            self.wake();
+            Ok(())
         }
 
         fn send(&self, notification: Notification) {
-            self.wakeup_pending.store(true, Ordering::Release);
-            if let Err(error) = self.sender.try_send(notification) {
-                let notification = match error {
-                    mpsc::TrySendError::Full(notification)
-                    | mpsc::TrySendError::Disconnected(notification) => notification,
-                };
-                if let Ok(mut deferred) = self.deferred.lock() {
-                    match notification {
-                        Notification::Action(Action::SetTitle { title, .. }) => {
-                            deferred.title = Some(title);
-                        }
-                        Notification::Action(Action::Progress { state, value }) => {
-                            deferred.progress = Some((state, value));
-                        }
-                        Notification::Action(Action::RingBell) => deferred.bell = true,
-                        Notification::Action(Action::CursorBlinkingChange) => {
-                            deferred.cursor_blinking = true
-                        }
-                        Notification::ClipboardStore { .. }
-                        | Notification::ClipboardOverflow => {
-                            deferred.clipboard_overflow = true;
-                        }
-                        Notification::Closed | Notification::ChildExited(_) => {}
-                        Notification::Desktop { title, body } => {
-                            if deferred.desktop_notifications.len() < MAX_PENDING_REQUESTS
-                            {
-                                deferred.desktop_notifications.push_back((title, body));
-                            }
-                        }
-                        Notification::ColorChange {
-                            route_id,
-                            index,
-                            color,
-                        } => {
-                            if let Some(change) = deferred.color_changes.iter_mut().find(
-                                |(route, pending_index, _)| {
-                                    *route == route_id && *pending_index == index
-                                },
-                            ) {
-                                change.2 = color;
-                            } else if deferred.color_changes.len() < MAX_PENDING_REQUESTS
-                            {
-                                deferred
-                                    .color_changes
-                                    .push_back((route_id, index, color));
-                            }
-                        }
-                        Notification::TerminalRequest(request) => {
-                            let request_id = request.id();
-                            let kind = request.kind();
-                            if deferred.terminal_requests.len() < MAX_PENDING_REQUESTS {
-                                deferred.terminal_requests.push_back(request);
-                            } else {
-                                self.release_request();
-                                Self::defer_request_refusal(
-                                    &mut deferred,
-                                    request_id,
-                                    kind,
-                                    RequestRefusalReason::Capacity,
-                                );
-                            }
-                        }
-                        Notification::RequestRefused {
-                            request_id,
-                            kind,
-                            reason,
-                        } => Self::defer_request_refusal(
-                            &mut deferred,
-                            request_id,
-                            kind,
-                            reason,
-                        ),
+            if let Ok(mut deferred) = self.deferred.lock() {
+                if !deferred.has_deferred_notifications()
+                    && deferred.queued.len() < MAX_PENDING_REQUESTS
+                {
+                    deferred.queued.push_back(notification);
+                } else {
+                    Self::defer_notification(&mut deferred, notification);
+                }
+            }
+            self.wake();
+        }
+
+        fn defer_notification(
+            deferred: &mut DeferredNotifications,
+            notification: Notification,
+        ) {
+            match notification {
+                Notification::Action(Action::SetTitle { title, .. }) => {
+                    deferred.title = Some(title);
+                }
+                Notification::Action(Action::Progress { state, value }) => {
+                    deferred.progress = Some((state, value));
+                }
+                Notification::Action(Action::RingBell) => deferred.bell = true,
+                Notification::Action(Action::CursorBlinkingChange) => {
+                    deferred.cursor_blinking = true
+                }
+                Notification::ClipboardStore { kind, text } => {
+                    deferred.clipboard_store[kind as usize] = Some(text);
+                }
+                Notification::ClipboardOverflow => deferred.clipboard_overflow = true,
+                Notification::Closed => deferred.closed = true,
+                Notification::ChildExited(status) => deferred.child_exited = Some(status),
+                Notification::Desktop { title, body } => {
+                    if deferred.desktop_notifications.len() < MAX_PENDING_REQUESTS {
+                        deferred.desktop_notifications.push_back((title, body));
                     }
                 }
+                Notification::ColorChange {
+                    route_id,
+                    index,
+                    color,
+                } => {
+                    if let Some(change) = deferred.color_changes.iter_mut().find(
+                        |(route, pending_index, _)| {
+                            *route == route_id && *pending_index == index
+                        },
+                    ) {
+                        change.2 = color;
+                    } else if deferred.color_changes.len() < MAX_PENDING_REQUESTS {
+                        deferred.color_changes.push_back((route_id, index, color));
+                    }
+                }
+                Notification::RequestRefused {
+                    request_id,
+                    kind,
+                    reason,
+                } => Self::defer_request_refusal(deferred, request_id, kind, reason),
             }
         }
 
-        fn send_critical(&self, notification: Notification) {
-            self.wakeup_pending.store(true, Ordering::Release);
-            if let Err(error) = self.critical_sender.try_send(notification) {
-                let notification = match error {
-                    mpsc::TrySendError::Full(notification)
-                    | mpsc::TrySendError::Disconnected(notification) => notification,
+        fn send_request(
+            &self,
+            kind: RequestKind,
+            make: impl FnOnce(u64) -> TerminalRequest,
+        ) {
+            let Some(request_id) = self.allocate_request() else {
+                let Some(request_id) = self.fresh_request_id() else {
+                    return;
                 };
-                if let Ok(mut deferred) = self.deferred.lock() {
-                    match notification {
-                        Notification::ChildExited(status) => {
-                            deferred.child_exited = Some(status);
-                        }
-                        Notification::Closed => deferred.closed = true,
-                        Notification::RequestRefused {
-                            request_id,
-                            kind,
-                            reason,
-                        } => Self::defer_request_refusal(
-                            &mut deferred,
-                            request_id,
-                            kind,
-                            reason,
-                        ),
-                        _ => {}
-                    }
-                }
+                self.request_refused(request_id, kind, RequestRefusalReason::Capacity);
+                return;
+            };
+            if self
+                .enqueue_terminal_reply(TerminalReply::Request(make(request_id)))
+                .is_err()
+            {
+                self.release_request();
+                self.request_refused(request_id, kind, RequestRefusalReason::Capacity);
             }
         }
     }
 
     impl SurfaceDelegate for Delegate {
         fn wakeup(&self, _surface: librio::SurfaceId) {
-            self.wakeup_pending.store(true, Ordering::Release);
+            self.wake();
         }
 
         fn action(&self, _surface: librio::SurfaceId, action: Action) {
@@ -491,22 +502,13 @@ mod unix {
             kind: librio::ClipboardType,
             format: Arc<dyn Fn(&str) -> String + Send + Sync>,
         ) {
-            let Some(request_id) = self.allocate_request() else {
-                let Some(request_id) = self.fresh_request_id() else {
-                    return;
-                };
-                self.request_refused(
+            self.send_request(RequestKind::ClipboardLoad, |request_id| {
+                TerminalRequest::ClipboardLoad {
                     request_id,
-                    RequestKind::ClipboardLoad,
-                    RequestRefusalReason::Capacity,
-                );
-                return;
-            };
-            self.send_request(TerminalRequest::ClipboardLoad {
-                request_id,
-                route_id,
-                kind,
-                format,
+                    route_id,
+                    kind,
+                    format,
+                }
             });
         }
 
@@ -517,22 +519,13 @@ mod unix {
             index: usize,
             format: Arc<dyn Fn(librio::ColorRgb) -> String + Send + Sync>,
         ) {
-            let Some(request_id) = self.allocate_request() else {
-                let Some(request_id) = self.fresh_request_id() else {
-                    return;
-                };
-                self.request_refused(
+            self.send_request(RequestKind::ColorRequest, |request_id| {
+                TerminalRequest::ColorRequest {
                     request_id,
-                    RequestKind::ColorRequest,
-                    RequestRefusalReason::Capacity,
-                );
-                return;
-            };
-            self.send_request(TerminalRequest::ColorRequest {
-                request_id,
-                route_id,
-                index,
-                format,
+                    route_id,
+                    index,
+                    format,
+                }
             });
         }
 
@@ -542,21 +535,12 @@ mod unix {
             route_id: librio::SurfaceId,
             format: Arc<dyn Fn(rio_vt::event::WindowSize) -> String + Send + Sync>,
         ) {
-            let Some(request_id) = self.allocate_request() else {
-                let Some(request_id) = self.fresh_request_id() else {
-                    return;
-                };
-                self.request_refused(
+            self.send_request(RequestKind::TextAreaSizeRequest, |request_id| {
+                TerminalRequest::TextAreaSizeRequest {
                     request_id,
-                    RequestKind::TextAreaSizeRequest,
-                    RequestRefusalReason::Capacity,
-                );
-                return;
-            };
-            self.send_request(TerminalRequest::TextAreaSizeRequest {
-                request_id,
-                route_id,
-                format,
+                    route_id,
+                    format,
+                }
             });
         }
 
@@ -566,21 +550,12 @@ mod unix {
             route_id: librio::SurfaceId,
             cp: u32,
         ) {
-            let Some(request_id) = self.allocate_request() else {
-                let Some(request_id) = self.fresh_request_id() else {
-                    return;
-                };
-                self.request_refused(
+            self.send_request(RequestKind::GlyphProtocolQuery, |request_id| {
+                TerminalRequest::GlyphProtocolQuery {
                     request_id,
-                    RequestKind::GlyphProtocolQuery,
-                    RequestRefusalReason::Capacity,
-                );
-                return;
-            };
-            self.send_request(TerminalRequest::GlyphProtocolQuery {
-                request_id,
-                route_id,
-                cp,
+                    route_id,
+                    cp,
+                }
             });
         }
 
@@ -612,11 +587,28 @@ mod unix {
         }
 
         fn close_surface(&self, _surface: librio::SurfaceId) {
-            self.send_critical(Notification::Closed);
+            self.send(Notification::Closed);
         }
 
         fn child_exited(&self, _surface: librio::SurfaceId, status: Option<i32>) {
-            self.send_critical(Notification::ChildExited(status.map(exit_code)));
+            self.send(Notification::ChildExited(status.map(exit_code)));
+        }
+
+        fn pty_write(
+            &self,
+            _surface: librio::SurfaceId,
+            write: librio::PtyWrite,
+        ) -> Result<librio::PtyWriteResult, librio::InputError> {
+            if self.allocate_request().is_none() {
+                return Err(librio::InputError::WouldBlock);
+            }
+            if let Err(error) =
+                self.enqueue_terminal_reply(TerminalReply::PtyWrite(write))
+            {
+                self.release_request();
+                return Err(error);
+            }
+            Ok(librio::PtyWriteResult::Handled)
         }
     }
 
@@ -634,7 +626,7 @@ mod unix {
         surface: Surface,
         snapshots: Snapshotter,
         pending_events: VecDeque<SessionEvent>,
-        pending_requests: Vec<PendingRequest>,
+        pending_replies: VecDeque<PendingReply>,
         pending_request_slots: Arc<AtomicUsize>,
         frame_pending: bool,
         selection_anchor: Option<i32>,
@@ -682,7 +674,8 @@ mod unix {
                 .into_iter()
                 .map(EnvVar::into_utf8)
                 .collect::<Result<Vec<_>, _>>()?;
-            let surface = Engine::new(delegate.clone())
+            let pending_request_slots = Arc::clone(&delegate.pending_requests);
+            let surface = Engine::new(delegate)
                 .create_surface(&SurfaceDesc {
                     shell,
                     args,
@@ -715,8 +708,8 @@ mod unix {
                 selection_endpoint: None,
                 child_exit_status: None,
                 terminal_closed: false,
-                pending_requests: Vec::new(),
-                pending_request_slots: Arc::clone(&delegate.pending_requests),
+                pending_replies: VecDeque::new(),
+                pending_request_slots,
                 search: None,
             })
         }
@@ -756,40 +749,113 @@ mod unix {
             kind: RequestKind,
             route_id: u64,
         ) -> Result<usize, SessionError> {
-            let Some(index) = self
-                .pending_requests
-                .iter()
-                .position(|pending| pending.request.id() == request_id)
-            else {
+            let Some(index) = self.pending_replies.iter().position(|reply| {
+                matches!(
+                        reply,
+                        PendingReply::Request { request, .. }
+                            if request.id() == request_id
+                )
+            }) else {
                 return Err(SessionError::invalid(
                     "terminal request is unknown or expired",
                 ));
             };
-            if self.pending_requests[index].request.kind() != kind {
+            let PendingReply::Request {
+                request,
+                expires_at,
+                ..
+            } = &self.pending_replies[index]
+            else {
+                unreachable!("pending reply kind was checked")
+            };
+            if request.kind() != kind {
                 return Err(SessionError::invalid(
                     "terminal response does not match its request",
                 ));
             }
-            let expected_route =
-                u64::try_from(self.pending_requests[index].request.route_id()).map_err(
-                    |_| SessionError::invalid("terminal route id exceeds protocol range"),
-                )?;
+            let expected_route = u64::try_from(request.route_id()).map_err(|_| {
+                SessionError::invalid("terminal route id exceeds protocol range")
+            })?;
             if expected_route != route_id {
                 return Err(SessionError::invalid(
                     "terminal response does not match its route",
                 ));
             }
-            if self.pending_requests[index].expires_at <= Instant::now() {
-                self.complete_request(index);
-                push_event(self, SessionEvent::RequestExpired { request_id, kind });
+            if *expires_at <= Instant::now() {
+                let Some(PendingReply::Request { .. }) =
+                    self.pending_replies.remove(index)
+                else {
+                    unreachable!("expired request barrier was missing")
+                };
+                release_request_slot(&self.pending_request_slots);
+                remove_terminal_request_event(&mut self.pending_events, request_id);
+                queue_event(
+                    &mut self.pending_events,
+                    SessionEvent::RequestExpired { request_id, kind },
+                );
                 return Err(SessionError::invalid("terminal request has expired"));
             }
             Ok(index)
         }
 
-        fn complete_request(&mut self, index: usize) {
-            self.pending_requests.swap_remove(index);
-            release_request_slot(&self.pending_request_slots);
+        fn accept_terminal_response(
+            &mut self,
+            request_id: u64,
+            kind: RequestKind,
+            route_id: u64,
+            format: impl FnOnce(&TerminalRequest) -> Result<Vec<u8>, SessionError>,
+        ) -> Result<SessionReply, SessionError> {
+            let pending = self.pending_request(request_id, kind, route_id)?;
+            let bytes = {
+                let PendingReply::Request {
+                    request, response, ..
+                } = &self.pending_replies[pending]
+                else {
+                    unreachable!("pending reply kind was checked")
+                };
+                if response.is_some() {
+                    return Err(SessionError::invalid(
+                        "terminal request already has a response",
+                    ));
+                }
+                format(request)?
+            };
+            let write = self
+                .surface
+                .try_reserve_response(bytes)
+                .map_err(input_error)?;
+            let PendingReply::Request { response, .. } =
+                &mut self.pending_replies[pending]
+            else {
+                unreachable!("pending reply kind was checked")
+            };
+            *response = Some(write);
+            self.frame_pending = true;
+            Ok(SessionReply::Accepted)
+        }
+
+        fn flush_ordered_replies(&mut self) -> Result<bool, SessionError> {
+            let mut flushed = false;
+            while let Some(reply) = self.pending_replies.front() {
+                if matches!(reply, PendingReply::Request { response: None, .. }) {
+                    break;
+                }
+                let write = match self.pending_replies.pop_front().unwrap() {
+                    PendingReply::PtyWrite(write)
+                    | PendingReply::Request {
+                        response: Some(write),
+                        ..
+                    } => write,
+                    PendingReply::Request { response: None, .. } => {
+                        unreachable!("unanswered requests stop the reply queue")
+                    }
+                };
+                let result = self.surface.send_pty_write(write);
+                release_request_slot(&self.pending_request_slots);
+                result.map_err(input_error)?;
+                flushed = true;
+            }
+            Ok(flushed)
         }
 
         fn response_bytes(text: String) -> Result<Vec<u8>, SessionError> {
@@ -808,35 +874,31 @@ mod unix {
             let history = i32::try_from(self.surface.history_size()).map_err(|_| {
                 SessionError::invalid("search history exceeds the session range")
             })?;
+            let protocol_position = |position: Pos| -> Result<(u32, u16), SessionError> {
+                let line = position
+                    .row
+                    .0
+                    .checked_add(history)
+                    .and_then(|line| u32::try_from(line).ok())
+                    .ok_or_else(|| {
+                        SessionError::invalid("search match is outside the session range")
+                    })?;
+                let column = u16::try_from(position.col.0).map_err(|_| {
+                    SessionError::invalid("search match is outside the session range")
+                })?;
+                Ok((line, column))
+            };
             let matched = match matched {
-                Some((start, end)) => Some(SearchMatch {
-                    start_line: u32::try_from(
-                        start.row.0.checked_add(history).ok_or_else(|| {
-                            SessionError::invalid(
-                                "search match is outside the session range",
-                            )
-                        })?,
-                    )
-                    .map_err(|_| {
-                        SessionError::invalid("search match is outside the session range")
-                    })?,
-                    start_column: u16::try_from(start.col.0).map_err(|_| {
-                        SessionError::invalid("search match is outside the session range")
-                    })?,
-                    end_line: u32::try_from(end.row.0.checked_add(history).ok_or_else(
-                        || {
-                            SessionError::invalid(
-                                "search match is outside the session range",
-                            )
-                        },
-                    )?)
-                    .map_err(|_| {
-                        SessionError::invalid("search match is outside the session range")
-                    })?,
-                    end_column: u16::try_from(end.col.0).map_err(|_| {
-                        SessionError::invalid("search match is outside the session range")
-                    })?,
-                }),
+                Some((start, end)) => {
+                    let (start_line, start_column) = protocol_position(start)?;
+                    let (end_line, end_column) = protocol_position(end)?;
+                    Some(SearchMatch {
+                        start_line,
+                        start_column,
+                        end_line,
+                        end_column,
+                    })
+                }
                 None => None,
             };
             let display_offset =
@@ -1086,14 +1148,12 @@ mod unix {
                 }
                 SessionCommand::Snapshot => {
                     let frame = self.snapshots.full_frame(&self.surface)?;
-                    frame.validate()?;
                     SessionReply::Frame(frame)
                 }
                 SessionCommand::SnapshotSince { base_sequence } => {
                     let update = self
                         .snapshots
                         .snapshot_since(&self.surface, base_sequence)?;
-                    update.validate()?;
                     SessionReply::FrameUpdate(update)
                 }
                 SessionCommand::SetAltIsMeta(enabled) => {
@@ -1453,54 +1513,38 @@ mod unix {
                     request_id,
                     route_id,
                     text,
-                } => {
-                    let pending = self.pending_request(
-                        request_id,
-                        RequestKind::ClipboardLoad,
-                        route_id,
-                    )?;
-                    let TerminalRequest::ClipboardLoad { format, .. } =
-                        &self.pending_requests[pending].request
-                    else {
-                        unreachable!("pending request kind was checked")
-                    };
-                    let bytes = Self::response_bytes(format(&text))?;
-                    self.surface
-                        .try_write_response(bytes)
-                        .map_err(input_error)?;
-                    self.complete_request(pending);
-                    self.frame_pending = true;
-                    SessionReply::Accepted
-                }
+                } => self.accept_terminal_response(
+                    request_id,
+                    RequestKind::ClipboardLoad,
+                    route_id,
+                    |request| {
+                        let TerminalRequest::ClipboardLoad { format, .. } = request
+                        else {
+                            unreachable!("pending request kind was checked")
+                        };
+                        Self::response_bytes(format(&text))
+                    },
+                )?,
                 SessionCommand::ColorResponse {
                     request_id,
                     route_id,
                     color,
-                } => {
-                    let Some([r, g, b]) = color else {
-                        return Err(SessionError::unsupported(
-                            "unset terminal colors need a host fallback",
-                        ));
-                    };
-                    let pending = self.pending_request(
-                        request_id,
-                        RequestKind::ColorRequest,
-                        route_id,
-                    )?;
-                    let TerminalRequest::ColorRequest { format, .. } =
-                        &self.pending_requests[pending].request
-                    else {
-                        unreachable!("pending request kind was checked")
-                    };
-                    let bytes =
-                        Self::response_bytes(format(librio::ColorRgb { r, g, b }))?;
-                    self.surface
-                        .try_write_response(bytes)
-                        .map_err(input_error)?;
-                    self.complete_request(pending);
-                    self.frame_pending = true;
-                    SessionReply::Accepted
-                }
+                } => self.accept_terminal_response(
+                    request_id,
+                    RequestKind::ColorRequest,
+                    route_id,
+                    |request| {
+                        let Some([r, g, b]) = color else {
+                            return Err(SessionError::unsupported(
+                                "unset terminal colors need a host fallback",
+                            ));
+                        };
+                        let TerminalRequest::ColorRequest { format, .. } = request else {
+                            unreachable!("pending request kind was checked")
+                        };
+                        Self::response_bytes(format(librio::ColorRgb { r, g, b }))
+                    },
+                )?,
                 SessionCommand::TextAreaSizeResponse {
                     request_id,
                     route_id,
@@ -1508,60 +1552,46 @@ mod unix {
                     columns,
                     pixel_width,
                     pixel_height,
-                } => {
-                    let pending = self.pending_request(
-                        request_id,
-                        RequestKind::TextAreaSizeRequest,
-                        route_id,
-                    )?;
-                    let TerminalRequest::TextAreaSizeRequest { format, .. } =
-                        &self.pending_requests[pending].request
-                    else {
-                        unreachable!("pending request kind was checked")
-                    };
-                    let bytes =
+                } => self.accept_terminal_response(
+                    request_id,
+                    RequestKind::TextAreaSizeRequest,
+                    route_id,
+                    |request| {
+                        let TerminalRequest::TextAreaSizeRequest { format, .. } = request
+                        else {
+                            unreachable!("pending request kind was checked")
+                        };
                         Self::response_bytes(format(rio_vt::event::WindowSize {
                             rows,
                             cols: columns,
                             width: pixel_width,
                             height: pixel_height,
-                        }))?;
-                    self.surface
-                        .try_write_response(bytes)
-                        .map_err(input_error)?;
-                    self.complete_request(pending);
-                    self.frame_pending = true;
-                    SessionReply::Accepted
-                }
+                        }))
+                    },
+                )?,
                 SessionCommand::GlyphProtocolResponse {
                     request_id,
                     route_id,
                     status,
-                } => {
-                    let pending = self.pending_request(
-                        request_id,
-                        RequestKind::GlyphProtocolQuery,
-                        route_id,
-                    )?;
-                    let TerminalRequest::GlyphProtocolQuery { cp, .. } =
-                        &self.pending_requests[pending].request
-                    else {
-                        unreachable!("pending request kind was checked")
-                    };
-                    let bytes = Self::response_bytes(
-                        rio_vt::ansi::glyph_protocol::format_query_response(
-                            *cp,
-                            glyph_status(status),
-                        ),
-                    )?;
-                    self.surface
-                        .try_write_response(bytes)
-                        .map_err(input_error)?;
-                    self.complete_request(pending);
-                    self.frame_pending = true;
-                    SessionReply::Accepted
-                }
+                } => self.accept_terminal_response(
+                    request_id,
+                    RequestKind::GlyphProtocolQuery,
+                    route_id,
+                    |request| {
+                        let TerminalRequest::GlyphProtocolQuery { cp, .. } = request
+                        else {
+                            unreachable!("pending request kind was checked")
+                        };
+                        Self::response_bytes(
+                            rio_vt::ansi::glyph_protocol::format_query_response(
+                                *cp,
+                                glyph_status(status),
+                            ),
+                        )
+                    },
+                )?,
             };
+            let _ = self.flush_ordered_replies()?;
             Ok(reply)
         }
     }
@@ -1692,17 +1722,15 @@ mod unix {
     struct Active {
         generation: u64,
         connection_fd: RawFd,
+        wakeup: Arc<readiness::Readiness>,
     }
 
     struct Shared {
         state: Mutex<SharedState>,
-        notifications: Mutex<Receiver<Notification>>,
-        critical_notifications: Mutex<Receiver<Notification>>,
         next_generation: AtomicU64,
-        connection_count: AtomicUsize,
         closing: AtomicBool,
         close_pending: AtomicBool,
-        connections: Mutex<Vec<(RawFd, UnixStream)>>,
+        connections: Mutex<Vec<UnixStream>>,
         session_id: SessionId,
         capability: [u8; 32],
         delegate: Arc<Delegate>,
@@ -1722,7 +1750,6 @@ mod unix {
     impl Drop for ConnectionGuard {
         fn drop(&mut self) {
             self.shared.unregister_connection(self.fd);
-            self.shared.release_connection_slot();
         }
     }
 
@@ -1730,8 +1757,6 @@ mod unix {
         fn new(
             session_id: SessionId,
             capability: [u8; 32],
-            receiver: Receiver<Notification>,
-            critical_receiver: Receiver<Notification>,
             delegate: Arc<Delegate>,
         ) -> Self {
             Self {
@@ -1740,16 +1765,48 @@ mod unix {
                     active: None,
                     idle_since: Some(Instant::now()),
                 }),
-                notifications: Mutex::new(receiver),
-                critical_notifications: Mutex::new(critical_receiver),
                 next_generation: AtomicU64::new(1),
-                connection_count: AtomicUsize::new(0),
                 closing: AtomicBool::new(false),
                 close_pending: AtomicBool::new(false),
                 connections: Mutex::new(Vec::new()),
                 session_id,
                 capability,
                 delegate,
+            }
+        }
+
+        fn wait_deadline(&self) -> Option<Instant> {
+            let state = self.state.lock().expect("worker state lock poisoned");
+            let idle_deadline = state.idle_since.map(|since| since + IDLE_RETENTION);
+            let request_deadline = state.runtime.as_ref().and_then(|runtime| {
+                runtime
+                    .pending_replies
+                    .iter()
+                    .filter_map(|reply| match reply {
+                        PendingReply::Request { expires_at, .. } => Some(*expires_at),
+                        PendingReply::PtyWrite(_) => None,
+                    })
+                    .min()
+            });
+            next_deadline(idle_deadline, request_deadline)
+        }
+
+        fn signal_active(&self) {
+            let wakeup = self
+                .state
+                .lock()
+                .expect("worker state lock poisoned")
+                .active
+                .as_ref()
+                .map(|active| Arc::clone(&active.wakeup));
+            if let Some(wakeup) = wakeup {
+                wakeup.signal();
+            }
+        }
+
+        fn request_close(&self) {
+            if !self.closing.swap(true, Ordering::AcqRel) {
+                self.delegate.wakeup.signal();
             }
         }
 
@@ -1776,23 +1833,28 @@ mod unix {
         fn register_connection(
             &self,
             stream: &UnixStream,
-        ) -> Result<RawFd, SessionError> {
+        ) -> Result<Option<RawFd>, SessionError> {
+            let mut connections = self
+                .connections
+                .lock()
+                .map_err(|_| SessionError::protocol("worker connection lock poisoned"))?;
+            if connections.len() >= MAX_CONNECTIONS {
+                return Ok(None);
+            }
             let copy = stream.try_clone()?;
             // Keep the registry's fd alive until the guard unregisters it. The
             // handler's stream can be dropped before its guard, so using that
             // fd as the key would allow reuse to unregister a newer peer.
             let fd = copy.as_raw_fd();
-            self.connections
-                .lock()
-                .map_err(|_| SessionError::protocol("worker connection lock poisoned"))?
-                .push((fd, copy));
-            Ok(fd)
+            connections.push(copy);
+            Ok(Some(fd))
         }
 
         fn unregister_connection(&self, fd: RawFd) {
             if let Ok(mut connections) = self.connections.lock() {
-                if let Some(index) =
-                    connections.iter().position(|(value, _)| *value == fd)
+                if let Some(index) = connections
+                    .iter()
+                    .position(|connection| connection.as_raw_fd() == fd)
                 {
                     connections.swap_remove(index);
                 }
@@ -1801,8 +1863,9 @@ mod unix {
 
         fn close_connection(&self, fd: RawFd) {
             if let Ok(connections) = self.connections.lock() {
-                if let Some((_, stream)) =
-                    connections.iter().find(|(value, _)| *value == fd)
+                if let Some(stream) = connections
+                    .iter()
+                    .find(|connection| connection.as_raw_fd() == fd)
                 {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                 }
@@ -1811,26 +1874,14 @@ mod unix {
 
         fn close_connections(&self) {
             if let Ok(connections) = self.connections.lock() {
-                for (_, stream) in connections.iter() {
+                for stream in connections.iter() {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                 }
             }
         }
 
-        fn release_connection_slot(&self) {
-            if self
-                .connection_count
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    count.checked_sub(1)
-                })
-                .is_err()
-            {
-                self.closing.store(true, Ordering::Release);
-            }
-        }
-
         fn next_generation(&self) -> Result<u64, SessionError> {
-            let mut current = self.next_generation.load(Ordering::Acquire);
+            let mut current = self.next_generation.load(Ordering::Relaxed);
             loop {
                 if current == 0 || current == u64::MAX {
                     return Err(SessionError::protocol(
@@ -1840,8 +1891,8 @@ mod unix {
                 match self.next_generation.compare_exchange_weak(
                     current,
                     current + 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
                 ) {
                     Ok(_) => return Ok(current),
                     Err(next) => current = next,
@@ -1850,10 +1901,49 @@ mod unix {
         }
     }
 
+    fn wait_for_listener(
+        listener: &UnixListener,
+        wakeup: &readiness::Readiness,
+        deadline: Option<Instant>,
+    ) -> Result<(), SessionError> {
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wakeup.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        loop {
+            let ready = readiness::wait(&mut poll_fds, deadline)?;
+            if ready == 0 {
+                return Ok(());
+            }
+            if poll_fds
+                .iter()
+                .any(|poll_fd| readiness::is_invalid(poll_fd.revents))
+            {
+                return Err(SessionError::protocol("session readiness fd is invalid"));
+            }
+            if poll_fds
+                .iter()
+                .any(|poll_fd| readiness::is_readable(poll_fd.revents))
+            {
+                return Ok(());
+            }
+        }
+    }
+
     pub fn run(
         endpoint: PathBuf,
         session_id: SessionId,
         capability: [u8; 32],
+        listener_fd: Option<RawFd>,
+        endpoint_identity: Option<(u64, u64)>,
     ) -> Result<(), SessionError> {
         if capability.iter().all(|byte| *byte == 0) {
             return Err(SessionError::invalid("worker capability is empty"));
@@ -1874,27 +1964,29 @@ mod unix {
                 "session worker endpoint must be an absolute path",
             ));
         }
-        let guard = EndpointGuard::bind(endpoint)?;
-        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_REQUESTS);
-        let (critical_sender, critical_receiver) = mpsc::sync_channel(8);
+        let guard = match listener_fd {
+            Some(listener_fd) => EndpointGuard::from_fd(
+                endpoint,
+                listener_fd,
+                endpoint_identity.ok_or_else(|| {
+                    SessionError::invalid("missing inherited endpoint identity")
+                })?,
+            )?,
+            None => EndpointGuard::bind(endpoint)?,
+        };
+        let wakeup = readiness::Readiness::new()?;
         let delegate = Arc::new(Delegate {
-            sender,
-            critical_sender,
-            wakeup_pending: Arc::new(AtomicBool::new(false)),
-            deferred: Arc::new(Mutex::new(DeferredNotifications::default())),
-            next_request_id: Arc::new(AtomicU64::new(1)),
+            wakeup_pending: AtomicBool::new(false),
+            wakeup,
+            deferred: Mutex::new(DeferredNotifications::default()),
+            next_request_id: AtomicU64::new(1),
             pending_requests: Arc::new(AtomicUsize::new(0)),
         });
-        let shared = Arc::new(Shared::new(
-            session_id,
-            capability,
-            receiver,
-            critical_receiver,
-            delegate,
-        ));
+        let shared = Arc::new(Shared::new(session_id, capability, delegate));
 
         let mut connection_threads: Vec<thread::JoinHandle<()>> = Vec::new();
         let result = loop {
+            shared.delegate.wakeup.clear();
             if shared.closing.load(Ordering::Acquire) {
                 break Ok(());
             }
@@ -1913,24 +2005,18 @@ mod unix {
                     index += 1;
                 }
             }
+            let deadline = shared.wait_deadline();
+            if let Err(error) =
+                wait_for_listener(&guard.listener, &shared.delegate.wakeup, deadline)
+            {
+                break Err(error);
+            }
             match guard.listener.accept() {
                 Ok((stream, _)) => {
-                    let accepted = shared.connection_count.try_update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |count| (count < MAX_CONNECTIONS).then_some(count + 1),
-                    );
-                    if accepted.is_err() {
-                        drop(stream);
-                        continue;
-                    }
                     let fd = match shared.register_connection(&stream) {
-                        Ok(fd) => fd,
-                        Err(error) => {
-                            shared.release_connection_slot();
-                            drop(stream);
-                            break Err(error);
-                        }
+                        Ok(Some(fd)) => fd,
+                        Ok(None) => continue,
+                        Err(error) => break Err(error),
                     };
                     let shared_for_thread = Arc::clone(&shared);
                     match thread::Builder::new()
@@ -1945,14 +2031,11 @@ mod unix {
                         Ok(thread) => connection_threads.push(thread),
                         Err(error) => {
                             shared.unregister_connection(fd);
-                            shared.release_connection_slot();
                             break Err(SessionError::Io(error));
                         }
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(25));
-                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => break Err(SessionError::Io(error)),
             }
@@ -2022,20 +2105,23 @@ mod unix {
             );
             return Ok(());
         }
-        let generation =
-            match establish_attachment(&shared, &mut stream, connection_fd, hello.3) {
-                Ok(generation) => generation,
-                Err(error) => {
-                    if !matches!(error, SessionError::Io(_) | SessionError::Codec(_)) {
-                        let _ = send_error(
-                            &mut stream,
-                            error_code(&error),
-                            &error.to_string(),
-                        );
-                    }
-                    return Err(error);
+        let active_wakeup = Arc::new(readiness::Readiness::new()?);
+        let generation = match establish_attachment(
+            &shared,
+            &mut stream,
+            connection_fd,
+            hello.3,
+            Arc::clone(&active_wakeup),
+        ) {
+            Ok(generation) => generation,
+            Err(error) => {
+                if !matches!(error, SessionError::Io(_) | SessionError::Codec(_)) {
+                    let _ =
+                        send_error(&mut stream, error_code(&error), &error.to_string());
                 }
-            };
+                return Err(error);
+            }
+        };
         if let Err(error) = stream.set_read_timeout(Some(CONNECTION_TIMEOUT)) {
             detach(&shared, generation);
             return Err(error.into());
@@ -2044,7 +2130,7 @@ mod unix {
             detach(&shared, generation);
             return Err(error.into());
         }
-        let result = run_attachment(&shared, &mut stream, generation);
+        let result = run_attachment(&shared, &mut stream, generation, &active_wakeup);
         if !shared.closing.load(Ordering::Acquire) && is_active(&shared, generation) {
             detach(&shared, generation);
         }
@@ -2056,8 +2142,9 @@ mod unix {
         stream: &mut UnixStream,
         connection_fd: RawFd,
         spec: Option<SessionSpec>,
+        active_wakeup: Arc<readiness::Readiness>,
     ) -> Result<u64, SessionError> {
-        let current_generation = {
+        let (current_generation, runtime_created) = {
             let mut state = shared
                 .state
                 .lock()
@@ -2067,7 +2154,7 @@ mod unix {
             {
                 return Err(SessionError::Detached);
             }
-            if state.runtime.is_none() {
+            let runtime_created = if state.runtime.is_none() {
                 let spec = match spec {
                     Some(spec) => spec,
                     None => {
@@ -2078,9 +2165,18 @@ mod unix {
                 };
                 let new_runtime = Runtime::new(spec, Arc::clone(&shared.delegate))?;
                 state.runtime = Some(new_runtime);
-            }
-            state.active.as_ref().map(|active| active.generation)
+                true
+            } else {
+                false
+            };
+            (
+                state.active.as_ref().map(|active| active.generation),
+                runtime_created,
+            )
         };
+        if runtime_created && shared.delegate.wakeup_pending.load(Ordering::Relaxed) {
+            shared.delegate.wakeup.signal();
+        }
 
         if let Some(current_generation) = current_generation {
             codec::write_frame_until(
@@ -2123,9 +2219,7 @@ mod unix {
                 .runtime
                 .as_mut()
                 .ok_or_else(|| SessionError::protocol("session runtime missing"))?;
-            let frame = runtime.snapshots.full_frame(&runtime.surface)?;
-            frame.validate()?;
-            frame
+            runtime.snapshots.full_frame(&runtime.surface)?
         };
 
         codec::write_frame_until(
@@ -2138,7 +2232,8 @@ mod unix {
             &ServerMessage::Initial { generation, frame },
             Instant::now() + HANDSHAKE_TIMEOUT,
         )?;
-        read_prepared_commit(stream, generation, Instant::now())?;
+        let initial_sent_at = Instant::now();
+        read_prepared_commit(stream, generation, initial_sent_at)?;
 
         let old_fd = {
             let mut state = shared
@@ -2158,6 +2253,7 @@ mod unix {
             let old_fd = state.active.replace(Active {
                 generation,
                 connection_fd,
+                wakeup: Arc::clone(&active_wakeup),
             });
             if let Some(runtime) = state.runtime.as_mut() {
                 runtime.frame_pending = true;
@@ -2231,16 +2327,17 @@ mod unix {
         shared: &Shared,
         stream: &mut UnixStream,
         generation: u64,
+        active_wakeup: &readiness::Readiness,
     ) -> Result<(), SessionError> {
         let mut last_request_id = 0;
         loop {
             if !is_active(shared, generation) {
                 return Ok(());
             }
-            drain_notifications(shared)?;
+            active_wakeup.clear();
             flush_events(shared, stream, generation)?;
 
-            match read_client_message(stream)? {
+            match read_client_message(stream, active_wakeup)? {
                 Some(message @ ClientMessage::Command { .. }) => {
                     if let Err(error) = message.validate() {
                         send_error(stream, error_code(&error), &error.to_string())?;
@@ -2300,13 +2397,21 @@ mod unix {
                     }
                     match result {
                         Ok(reply) => {
-                            if let Err(error) = reply.validate() {
-                                send_error(
-                                    stream,
-                                    error_code(&error),
-                                    &error.to_string(),
-                                )?;
-                                return Ok(());
+                            // Snapshotter validates and size-checks its own trusted frames before
+                            // advancing publication state. Other replies still cross this
+                            // worker-side contract check before they are written.
+                            if !matches!(
+                                &reply,
+                                &SessionReply::Frame(_) | &SessionReply::FrameUpdate(_)
+                            ) {
+                                if let Err(error) = reply.validate() {
+                                    send_error(
+                                        stream,
+                                        error_code(&error),
+                                        &error.to_string(),
+                                    )?;
+                                    return Ok(());
+                                }
                             }
                             if close {
                                 // Reply first: the client must observe explicit close before
@@ -2316,7 +2421,7 @@ mod unix {
                                     &ServerMessage::Reply { request_id, reply },
                                     Instant::now() + HANDSHAKE_TIMEOUT,
                                 );
-                                shared.closing.store(true, Ordering::Release);
+                                shared.request_close();
                                 shared.close_connections();
                                 write_result?;
                                 return Ok(());
@@ -2347,27 +2452,38 @@ mod unix {
 
     fn read_client_message(
         stream: &mut UnixStream,
+        active_wakeup: &readiness::Readiness,
     ) -> Result<Option<ClientMessage>, SessionError> {
-        let mut poll_fd = libc::pollfd {
-            fd: std::os::fd::AsRawFd::as_raw_fd(stream),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready =
-            unsafe { libc::poll(&mut poll_fd, 1, CONNECTION_TIMEOUT.as_millis() as i32) };
-        if ready == 0 {
-            return Ok(None);
-        }
-        if ready < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: active_wakeup.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        loop {
+            readiness::wait(&mut poll_fds, None)?;
+            if readiness::is_invalid(poll_fds[1].revents) {
+                return Err(SessionError::protocol("attachment readiness fd is invalid"));
+            }
+            if readiness::is_invalid(poll_fds[0].revents) {
+                return Err(SessionError::WorkerExited);
+            }
+            if readiness::is_readable(poll_fds[0].revents) {
+                let message =
+                    codec::read_frame_until(stream, Instant::now() + HANDSHAKE_TIMEOUT);
+                stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
+                return message.map(Some);
+            }
+            if readiness::is_readable(poll_fds[1].revents) {
                 return Ok(None);
             }
-            return Err(error.into());
         }
-        let message = codec::read_frame_until(stream, Instant::now() + HANDSHAKE_TIMEOUT);
-        stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
-        message.map(Some)
     }
 
     fn is_active(shared: &Shared, generation: u64) -> bool {
@@ -2396,65 +2512,81 @@ mod unix {
         };
         if detached {
             if let Some(runtime) = state.runtime.as_mut() {
+                expire_requests(runtime);
                 let requests = runtime
-                    .pending_requests
+                    .pending_replies
                     .iter()
-                    .filter_map(|pending| terminal_request_event(&pending.request).ok())
+                    .filter_map(|reply| match reply {
+                        PendingReply::Request {
+                            request,
+                            response: None,
+                            ..
+                        } => terminal_request_event(request),
+                        PendingReply::PtyWrite(_) => None,
+                        PendingReply::Request {
+                            response: Some(_), ..
+                        } => None,
+                    })
                     .collect::<Vec<_>>();
                 for event in requests {
-                    push_event(runtime, event);
+                    queue_event(&mut runtime.pending_events, event);
                 }
                 if let Some(status) = runtime.child_exit_status {
-                    push_event(runtime, SessionEvent::ChildExited { status });
+                    queue_event(
+                        &mut runtime.pending_events,
+                        SessionEvent::ChildExited { status },
+                    );
                 }
                 if runtime.terminal_closed {
-                    push_event(runtime, SessionEvent::Closed);
+                    queue_event(&mut runtime.pending_events, SessionEvent::Closed);
                 }
             }
             state.idle_since = Some(Instant::now());
         }
+        drop(state);
+        if detached {
+            shared.delegate.wakeup.signal();
+        }
     }
 
-    fn drain_notifications(shared: &Shared) -> Result<(), SessionError> {
-        let mut critical_notifications = Vec::new();
-        let mut notifications = Vec::new();
-        {
-            let receiver = shared.notifications.lock().map_err(|_| {
-                SessionError::protocol("worker notification lock poisoned")
-            })?;
-            let critical_receiver =
-                shared.critical_notifications.lock().map_err(|_| {
-                    SessionError::protocol("worker critical notification lock poisoned")
-                })?;
-            while let Ok(notification) = critical_receiver.try_recv() {
-                critical_notifications.push(notification);
-            }
-            while let Ok(notification) = receiver.try_recv() {
-                notifications.push(notification);
-            }
-        }
-        {
-            let mut deferred = shared.delegate.deferred.lock().map_err(|_| {
-                SessionError::protocol("worker deferred notification lock poisoned")
-            })?;
-            deferred.drain_into(&mut critical_notifications, &mut notifications);
-        }
-        critical_notifications.extend(notifications);
-        let notifications = critical_notifications;
-        let terminal_event = {
+    fn drain_notifications(shared: &Shared) -> Result<bool, SessionError> {
+        let (terminal_event, published) = {
             let mut state = shared
                 .state
                 .lock()
                 .map_err(|_| SessionError::protocol("worker state lock poisoned"))?;
             let Some(runtime) = state.runtime.as_mut() else {
-                return Ok(());
+                return Ok(false);
             };
-            expire_requests(runtime);
-            if shared.delegate.wakeup_pending.swap(false, Ordering::AcqRel) {
-                runtime.frame_pending = true;
+            let wakeup_pending = shared
+                .delegate
+                .wakeup_pending
+                .swap(false, Ordering::Relaxed);
+            let mut critical_notifications = Vec::new();
+            let mut notifications = Vec::new();
+            let mut deferred = shared.delegate.deferred.lock().map_err(|_| {
+                SessionError::protocol("worker deferred notification lock poisoned")
+            })?;
+            while let Some(notification) = deferred.queued.pop_front() {
+                if notification.is_critical() {
+                    critical_notifications.push(notification);
+                } else {
+                    notifications.push(notification);
+                }
             }
-            let mut terminal_event = false;
-            for notification in notifications {
+            deferred.drain_into(&mut critical_notifications, &mut notifications);
+            let mut published =
+                !critical_notifications.is_empty() || !notifications.is_empty();
+            let requests_expired = expire_requests(runtime);
+            if requests_expired {
+                published = true;
+            }
+            if wakeup_pending {
+                runtime.frame_pending = true;
+                published = true;
+            }
+            let mut terminal_event = requests_expired;
+            for notification in critical_notifications.into_iter().chain(notifications) {
                 match notification {
                     Notification::Action(action) => {
                         let event = match action {
@@ -2470,11 +2602,11 @@ mod unix {
                                 SessionEvent::Progress { state, value }
                             }
                         };
-                        push_event(runtime, event);
+                        queue_event(&mut runtime.pending_events, event);
                     }
                     Notification::ClipboardStore { kind, text } => {
-                        push_event(
-                            runtime,
+                        queue_event(
+                            &mut runtime.pending_events,
                             SessionEvent::ClipboardStore {
                                 kind: kind as u8,
                                 text,
@@ -2484,73 +2616,30 @@ mod unix {
                     Notification::Closed => {
                         runtime.terminal_closed = true;
                         terminal_event = true;
-                        push_event(runtime, SessionEvent::Closed);
+                        queue_event(&mut runtime.pending_events, SessionEvent::Closed);
                     }
                     Notification::ChildExited(status) => {
                         runtime.child_exit_status = Some(status);
                         runtime.frame_pending = true;
                         terminal_event = true;
-                        push_event(runtime, SessionEvent::ChildExited { status });
+                        queue_event(
+                            &mut runtime.pending_events,
+                            SessionEvent::ChildExited { status },
+                        );
                     }
                     Notification::ClipboardOverflow => {
-                        push_event(runtime, SessionEvent::ClipboardOverflow);
-                    }
-                    Notification::TerminalRequest(request) => {
-                        let request_id = request.id();
-                        let kind = request.kind();
-                        let event = match terminal_request_event(&request) {
-                            Ok(event) => event,
-                            Err(_) => {
-                                shared.delegate.release_request();
-                                push_event(
-                                    runtime,
-                                    SessionEvent::RequestRefused {
-                                        request_id,
-                                        kind,
-                                        reason: RequestRefusalReason::Unsupported,
-                                    },
-                                );
-                                continue;
-                            }
-                        };
-                        if runtime.pending_requests.len() >= MAX_PENDING_REQUESTS {
-                            push_event(
-                                runtime,
-                                SessionEvent::RequestRefused {
-                                    request_id,
-                                    kind,
-                                    reason: RequestRefusalReason::Capacity,
-                                },
-                            );
-                            shared.delegate.release_request();
-                            continue;
-                        }
-                        if push_event(runtime, event) {
-                            runtime.pending_requests.push(PendingRequest {
-                                request,
-                                expires_at: Instant::now() + TERMINAL_REQUEST_TIMEOUT,
-                            });
-                        } else {
-                            shared.delegate.release_request();
-                            if !push_event(
-                                runtime,
-                                SessionEvent::RequestRefused {
-                                    request_id,
-                                    kind,
-                                    reason: RequestRefusalReason::Capacity,
-                                },
-                            ) {
-                                eprintln!("rio-session: terminal request {request_id} ({kind:?}) refused because the event queue is full");
-                            }
-                        }
+                        queue_event(
+                            &mut runtime.pending_events,
+                            SessionEvent::ClipboardOverflow,
+                        );
                     }
                     Notification::RequestRefused {
                         request_id,
                         kind,
                         reason,
                     } => {
-                        push_event(
-                            runtime,
+                        queue_event(
+                            &mut runtime.pending_events,
                             SessionEvent::RequestRefused {
                                 request_id,
                                 kind,
@@ -2559,8 +2648,8 @@ mod unix {
                         );
                     }
                     Notification::Desktop { title, body } => {
-                        push_event(
-                            runtime,
+                        queue_event(
+                            &mut runtime.pending_events,
                             SessionEvent::DesktopNotification { title, body },
                         );
                     }
@@ -2579,8 +2668,8 @@ mod unix {
                                 "color change index exceeds protocol range",
                             )
                         })?;
-                        push_event(
-                            runtime,
+                        queue_event(
+                            &mut runtime.pending_events,
                             SessionEvent::ColorChange {
                                 route_id,
                                 index,
@@ -2591,139 +2680,115 @@ mod unix {
                     }
                 }
             }
-            terminal_event
+            if !deferred.terminal_replies.is_empty() {
+                published = true;
+            }
+            while let Some(reply) = deferred.terminal_replies.pop_front() {
+                match reply {
+                    TerminalReply::PtyWrite(write) => {
+                        runtime
+                            .pending_replies
+                            .push_back(PendingReply::PtyWrite(write));
+                        terminal_event = true;
+                    }
+                    TerminalReply::Request(request) => {
+                        let request_id = request.id();
+                        let kind = request.kind();
+                        let Some(event) = terminal_request_event(&request) else {
+                            shared.delegate.release_request();
+                            queue_event(
+                                &mut runtime.pending_events,
+                                SessionEvent::RequestRefused {
+                                    request_id,
+                                    kind,
+                                    reason: RequestRefusalReason::Unsupported,
+                                },
+                            );
+                            continue;
+                        };
+                        if queue_event(&mut runtime.pending_events, event) {
+                            runtime.pending_replies.push_back(PendingReply::Request {
+                                request,
+                                expires_at: Instant::now() + TERMINAL_REQUEST_TIMEOUT,
+                                response: None,
+                            });
+                            terminal_event = true;
+                        } else {
+                            shared.delegate.release_request();
+                            if !queue_event(
+                                &mut runtime.pending_events,
+                                SessionEvent::RequestRefused {
+                                    request_id,
+                                    kind,
+                                    reason: RequestRefusalReason::Capacity,
+                                },
+                            ) {
+                                eprintln!("rio-session: terminal request {request_id} ({kind:?}) refused because the event queue is full");
+                            }
+                        }
+                    }
+                }
+            }
+            drop(deferred);
+            if runtime.flush_ordered_replies()? {
+                published = true;
+                terminal_event = true;
+            }
+            (terminal_event, published)
         };
         if terminal_event {
             shared.refresh_idle_after_terminal_event();
         }
-        Ok(())
+        if published {
+            shared.signal_active();
+        }
+        Ok(published)
     }
 
-    fn expire_requests(runtime: &mut Runtime) {
+    fn next_deadline(
+        idle_deadline: Option<Instant>,
+        request_deadline: Option<Instant>,
+    ) -> Option<Instant> {
+        match (idle_deadline, request_deadline) {
+            (Some(idle), Some(request)) => Some(idle.min(request)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        }
+    }
+
+    fn expire_requests(runtime: &mut Runtime) -> bool {
         let now = Instant::now();
-        let mut expired = Vec::new();
-        runtime.pending_requests.retain(|request| {
-            if request.expires_at <= now {
-                expired.push((request.request.id(), request.request.kind()));
-                release_request_slot(&runtime.pending_request_slots);
+        let mut had_expired = false;
+        let pending_request_slots = &runtime.pending_request_slots;
+        let pending_events = &mut runtime.pending_events;
+        runtime.pending_replies.retain(|reply| match reply {
+            PendingReply::Request {
+                request,
+                expires_at,
+                ..
+            } if *expires_at <= now => {
+                release_request_slot(pending_request_slots);
+                remove_terminal_request_event(pending_events, request.id());
+                queue_event(
+                    pending_events,
+                    SessionEvent::RequestExpired {
+                        request_id: request.id(),
+                        kind: request.kind(),
+                    },
+                );
+                had_expired = true;
                 false
-            } else {
-                true
             }
+            _ => true,
         });
-        for (request_id, kind) in expired {
-            push_event(runtime, SessionEvent::RequestExpired { request_id, kind });
-        }
+        had_expired
     }
 
-    fn push_event(runtime: &mut Runtime, event: SessionEvent) -> bool {
-        if let Some(request_id) = terminal_request_event_id(&event) {
-            if runtime
-                .pending_events
-                .iter()
-                .any(|pending| terminal_request_event_id(pending) == Some(request_id))
-            {
-                return true;
-            }
-        }
-        if matches!(
-            event,
-            SessionEvent::Title { .. } | SessionEvent::Progress { .. }
-        ) {
-            runtime.pending_events.retain(|pending| {
-                !matches!(
-                    (&event, pending),
-                    (SessionEvent::Title { .. }, SessionEvent::Title { .. })
-                        | (SessionEvent::Progress { .. }, SessionEvent::Progress { .. })
-                )
-            });
-        }
-        if let SessionEvent::ColorChange {
-            route_id, index, ..
-        } = &event
-        {
-            runtime.pending_events.retain(|pending| {
-                !matches!(
-                    pending,
-                    SessionEvent::ColorChange {
-                        route_id: pending_route_id,
-                        index: pending_index,
-                        ..
-                    } if pending_route_id == route_id && pending_index == index
-                )
-            });
-        }
-        if matches!(
-            event,
-            SessionEvent::ChildExited { .. }
-                | SessionEvent::ClipboardOverflow
-                | SessionEvent::Closed
-        ) && runtime.pending_events.iter().any(|pending| {
-            matches!(
-                (&event, pending),
-                (
-                    SessionEvent::ChildExited { .. },
-                    SessionEvent::ChildExited { .. }
-                ) | (SessionEvent::Closed, SessionEvent::Closed)
-                    | (
-                        SessionEvent::ClipboardOverflow,
-                        SessionEvent::ClipboardOverflow
-                    )
-            )
-        }) {
-            return true;
-        }
-        if matches!(event, SessionEvent::FrameReady)
-            && runtime
-                .pending_events
-                .iter()
-                .any(|pending| matches!(pending, SessionEvent::FrameReady))
-        {
-            return true;
-        }
-        if runtime.pending_events.len() >= MAX_PENDING_REQUESTS {
-            let removable = runtime
-                .pending_events
-                .iter()
-                .position(|pending| !pending.is_critical());
-            if let Some(index) = removable {
-                let _ = runtime.pending_events.remove(index);
-            } else if matches!(event, SessionEvent::ClipboardStore { .. }) {
-                if runtime
-                    .pending_events
-                    .iter()
-                    .any(|pending| matches!(pending, SessionEvent::ClipboardOverflow))
-                {
-                    return true;
-                }
-                // Keep the queue bounded when every slot already contains a
-                // critical event. Existing lifecycle/request events win over
-                // an additional overflow notification.
-                return false;
-            } else {
-                if matches!(
-                    event,
-                    SessionEvent::Closed | SessionEvent::ChildExited { .. }
-                ) {
-                    runtime.pending_events.clear();
-                    runtime.pending_events.push_back(event);
-                    return true;
-                }
-                return false;
-            }
-        }
-        runtime.pending_events.push_back(event);
-        true
-    }
-
-    fn terminal_request_event_id(event: &SessionEvent) -> Option<u64> {
-        match event {
-            SessionEvent::ClipboardLoad { request_id, .. }
-            | SessionEvent::ColorRequest { request_id, .. }
-            | SessionEvent::TextAreaSizeRequest { request_id, .. }
-            | SessionEvent::GlyphProtocolQuery { request_id, .. } => Some(*request_id),
-            _ => None,
-        }
+    fn remove_terminal_request_event(
+        events: &mut VecDeque<SessionEvent>,
+        request_id: u64,
+    ) {
+        events.retain(|event| terminal_request_event_id(event) != Some(request_id));
     }
 
     fn flush_events(
@@ -2732,6 +2797,7 @@ mod unix {
         generation: u64,
     ) -> Result<(), SessionError> {
         let mut messages = Vec::new();
+        let mut retry_frame = false;
         {
             let mut state = shared
                 .state
@@ -2747,8 +2813,14 @@ mod unix {
             let Some(runtime) = state.runtime.as_mut() else {
                 return Ok(());
             };
-            if runtime.frame_pending && push_event(runtime, SessionEvent::FrameReady) {
-                runtime.frame_pending = false;
+            expire_requests(runtime);
+            runtime.flush_ordered_replies()?;
+            if runtime.frame_pending {
+                if queue_event(&mut runtime.pending_events, SessionEvent::FrameReady) {
+                    runtime.frame_pending = false;
+                } else {
+                    retry_frame = true;
+                }
             }
             messages.extend(
                 runtime
@@ -2757,7 +2829,57 @@ mod unix {
                     .map(|event| ServerMessage::Event { generation, event }),
             );
         }
-        let critical = messages
+        if let Err(error) = messages.iter().try_for_each(ServerMessage::validate) {
+            requeue_critical(shared, &messages, 0);
+            return Err(error);
+        }
+        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        for (index, message) in messages.iter().enumerate() {
+            if let Err(error) = codec::write_frame_until(stream, message, deadline) {
+                let start = if is_active(shared, generation) {
+                    index
+                } else {
+                    0
+                };
+                requeue_critical(shared, &messages, start);
+                return Err(error);
+            }
+        }
+        if !is_active(shared, generation) {
+            requeue_critical(shared, &messages, 0);
+        }
+        if retry_frame {
+            shared.signal_active();
+        }
+        Ok(())
+    }
+
+    fn requeue_critical(shared: &Shared, messages: &[ServerMessage], start: usize) {
+        let events = critical_events_from(messages, start);
+        if events.is_empty() {
+            return;
+        }
+        let published = {
+            let mut state = shared.state.lock().expect("worker state lock poisoned");
+            let Some(runtime) = state.runtime.as_mut() else {
+                return;
+            };
+            let mut published = false;
+            for event in events {
+                published |= queue_event(&mut runtime.pending_events, event);
+            }
+            published
+        };
+        if published {
+            shared.signal_active();
+        }
+    }
+
+    fn critical_events_from(
+        messages: &[ServerMessage],
+        start: usize,
+    ) -> Vec<SessionEvent> {
+        messages[start..]
             .iter()
             .filter_map(|message| match message {
                 ServerMessage::Event { event, .. } if event.is_critical() => {
@@ -2765,28 +2887,7 @@ mod unix {
                 }
                 _ => None,
             })
-            .collect::<Vec<_>>();
-        if let Err(error) = messages.iter().try_for_each(ServerMessage::validate) {
-            requeue_critical(shared, critical);
-            return Err(error);
-        }
-        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-        let result = messages
-            .iter()
-            .try_for_each(|message| codec::write_frame_until(stream, message, deadline));
-        if result.is_err() || !is_active(shared, generation) {
-            requeue_critical(shared, critical);
-        }
-        result
-    }
-
-    fn requeue_critical(shared: &Shared, events: Vec<SessionEvent>) {
-        let mut state = shared.state.lock().expect("worker state lock poisoned");
-        if let Some(runtime) = state.runtime.as_mut() {
-            for event in events {
-                push_event(runtime, event);
-            }
-        }
+            .collect()
     }
 
     fn send_error(
@@ -2875,61 +2976,178 @@ mod unix {
     struct EndpointGuard {
         listener: UnixListener,
         endpoint: PathBuf,
+        endpoint_identity: crate::FileIdentity,
+        parent_identity: crate::FileIdentity,
     }
 
     impl EndpointGuard {
         fn bind(endpoint: PathBuf) -> Result<Self, SessionError> {
-            let parent = endpoint
-                .parent()
-                .ok_or_else(|| SessionError::invalid("session endpoint has no parent"))?;
-            let parent_metadata = fs::symlink_metadata(parent)?;
-            let uid = unsafe { libc::geteuid() };
-            if !parent_metadata.is_dir()
-                || parent_metadata.uid() != uid
-                || parent_metadata.mode() & 0o077 != 0
-            {
-                return Err(SessionError::protocol(
-                    "session endpoint directory is not private",
-                ));
+            let (listener, endpoint_identity, parent_identity) =
+                crate::bind_endpoint(&endpoint)?;
+            Ok(Self {
+                listener,
+                endpoint,
+                endpoint_identity,
+                parent_identity,
+            })
+        }
+
+        fn from_fd(
+            endpoint: PathBuf,
+            fd: RawFd,
+            expected_identity: crate::FileIdentity,
+        ) -> Result<Self, SessionError> {
+            if fd < 0 {
+                return Err(SessionError::invalid("session listener fd is negative"));
             }
-            let previous_umask = unsafe { libc::umask(0o177) };
-            let listener_result = UnixListener::bind(&endpoint);
-            unsafe { libc::umask(previous_umask) };
-            let listener = listener_result?;
-            listener.set_nonblocking(true)?;
-            let metadata = match fs::symlink_metadata(&endpoint) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    let _ = fs::remove_file(&endpoint);
-                    return Err(error.into());
+            // The parent clears close-on-exec only for this inherited listener.
+            let listener = unsafe { UnixListener::from_raw_fd(fd) };
+            let validation = (|| -> Result<(), SessionError> {
+                let flags = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFD) };
+                if flags == -1 {
+                    return Err(io::Error::last_os_error().into());
+                }
+                if unsafe {
+                    libc::fcntl(
+                        listener.as_raw_fd(),
+                        libc::F_SETFD,
+                        flags | libc::FD_CLOEXEC,
+                    )
+                } == -1
+                {
+                    return Err(io::Error::last_os_error().into());
+                }
+                let address = listener.local_addr()?;
+                if address.as_pathname() != Some(endpoint.as_path()) {
+                    return Err(SessionError::protocol(
+                        "inherited listener does not match the session endpoint",
+                    ));
+                }
+                let mut socket_metadata = unsafe { std::mem::zeroed::<libc::stat>() };
+                if unsafe { libc::fstat(listener.as_raw_fd(), &mut socket_metadata) }
+                    == -1
+                {
+                    return Err(io::Error::last_os_error().into());
+                }
+                if socket_metadata.st_mode as u64 & libc::S_IFMT as u64
+                    != libc::S_IFSOCK as u64
+                {
+                    return Err(SessionError::protocol(
+                        "inherited listener does not match the session endpoint",
+                    ));
+                }
+                let mut socket_type = 0;
+                let mut option_length =
+                    std::mem::size_of_val(&socket_type) as libc::socklen_t;
+                if unsafe {
+                    libc::getsockopt(
+                        listener.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_TYPE,
+                        (&mut socket_type as *mut libc::c_int).cast(),
+                        &mut option_length,
+                    )
+                } == -1
+                    || socket_type != libc::SOCK_STREAM
+                {
+                    return Err(SessionError::protocol(
+                        "inherited listener is not a stream socket",
+                    ));
+                }
+                let mut accepting = 0;
+                option_length = std::mem::size_of_val(&accepting) as libc::socklen_t;
+                if unsafe {
+                    libc::getsockopt(
+                        listener.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_ACCEPTCONN,
+                        (&mut accepting as *mut libc::c_int).cast(),
+                        &mut option_length,
+                    )
+                } == -1
+                    || accepting == 0
+                {
+                    return Err(SessionError::protocol(
+                        "inherited fd is not a listening socket",
+                    ));
+                }
+                Ok(())
+            })();
+            if let Err(error) = validation {
+                cleanup_listener(&endpoint, listener, expected_identity);
+                return Err(error);
+            }
+            Self::from_listener(endpoint, listener, expected_identity)
+        }
+
+        fn from_listener(
+            endpoint: PathBuf,
+            listener: UnixListener,
+            expected_identity: crate::FileIdentity,
+        ) -> Result<Self, SessionError> {
+            let parent = match endpoint.parent() {
+                Some(parent) => parent,
+                None => {
+                    cleanup_listener(&endpoint, listener, expected_identity);
+                    return Err(SessionError::invalid("session endpoint has no parent"));
                 }
             };
-            if !metadata.file_type().is_socket()
-                || metadata.uid() != uid
-                || metadata.mode() & 0o777 != 0o600
-            {
-                let _ = fs::remove_file(&endpoint);
-                return Err(SessionError::protocol("session endpoint is not private"));
+            let parent_identity = match private_directory_identity(parent) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    cleanup_listener(&endpoint, listener, expected_identity);
+                    return Err(error);
+                }
+            };
+            let endpoint_identity =
+                match crate::private_endpoint_identity(&endpoint, expected_identity) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        cleanup_listener(&endpoint, listener, expected_identity);
+                        return Err(error);
+                    }
+                };
+            if let Err(error) = listener.set_nonblocking(true) {
+                cleanup_listener(&endpoint, listener, expected_identity);
+                return Err(error.into());
             }
-            Ok(Self { listener, endpoint })
+            Ok(Self {
+                listener,
+                endpoint,
+                endpoint_identity,
+                parent_identity,
+            })
         }
     }
 
     impl Drop for EndpointGuard {
         fn drop(&mut self) {
-            let _ = fs::remove_file(&self.endpoint);
             if let Some(parent) = self.endpoint.parent() {
-                let _ = fs::remove_dir(parent);
+                cleanup_endpoint_if_owned(
+                    &self.endpoint,
+                    Some(self.endpoint_identity),
+                    parent,
+                    self.parent_identity,
+                );
             }
         }
     }
 
-    pub fn parse_args(
+    pub(super) struct WorkerArgs {
+        pub(super) endpoint: PathBuf,
+        pub(super) session_id: SessionId,
+        pub(super) listener_fd: Option<RawFd>,
+        pub(super) endpoint_identity: Option<crate::FileIdentity>,
+    }
+
+    pub(super) fn parse_args(
         args: impl IntoIterator<Item = std::ffi::OsString>,
-    ) -> Result<(PathBuf, SessionId), SessionError> {
+    ) -> Result<WorkerArgs, SessionError> {
         let mut args = args.into_iter();
         let mut endpoint = None;
         let mut session_id = None;
+        let mut listener_fd = None;
+        let mut endpoint_identity = None;
         while let Some(arg) = args.next() {
             match arg.to_str() {
                 Some("--endpoint") => {
@@ -2947,6 +3165,34 @@ mod unix {
                         .ok_or_else(|| SessionError::invalid("missing session id"))?;
                     session_id = Some(parse_session_id(&value)?);
                 }
+                Some("--listener-fd") => {
+                    if listener_fd.is_some() {
+                        return Err(SessionError::invalid(
+                            "duplicate worker listener fd",
+                        ));
+                    }
+                    let value = args
+                        .next()
+                        .ok_or_else(|| SessionError::invalid("missing listener fd"))?;
+                    let value = value.to_str().ok_or_else(|| {
+                        SessionError::invalid("listener fd is not UTF-8")
+                    })?;
+                    let value = value
+                        .parse::<RawFd>()
+                        .map_err(|_| SessionError::invalid("invalid listener fd"))?;
+                    listener_fd = Some(value);
+                }
+                Some("--endpoint-identity") => {
+                    if endpoint_identity.is_some() {
+                        return Err(SessionError::invalid(
+                            "duplicate worker endpoint identity",
+                        ));
+                    }
+                    let value = args.next().ok_or_else(|| {
+                        SessionError::invalid("missing endpoint identity")
+                    })?;
+                    endpoint_identity = Some(parse_endpoint_identity(&value)?);
+                }
                 _ => return Err(SessionError::invalid("unknown worker argument")),
             }
         }
@@ -2959,7 +3205,35 @@ mod unix {
         }
         let session_id = session_id
             .ok_or_else(|| SessionError::invalid("missing worker session id"))?;
-        Ok((endpoint, session_id))
+        if listener_fd.is_some() != endpoint_identity.is_some() {
+            return Err(SessionError::invalid(
+                "inherited listener requires an endpoint identity",
+            ));
+        }
+        Ok(WorkerArgs {
+            endpoint,
+            session_id,
+            listener_fd,
+            endpoint_identity,
+        })
+    }
+
+    fn parse_endpoint_identity(
+        value: &std::ffi::OsStr,
+    ) -> Result<crate::FileIdentity, SessionError> {
+        let value = value
+            .to_str()
+            .ok_or_else(|| SessionError::invalid("endpoint identity is not UTF-8"))?;
+        let (device, inode) = value
+            .split_once(':')
+            .ok_or_else(|| SessionError::invalid("invalid endpoint identity"))?;
+        let device = device
+            .parse()
+            .map_err(|_| SessionError::invalid("invalid endpoint device"))?;
+        let inode = inode
+            .parse()
+            .map_err(|_| SessionError::invalid("invalid endpoint inode"))?;
+        Ok((device, inode))
     }
 
     fn parse_session_id(value: &std::ffi::OsStr) -> Result<SessionId, SessionError> {
@@ -2992,27 +3266,12 @@ mod unix {
 
     #[test]
     fn detach_serializes_retention_with_replacement_commit() {
-        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_REQUESTS);
-        let (critical_sender, critical_receiver) = mpsc::sync_channel(8);
-        let delegate = Arc::new(Delegate {
-            sender,
-            critical_sender,
-            wakeup_pending: Arc::new(AtomicBool::new(false)),
-            deferred: Arc::new(Mutex::new(DeferredNotifications::default())),
-            next_request_id: Arc::new(AtomicU64::new(1)),
-            pending_requests: Arc::new(AtomicUsize::new(0)),
-        });
-        let shared = Arc::new(Shared::new(
-            SessionId([1; 16]),
-            [1; 32],
-            receiver,
-            critical_receiver,
-            delegate,
-        ));
+        let shared = test_shared();
         let mut state = shared.state.lock().unwrap();
         state.active = Some(Active {
             generation: 1,
             connection_fd: -1,
+            wakeup: Arc::new(readiness::Readiness::new().unwrap()),
         });
         state.idle_since = None;
         let (started, waiting) = mpsc::sync_channel(1);
@@ -3029,6 +3288,7 @@ mod unix {
         state.active = Some(Active {
             generation: 2,
             connection_fd: -1,
+            wakeup: Arc::new(readiness::Readiness::new().unwrap()),
         });
         state.idle_since = None;
         drop(state);
@@ -3040,6 +3300,790 @@ mod unix {
         assert!(!shared.expire_if_idle());
         shared.state.lock().unwrap().idle_since = Some(Instant::now() - IDLE_RETENTION);
         assert!(shared.expire_if_idle());
+    }
+
+    #[cfg(test)]
+    fn test_shared() -> Arc<Shared> {
+        let delegate = Arc::new(Delegate {
+            wakeup_pending: AtomicBool::new(false),
+            wakeup: readiness::Readiness::new().unwrap(),
+            deferred: Mutex::new(DeferredNotifications::default()),
+            next_request_id: AtomicU64::new(1),
+            pending_requests: Arc::new(AtomicUsize::new(0)),
+        });
+        Arc::new(Shared::new(SessionId([1; 16]), [1; 32], delegate))
+    }
+
+    #[cfg(test)]
+    fn test_color_request(request_id: u64) -> TerminalRequest {
+        TerminalRequest::ColorRequest {
+            request_id,
+            route_id: 1,
+            index: 11,
+            format: Arc::new(|color: librio::ColorRgb| {
+                format!("color:{}:{}:{}", color.r, color.g, color.b)
+            }),
+        }
+    }
+
+    #[test]
+    fn frame_ready_retries_after_critical_events_are_flushed() {
+        let shared = test_shared();
+        let active_wakeup = Arc::new(readiness::Readiness::new().unwrap());
+        let (mut stream, _peer) = UnixStream::pair().unwrap();
+        let mut runtime =
+            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        for index in 0..MAX_PENDING_REQUESTS {
+            assert!(queue_event(
+                &mut runtime.pending_events,
+                SessionEvent::ColorChange {
+                    route_id: 1,
+                    index: index as u16,
+                    color: None,
+                },
+            ));
+        }
+        runtime.frame_pending = true;
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.runtime = Some(runtime);
+            state.active = Some(Active {
+                generation: 1,
+                connection_fd: stream.as_raw_fd(),
+                wakeup: Arc::clone(&active_wakeup),
+            });
+        }
+
+        flush_events(&shared, &mut stream, 1).unwrap();
+
+        assert!(readiness_is_signaled(&active_wakeup));
+    }
+
+    #[test]
+    fn detach_does_not_requeue_a_request_with_an_accepted_response() {
+        let shared = test_shared();
+        let mut runtime =
+            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        let response = runtime.surface.try_reserve_response(vec![b'\n']).unwrap();
+        runtime.pending_replies.push_back(PendingReply::Request {
+            request: TerminalRequest::GlyphProtocolQuery {
+                request_id: 7,
+                route_id: 1,
+                cp: b'?' as u32,
+            },
+            expires_at: Instant::now() + TERMINAL_REQUEST_TIMEOUT,
+            response: Some(response),
+        });
+        shared.delegate.pending_requests.store(1, Ordering::Release);
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.runtime = Some(runtime);
+            state.active = Some(Active {
+                generation: 1,
+                connection_fd: -1,
+                wakeup: Arc::new(readiness::Readiness::new().unwrap()),
+            });
+        }
+
+        detach(&shared, 1);
+
+        let state = shared.state.lock().unwrap();
+        assert!(!state.runtime.as_ref().unwrap().pending_events.iter().any(
+            |event| matches!(
+                event,
+                SessionEvent::GlyphProtocolQuery { request_id: 7, .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn terminal_replies_preserve_fifo_when_responses_are_reversed() {
+        let shared = test_shared();
+        let runtime =
+            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.runtime = Some(runtime);
+        }
+
+        let first_id = shared.delegate.next_request_id.load(Ordering::Acquire);
+        shared
+            .delegate
+            .send_request(RequestKind::ColorRequest, test_color_request);
+        let second_id = shared.delegate.next_request_id.load(Ordering::Acquire);
+        shared
+            .delegate
+            .send_request(RequestKind::ColorRequest, test_color_request);
+        drain_notifications(&shared).unwrap();
+
+        let mut state = shared.state.lock().unwrap();
+        let runtime = state.runtime.as_mut().unwrap();
+        assert!(matches!(
+            runtime.pending_replies.front(),
+            Some(PendingReply::Request { request, .. })
+                if request.id() == first_id
+        ));
+        assert!(matches!(
+            runtime.pending_replies.get(1),
+            Some(PendingReply::Request { request, .. })
+                if request.id() == second_id
+        ));
+
+        runtime
+            .execute(SessionCommand::ColorResponse {
+                request_id: second_id,
+                route_id: 1,
+                color: Some([4, 5, 6]),
+            })
+            .unwrap();
+        assert_eq!(runtime.pending_replies.len(), 2);
+        assert!(runtime
+            .pending_replies
+            .iter()
+            .find_map(|reply| match reply {
+                PendingReply::Request {
+                    request, response, ..
+                } if request.id() == second_id => Some(response.is_some()),
+                _ => None,
+            })
+            .unwrap());
+
+        runtime
+            .execute(SessionCommand::ColorResponse {
+                request_id: first_id,
+                route_id: 1,
+                color: Some([1, 2, 3]),
+            })
+            .unwrap();
+        assert!(runtime.pending_replies.is_empty());
+        assert_eq!(shared.delegate.pending_requests.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn terminal_reply_fifo_survives_notification_backpressure() {
+        let shared = test_shared();
+        let runtime =
+            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.runtime = Some(runtime);
+        }
+        for _ in 0..MAX_PENDING_REQUESTS {
+            shared.delegate.send(Notification::Action(Action::RingBell));
+        }
+
+        let first_id = shared.delegate.next_request_id.load(Ordering::Acquire);
+        shared
+            .delegate
+            .send_request(RequestKind::ColorRequest, test_color_request);
+        let second_id = shared.delegate.next_request_id.load(Ordering::Acquire);
+        shared
+            .delegate
+            .send_request(RequestKind::ColorRequest, test_color_request);
+        {
+            let deferred = shared.delegate.deferred.lock().unwrap();
+            assert_eq!(deferred.terminal_replies.len(), 2);
+        }
+
+        drain_notifications(&shared).unwrap();
+        let state = shared.state.lock().unwrap();
+        let runtime = state.runtime.as_ref().unwrap();
+        assert!(matches!(
+            runtime.pending_replies.front(),
+            Some(PendingReply::Request { request, .. })
+                if request.id() == first_id
+        ));
+        assert!(matches!(
+            runtime.pending_replies.get(1),
+            Some(PendingReply::Request { request, .. })
+                if request.id() == second_id
+        ));
+    }
+
+    #[test]
+    fn terminal_reply_fifo_keeps_raw_and_request_admission_together() {
+        let shared = test_shared();
+        let runtime =
+            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.runtime = Some(runtime);
+        }
+        for _ in 0..MAX_PENDING_REQUESTS {
+            shared.delegate.send(Notification::Action(Action::RingBell));
+        }
+
+        let first_id = shared.delegate.next_request_id.load(Ordering::Acquire);
+        shared
+            .delegate
+            .send_request(RequestKind::ColorRequest, test_color_request);
+        let raw = {
+            let state = shared.state.lock().unwrap();
+            state
+                .runtime
+                .as_ref()
+                .unwrap()
+                .surface
+                .try_reserve_response(b"raw-reply".to_vec())
+                .unwrap()
+        };
+        assert!(matches!(
+            SurfaceDelegate::pty_write(&*shared.delegate, 1, raw).unwrap(),
+            librio::PtyWriteResult::Handled
+        ));
+        let second_id = shared.delegate.next_request_id.load(Ordering::Acquire);
+        shared
+            .delegate
+            .send_request(RequestKind::ColorRequest, test_color_request);
+        assert_eq!(
+            shared
+                .delegate
+                .deferred
+                .lock()
+                .unwrap()
+                .terminal_replies
+                .len(),
+            3
+        );
+
+        drain_notifications(&shared).unwrap();
+        let state = shared.state.lock().unwrap();
+        let runtime = state.runtime.as_ref().unwrap();
+        assert!(matches!(
+            runtime
+                .surface
+                .try_reserve_response(vec![0; MAX_PENDING_INPUT_BYTES]),
+            Err(librio::InputError::WouldBlock)
+        ));
+        assert!(matches!(
+            runtime.pending_replies.front(),
+            Some(PendingReply::Request { request, .. })
+                if request.id() == first_id
+        ));
+        assert!(matches!(
+            runtime.pending_replies.get(1),
+            Some(PendingReply::PtyWrite(_))
+        ));
+        assert!(matches!(
+            runtime.pending_replies.get(2),
+            Some(PendingReply::Request { request, .. })
+                if request.id() == second_id
+        ));
+    }
+
+    #[test]
+    fn saturated_clipboard_store_preserves_its_payload() {
+        let shared = test_shared();
+        let runtime =
+            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        shared.state.lock().unwrap().runtime = Some(runtime);
+        for _ in 0..MAX_PENDING_REQUESTS {
+            shared.delegate.send(Notification::Action(Action::RingBell));
+        }
+
+        shared.delegate.send(Notification::ClipboardStore {
+            kind: librio::ClipboardType::Selection,
+            text: String::from("preserve this clipboard"),
+        });
+        shared.delegate.send(Notification::ClipboardStore {
+            kind: librio::ClipboardType::Clipboard,
+            text: String::from("old clipboard value"),
+        });
+        shared.delegate.send(Notification::ClipboardStore {
+            kind: librio::ClipboardType::Clipboard,
+            text: String::from("new clipboard value"),
+        });
+        drain_notifications(&shared).unwrap();
+
+        let state = shared.state.lock().unwrap();
+        let events = &state.runtime.as_ref().unwrap().pending_events;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ClipboardStore { kind: 1, text }
+                if text == "preserve this clipboard"
+        )));
+        let clipboard = events.iter().filter_map(|event| match event {
+            SessionEvent::ClipboardStore { kind: 0, text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert_eq!(clipboard.collect::<Vec<_>>(), ["new clipboard value"]);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ClipboardOverflow)));
+    }
+
+    #[test]
+    fn deferred_notifications_do_not_overtake_newer_queued_notifications() {
+        let shared = test_shared();
+        let runtime =
+            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        shared.state.lock().unwrap().runtime = Some(runtime);
+        for _ in 0..MAX_PENDING_REQUESTS {
+            shared.delegate.send(Notification::Action(Action::RingBell));
+        }
+
+        shared.delegate.send(Notification::Desktop {
+            title: String::from("old"),
+            body: String::from("old body"),
+        });
+        shared.delegate.send(Notification::Desktop {
+            title: String::from("new"),
+            body: String::from("new body"),
+        });
+        drain_notifications(&shared).unwrap();
+
+        let state = shared.state.lock().unwrap();
+        let titles = state
+            .runtime
+            .as_ref()
+            .unwrap()
+            .pending_events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::DesktopNotification { title, .. } => Some(title.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(titles, ["old", "new"]);
+    }
+
+    #[test]
+    fn older_deferred_color_change_precedes_newer_terminal_request() {
+        let shared = test_shared();
+        let runtime =
+            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        shared.state.lock().unwrap().runtime = Some(runtime);
+
+        for _ in 0..MAX_PENDING_REQUESTS {
+            shared.delegate.send(Notification::Action(Action::RingBell));
+        }
+        shared.delegate.send(Notification::ColorChange {
+            route_id: 1,
+            index: 11,
+            color: None,
+        });
+        shared
+            .delegate
+            .send_request(RequestKind::ColorRequest, test_color_request);
+        drain_notifications(&shared).unwrap();
+
+        let state = shared.state.lock().unwrap();
+        let events = &state.runtime.as_ref().unwrap().pending_events;
+        let color_index = events
+            .iter()
+            .position(|event| {
+                matches!(event, SessionEvent::ColorChange { index: 11, .. })
+            })
+            .unwrap();
+        let request_index = events
+            .iter()
+            .position(|event| matches!(event, SessionEvent::ColorRequest { .. }))
+            .unwrap();
+        assert!(color_index < request_index);
+    }
+
+    #[test]
+    fn expired_ordered_request_releases_following_raw_reply() {
+        let shared = test_shared();
+        let runtime =
+            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.runtime = Some(runtime);
+        }
+
+        let request_id = shared.delegate.next_request_id.load(Ordering::Acquire);
+        shared
+            .delegate
+            .send_request(RequestKind::ColorRequest, test_color_request);
+        let raw = {
+            let state = shared.state.lock().unwrap();
+            state
+                .runtime
+                .as_ref()
+                .unwrap()
+                .surface
+                .try_reserve_response(b"raw-reply".to_vec())
+                .unwrap()
+        };
+        assert!(matches!(
+            SurfaceDelegate::pty_write(&*shared.delegate, 1, raw).unwrap(),
+            librio::PtyWriteResult::Handled
+        ));
+        drain_notifications(&shared).unwrap();
+
+        let mut state = shared.state.lock().unwrap();
+        let runtime = state.runtime.as_mut().unwrap();
+        *runtime
+            .pending_replies
+            .iter_mut()
+            .find_map(|reply| match reply {
+                PendingReply::Request {
+                    request,
+                    expires_at,
+                    ..
+                } if request.id() == request_id => Some(expires_at),
+                _ => None,
+            })
+            .unwrap() = Instant::now() - Duration::from_secs(1);
+        assert!(expire_requests(runtime));
+        assert_eq!(runtime.pending_replies.len(), 1);
+        assert!(matches!(
+            runtime.pending_replies.front(),
+            Some(PendingReply::PtyWrite(_))
+        ));
+        assert!(runtime.flush_ordered_replies().unwrap());
+        assert!(runtime.pending_replies.is_empty());
+        assert_eq!(shared.delegate.pending_requests.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn invalid_terminal_response_keeps_request_for_retry() {
+        let shared = test_shared();
+        let runtime =
+            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.runtime = Some(runtime);
+        }
+
+        let request_id = shared.delegate.next_request_id.load(Ordering::Acquire);
+        shared
+            .delegate
+            .send_request(RequestKind::ColorRequest, test_color_request);
+        let raw = {
+            let state = shared.state.lock().unwrap();
+            state
+                .runtime
+                .as_ref()
+                .unwrap()
+                .surface
+                .try_reserve_response(b"raw-reply".to_vec())
+                .unwrap()
+        };
+        assert!(matches!(
+            SurfaceDelegate::pty_write(&*shared.delegate, 1, raw).unwrap(),
+            librio::PtyWriteResult::Handled
+        ));
+        drain_notifications(&shared).unwrap();
+
+        let mut state = shared.state.lock().unwrap();
+        let runtime = state.runtime.as_mut().unwrap();
+        assert!(runtime
+            .execute(SessionCommand::ColorResponse {
+                request_id,
+                route_id: 1,
+                color: None,
+            })
+            .is_err());
+        assert_eq!(runtime.pending_replies.len(), 2);
+        assert!(matches!(
+            runtime.pending_replies.front(),
+            Some(PendingReply::Request { request, .. })
+                if request.id() == request_id
+        ));
+        runtime
+            .execute(SessionCommand::ColorResponse {
+                request_id,
+                route_id: 1,
+                color: Some([1, 2, 3]),
+            })
+            .unwrap();
+        assert!(runtime.pending_replies.is_empty());
+        assert_eq!(shared.delegate.pending_requests.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn terminal_request_capacity_refusal_preserves_bound() {
+        let shared = test_shared();
+        for _ in 0..MAX_PENDING_REQUESTS {
+            shared
+                .delegate
+                .send_request(RequestKind::GlyphProtocolQuery, |request_id| {
+                    TerminalRequest::GlyphProtocolQuery {
+                        request_id,
+                        route_id: 1,
+                        cp: b'?' as u32,
+                    }
+                });
+        }
+        assert_eq!(
+            shared.delegate.pending_requests.load(Ordering::Acquire),
+            MAX_PENDING_REQUESTS
+        );
+        assert_eq!(
+            shared
+                .delegate
+                .deferred
+                .lock()
+                .unwrap()
+                .terminal_replies
+                .len(),
+            MAX_PENDING_REQUESTS
+        );
+        let refused_request_id = shared.delegate.next_request_id.load(Ordering::Acquire);
+        SurfaceDelegate::glyph_protocol_query(&*shared.delegate, 1, 1, b'!' as u32);
+        let notification = shared
+            .delegate
+            .deferred
+            .lock()
+            .unwrap()
+            .queued
+            .pop_front()
+            .unwrap();
+        assert!(matches!(
+            notification,
+            Notification::RequestRefused {
+                request_id: refused_id,
+                kind: RequestKind::GlyphProtocolQuery,
+                reason: RequestRefusalReason::Capacity,
+            } if refused_id == refused_request_id
+        ));
+    }
+
+    #[cfg(test)]
+    fn readiness_is_signaled(readiness: &readiness::Readiness) -> bool {
+        let mut poll_fd = libc::pollfd {
+            fd: readiness.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        readiness::wait(std::slice::from_mut(&mut poll_fd), Some(Instant::now()))
+            .is_ok_and(|ready| ready == 1)
+    }
+
+    #[test]
+    fn active_wakeup_follows_canonical_generation() {
+        let shared = test_shared();
+        let first = Arc::new(readiness::Readiness::new().unwrap());
+        let second = Arc::new(readiness::Readiness::new().unwrap());
+        shared.state.lock().unwrap().active = Some(Active {
+            generation: 1,
+            connection_fd: -1,
+            wakeup: Arc::clone(&first),
+        });
+
+        shared.delegate.wake();
+        assert!(readiness_is_signaled(&shared.delegate.wakeup));
+        assert!(!readiness_is_signaled(&first));
+        shared.delegate.wakeup.clear();
+        shared
+            .delegate
+            .wakeup_pending
+            .store(false, Ordering::Release);
+
+        shared.signal_active();
+        assert!(readiness_is_signaled(&first));
+        first.clear();
+        shared.state.lock().unwrap().active = Some(Active {
+            generation: 2,
+            connection_fd: -1,
+            wakeup: Arc::clone(&second),
+        });
+        shared.signal_active();
+        assert!(!readiness_is_signaled(&first));
+        assert!(readiness_is_signaled(&second));
+    }
+
+    #[test]
+    fn wait_deadline_includes_pending_request_expiry() {
+        let now = Instant::now();
+        let idle = now + Duration::from_secs(30);
+        let request = now + TERMINAL_REQUEST_TIMEOUT;
+        assert_eq!(next_deadline(Some(idle), Some(request)), Some(request));
+        assert_eq!(next_deadline(Some(request), None), Some(request));
+    }
+
+    #[test]
+    fn expired_request_refreshes_detached_retention() {
+        let shared = test_shared();
+        let mut runtime =
+            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        runtime.pending_replies.push_back(PendingReply::Request {
+            request: TerminalRequest::GlyphProtocolQuery {
+                request_id: 7,
+                route_id: 1,
+                cp: b'?' as u32,
+            },
+            expires_at: Instant::now() - Duration::from_secs(1),
+            response: None,
+        });
+        runtime
+            .pending_events
+            .push_back(SessionEvent::GlyphProtocolQuery {
+                request_id: 7,
+                route_id: 1,
+                codepoint: b'?' as u32,
+            });
+        shared.delegate.pending_requests.store(1, Ordering::Release);
+        let before = Instant::now();
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.runtime = Some(runtime);
+            state.idle_since = Some(before - Duration::from_secs(1));
+        }
+
+        drain_notifications(&shared).unwrap();
+
+        assert!(shared
+            .state
+            .lock()
+            .unwrap()
+            .idle_since
+            .is_some_and(|idle_since| idle_since >= before));
+    }
+
+    #[test]
+    fn accepted_request_refreshes_detached_retention() {
+        let shared = test_shared();
+        let runtime =
+            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        let before = Instant::now();
+        {
+            let mut state = shared.state.lock().unwrap();
+            state.runtime = Some(runtime);
+            state.idle_since = Some(before - Duration::from_secs(1));
+        }
+
+        shared
+            .delegate
+            .send_request(RequestKind::GlyphProtocolQuery, |request_id| {
+                TerminalRequest::GlyphProtocolQuery {
+                    request_id,
+                    route_id: 1,
+                    cp: b'?' as u32,
+                }
+            });
+        drain_notifications(&shared).unwrap();
+
+        let state = shared.state.lock().unwrap();
+        assert!(state
+            .idle_since
+            .is_some_and(|idle_since| idle_since >= before));
+        assert_eq!(
+            state
+                .runtime
+                .as_ref()
+                .unwrap()
+                .pending_replies
+                .iter()
+                .filter(|reply| matches!(reply, PendingReply::Request { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn expired_request_replaces_queued_request_event() {
+        let mut events = VecDeque::from([
+            SessionEvent::ClipboardLoad {
+                request_id: 7,
+                route_id: 1,
+                kind: 0,
+            },
+            SessionEvent::Title {
+                title: String::from("still pending"),
+            },
+        ]);
+        remove_terminal_request_event(&mut events, 7);
+        events.push_back(SessionEvent::RequestExpired {
+            request_id: 7,
+            kind: RequestKind::ClipboardLoad,
+        });
+
+        assert_eq!(events.len(), 2);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ClipboardLoad { request_id: 7, .. }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::RequestExpired { request_id: 7, .. }
+        )));
+    }
+
+    #[test]
+    fn flush_requeues_only_unsent_critical_events() {
+        let messages = vec![
+            ServerMessage::Event {
+                generation: 1,
+                event: SessionEvent::ChildExited { status: Some(1) },
+            },
+            ServerMessage::Event {
+                generation: 1,
+                event: SessionEvent::Title {
+                    title: String::from("sent"),
+                },
+            },
+            ServerMessage::Event {
+                generation: 1,
+                event: SessionEvent::RequestExpired {
+                    request_id: 7,
+                    kind: RequestKind::ClipboardLoad,
+                },
+            },
+        ];
+
+        let events = critical_events_from(&messages, 2);
+        assert_eq!(
+            events,
+            vec![SessionEvent::RequestExpired {
+                request_id: 7,
+                kind: RequestKind::ClipboardLoad,
+            }]
+        );
+    }
+
+    #[test]
+    fn endpoint_cleanup_does_not_remove_replacement_socket() {
+        let directory = std::env::temp_dir().join(format!(
+            "rio-session-endpoint-cleanup-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = directory.join("session.sock");
+        let guard = EndpointGuard::bind(endpoint.clone()).unwrap();
+        fs::remove_file(&endpoint).unwrap();
+        let replacement = UnixListener::bind(&endpoint).unwrap();
+        fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600)).unwrap();
+
+        drop(guard);
+        assert!(endpoint.exists());
+
+        drop(replacement);
+        fs::remove_file(&endpoint).unwrap();
+        fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn inherited_listener_rejects_replaced_endpoint() {
+        let directory = std::env::temp_dir().join(format!(
+            "rio-session-endpoint-adoption-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = directory.join("session.sock");
+        let listener = UnixListener::bind(&endpoint).unwrap();
+        fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600)).unwrap();
+        let expected_identity = crate::path_identity(&endpoint).unwrap();
+        let inherited =
+            std::os::fd::IntoRawFd::into_raw_fd(listener.try_clone().unwrap());
+        fs::remove_file(&endpoint).unwrap();
+        let replacement = UnixListener::bind(&endpoint).unwrap();
+        fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(
+            EndpointGuard::from_fd(endpoint.clone(), inherited, expected_identity)
+                .is_err()
+        );
+        assert!(endpoint.exists());
+
+        drop(replacement);
+        drop(listener);
+        fs::remove_file(&endpoint).unwrap();
+        fs::remove_dir(&directory).unwrap();
     }
 
     pub fn read_capability() -> Result<[u8; 32], SessionError> {
@@ -3062,9 +4106,15 @@ mod unix {
 pub fn run() -> Result<(), crate::SessionError> {
     #[cfg(unix)]
     {
-        let (endpoint, session_id) = unix::parse_args(std::env::args_os().skip(1))?;
+        let args = unix::parse_args(std::env::args_os().skip(1))?;
         let capability = unix::read_capability()?;
-        unix::run(endpoint, session_id, capability)
+        unix::run(
+            args.endpoint,
+            args.session_id,
+            capability,
+            args.listener_fd,
+            args.endpoint_identity,
+        )
     }
     #[cfg(not(unix))]
     Err(crate::SessionError::unsupported(

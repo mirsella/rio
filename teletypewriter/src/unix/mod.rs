@@ -1050,10 +1050,6 @@ pub fn reap_child(pid: libc::pid_t) -> io::Result<()> {
     }
 }
 
-fn reap_child_unchecked(pid: libc::pid_t) {
-    let _ = reap_child(pid);
-}
-
 fn terminate_and_reap_child(pid: libc::pid_t) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
@@ -1065,7 +1061,7 @@ fn terminate_and_reap_child(pid: libc::pid_t) {
     }
 
     unsafe { libc::kill(pid, libc::SIGKILL) };
-    reap_child_unchecked(pid);
+    let _ = reap_child(pid);
 }
 
 impl Drop for Child {
@@ -1092,7 +1088,7 @@ impl Drop for Child {
         {
             tracing::error!("failed to start PTY child reaper: {error}");
             unsafe { libc::kill(pid, libc::SIGKILL) };
-            reap_child_unchecked(pid);
+            let _ = reap_child(pid);
         }
     }
 }
