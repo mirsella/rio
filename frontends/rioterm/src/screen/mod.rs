@@ -36,6 +36,8 @@ use rio_backend::config::renderer::Backend;
 use rio_backend::crosswords::pos::{Boundary, CursorState, Direction, Line};
 use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
 use rio_backend::event::{ClickState, EventProxy, SearchState};
+#[cfg(wgpu_backend)]
+use rio_backend::sugarloaf::wgpu;
 use rio_backend::sugarloaf::{
     layout::RootStyle, Sugarloaf, SugarloafBackend, SugarloafErrors, SugarloafRenderer,
     SugarloafWindow, SugarloafWindowSize,
@@ -1306,7 +1308,8 @@ impl Screen<'_> {
         let mods = self.modifiers.state();
 
         if key.state == ElementState::Released {
-            if mode.contains(Mode::VI)
+            if !mode.contains(Mode::REPORT_EVENT_TYPES)
+                || mode.contains(Mode::VI)
                 || self.search_active()
                 || self.hint_state.is_active()
             {
@@ -4959,24 +4962,44 @@ impl Screen<'_> {
         use rio_grid::HintLabel;
 
         let hint_labels = if self.hint_state.is_active() {
+            let columns = self.context_manager.current().terminal.lock().columns();
             let matches = self.hint_state.matches();
             let visible_labels = self.hint_state.visible_labels();
 
             let mut labels = Vec::new();
-            for (match_index, remaining_label) in visible_labels {
-                if let Some(hint_match) = matches.get(match_index) {
-                    // Create labels for each character in the hint label
-                    for (char_index, &label_char) in remaining_label.iter().enumerate() {
-                        let position = rio_backend::crosswords::pos::Pos::new(
-                            hint_match.start.row,
-                            hint_match.start.col + char_index,
-                        );
+            if columns != 0 {
+                for (match_index, remaining_label) in visible_labels {
+                    if let Some(hint_match) = matches.get(match_index) {
+                        // Keep a label visible when its start cell is too close
+                        // to the right edge. Longer labels still follow the
+                        // terminal's row-major wrapping.
+                        let start_col = if remaining_label.len() <= columns
+                            && hint_match.start.col.0 + remaining_label.len() > columns
+                        {
+                            columns - remaining_label.len()
+                        } else {
+                            hint_match.start.col.0
+                        };
+                        for (char_index, &label_char) in
+                            remaining_label.iter().enumerate()
+                        {
+                            let linear_col = start_col + char_index;
+                            let position = rio_backend::crosswords::pos::Pos::new(
+                                Line(
+                                    hint_match.start.row.0
+                                        + (linear_col / columns) as i32,
+                                ),
+                                rio_backend::crosswords::pos::Column(
+                                    linear_col % columns,
+                                ),
+                            );
 
-                        labels.push(HintLabel {
-                            position,
-                            label: label_char,
-                            is_first: char_index == 0, // First character gets different styling
-                        });
+                            labels.push(HintLabel {
+                                position,
+                                label: label_char,
+                                is_first: char_index == 0, // First character gets different styling
+                            });
+                        }
                     }
                 }
             }

@@ -96,6 +96,8 @@ pub enum Event<D = PlatformDragId, O = PlatformOfferId> {
     },
     DataFailed(O),
     OfferCancelled(O),
+    ForeignFinished(D),
+    ForeignCommitted([u8; 16]),
     SourceFinished(D),
     SourceCancelled(D),
     Detach,
@@ -461,6 +463,16 @@ impl<D: Copy + Eq, O: Copy + Eq> TabDrag<D, O> {
                     });
                 }
             }
+            Event::ForeignFinished(drag_id)
+                if self.drag_id == Some(drag_id)
+                    && self.hover.is_none()
+                    && self.lifecycle == Lifecycle::Dragging =>
+            {
+                self.lifecycle = Lifecycle::AwaitingFinish;
+            }
+            Event::ForeignCommitted(token) if self.token.as_bytes() == token => {
+                self.lifecycle = Lifecycle::Complete(Outcome::Moved);
+            }
             Event::Detach
                 if self.lifecycle == Lifecycle::Dragging && !self.whole_window =>
             {
@@ -707,6 +719,18 @@ mod tests {
             .state;
         assert_eq!(state.lifecycle, Lifecycle::AwaitingFinish);
         let state = state.reduce(Event::OfferCancelled(2)).state;
+        assert_eq!(state.lifecycle, Lifecycle::Complete(Outcome::Moved));
+    }
+
+    #[test]
+    fn foreign_commit_cannot_be_overwritten_by_late_source_finish() {
+        let state = active(2).reduce(Event::ForeignFinished(1)).state;
+        assert_eq!(state.lifecycle, Lifecycle::AwaitingFinish);
+
+        let state = state.reduce(Event::ForeignCommitted([7; 16])).state;
+        assert_eq!(state.lifecycle, Lifecycle::Complete(Outcome::Moved));
+
+        let state = state.reduce(Event::ForeignFinished(1)).state;
         assert_eq!(state.lifecycle, Lifecycle::Complete(Outcome::Moved));
     }
 
