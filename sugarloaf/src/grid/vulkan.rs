@@ -39,6 +39,11 @@ const ATLAS_PAGE_SIZE: u16 = 2048;
 /// Memory is lazy — typical sessions use 1–2 pages.
 const MAX_PAGES: usize = 16;
 
+#[inline]
+fn align_staging_offset(offset: usize) -> usize {
+    (offset + 3) & !3
+}
+
 /// One pending glyph upload — `bytes` were copied at insert time, so
 /// the rasterizer's buffer can be reused immediately. Drained by
 /// `flush_uploads` on the next frame's command buffer.
@@ -223,12 +228,16 @@ impl VulkanGlyphAtlas {
         cmd: vk::CommandBuffer,
         slot: usize,
     ) {
-        let total_bytes: usize = self
-            .pages
-            .iter()
-            .flat_map(|p| p.pending.iter())
-            .map(|u| (u.w as usize) * (u.h as usize) * self.bytes_per_pixel as usize)
-            .sum();
+        let total_bytes = self.pages.iter().flat_map(|p| p.pending.iter()).fold(
+            0usize,
+            |offset, upload| {
+                let offset = align_staging_offset(offset);
+                let bytes = (upload.w as usize)
+                    * (upload.h as usize)
+                    * self.bytes_per_pixel as usize;
+                offset + bytes
+            },
+        );
         if total_bytes == 0 {
             return;
         }
@@ -249,7 +258,7 @@ impl VulkanGlyphAtlas {
         let staging_handle = staging.handle();
         let bpp = self.bytes_per_pixel as usize;
 
-        let mut offset: u64 = 0;
+        let mut offset = 0usize;
         for page in &mut self.pages {
             if page.pending.is_empty() {
                 continue;
@@ -258,16 +267,21 @@ impl VulkanGlyphAtlas {
                 Vec::with_capacity(page.pending.len());
             unsafe {
                 for upload in page.pending.drain(..) {
+                    offset = align_staging_offset(offset);
                     let bytes = (upload.w as usize) * (upload.h as usize) * bpp;
                     std::ptr::copy_nonoverlapping(
                         upload.bytes.as_ptr(),
-                        staging_ptr.add(offset as usize),
+                        staging_ptr.add(offset),
                         bytes,
                     );
                     copies.push(image_copy_region(
-                        offset, upload.x, upload.y, upload.w, upload.h,
+                        offset as u64,
+                        upload.x,
+                        upload.y,
+                        upload.w,
+                        upload.h,
                     ));
-                    offset += bytes as u64;
+                    offset += bytes;
                 }
             }
             upload_to_page(&shared.raw, cmd, staging_handle, page, &copies);
@@ -1775,5 +1789,19 @@ fn load_shader_module(device: &ash::Device, bytes: &[u8]) -> vk::ShaderModule {
         device
             .create_shader_module(&info, None)
             .expect("create_shader_module(grid)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::align_staging_offset;
+
+    #[test]
+    fn staging_offsets_are_four_byte_aligned() {
+        for offset in [0, 1, 2, 3, 4, 5, 7, 8, 13] {
+            assert_eq!(align_staging_offset(offset) % 4, 0);
+        }
+        assert_eq!(align_staging_offset(4), 4);
+        assert_eq!(align_staging_offset(5), 8);
     }
 }

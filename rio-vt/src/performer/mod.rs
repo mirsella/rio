@@ -130,6 +130,30 @@ pub struct Machine<T: teletypewriter::EventedPty, U: EventListener> {
     route_id: usize,
 }
 
+#[cfg(all(test, feature = "pty"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_ignores_empty_writes() {
+        let mut state = State::default();
+        state
+            .write_list
+            .push_back(Writing::new(Cow::Borrowed(&[]), None));
+        state
+            .write_list
+            .push_back(Writing::new(Cow::Borrowed(b"input"), None));
+
+        assert!(state.needs_write());
+        state.ensure_next();
+        assert_eq!(state.writing.as_ref().unwrap().remaining_bytes(), b"input");
+
+        state.writing = None;
+        state.goto_next();
+        assert!(!state.needs_write());
+    }
+}
+
 #[cfg(feature = "pty")]
 #[derive(Default)]
 pub struct State {
@@ -142,6 +166,9 @@ pub struct State {
 impl State {
     #[inline]
     fn ensure_next(&mut self) {
+        if self.writing.as_ref().is_some_and(Writing::finished) {
+            self.writing = None;
+        }
         if self.writing.is_none() {
             self.goto_next();
         }
@@ -149,12 +176,19 @@ impl State {
 
     #[inline]
     fn goto_next(&mut self) {
-        self.writing = self.write_list.pop_front();
+        self.writing = None;
+        while let Some(writing) = self.write_list.pop_front() {
+            if !writing.finished() {
+                self.writing = Some(writing);
+                break;
+            }
+        }
     }
 
     #[inline]
     fn needs_write(&self) -> bool {
-        self.writing.is_some() || !self.write_list.is_empty()
+        self.writing.is_some()
+            || self.write_list.iter().any(|writing| !writing.finished())
     }
 }
 
@@ -316,12 +350,13 @@ where
     fn drain_recv_channel(&mut self, state: &mut State) -> bool {
         while let Some(msg) = self.receiver.recv() {
             match msg {
-                Msg::Input(input) => {
+                Msg::Input(input) if !input.is_empty() => {
                     state.write_list.push_back(Writing::new(input, None))
                 }
-                Msg::InputBounded { input, reservation } => state
+                Msg::InputBounded { input, reservation } if !input.is_empty() => state
                     .write_list
                     .push_back(Writing::new(input, Some(reservation))),
+                Msg::Input(_) | Msg::InputBounded { .. } => (),
                 Msg::Resize(window_size) => {
                     let _ = self.pty.set_winsize(window_size.into());
                 }
