@@ -133,6 +133,8 @@ pub struct VulkanContext {
     swapchain_format: vk::Format,
     swapchain_images: Vec<vk::Image>,
     swapchain_views: Vec<vk::ImageView>,
+    swapchain_image_layouts: Vec<vk::ImageLayout>,
+    images_in_flight: Vec<vk::Fence>,
     swapchain: vk::SwapchainKHR,
     swapchain_loader: khr::swapchain::Device,
 
@@ -196,6 +198,9 @@ pub struct VulkanFrame {
     pub cmd_buffer: vk::CommandBuffer,
     pub extent: vk::Extent2D,
     pub format: vk::Format,
+    /// Layout recorded for this swapchain image before this frame's acquire
+    /// barrier. New images start undefined; reused images return from present.
+    pub old_layout: vk::ImageLayout,
     /// Frame-in-flight slot for this frame. Renderers (grid, text,
     /// images) ring their per-frame GPU resources by this index; the
     /// `in_flight` fence wait inside `acquire_frame` proved this slot
@@ -261,6 +266,7 @@ impl VulkanContext {
         // device creation time in a follow-up; for the MVP we report
         // false, matching the conservative default.
         let supports_f16 = false;
+        let swapchain_image_count = swapchain_images.len();
 
         tracing::info!(
             "Vulkan device created: {}",
@@ -295,6 +301,11 @@ impl VulkanContext {
             swapchain_format,
             swapchain_images,
             swapchain_views,
+            swapchain_image_layouts: vec![
+                vk::ImageLayout::UNDEFINED;
+                swapchain_image_count
+            ],
+            images_in_flight: vec![vk::Fence::null(); swapchain_image_count],
             swapchain,
             swapchain_loader,
             queue,
@@ -361,6 +372,9 @@ impl VulkanContext {
         self.swapchain_extent = extent;
         self.swapchain_images = images;
         self.swapchain_views = views;
+        self.swapchain_image_layouts =
+            vec![vk::ImageLayout::UNDEFINED; self.swapchain_images.len()];
+        self.images_in_flight = vec![vk::Fence::null(); self.swapchain_images.len()];
         self.needs_recreate = false;
     }
 
@@ -379,11 +393,19 @@ impl VulkanContext {
         }
 
         let slot = self.frame_index;
-        let sync = &self.frames[slot];
+        let (image_available, in_flight, cmd_pool, cmd_buffer) = {
+            let sync = &self.frames[slot];
+            (
+                sync.image_available,
+                sync.in_flight,
+                sync.cmd_pool,
+                sync.cmd_buffer,
+            )
+        };
 
         unsafe {
             self.shared
-                .wait_for_fences(&[sync.in_flight], true, u64::MAX)
+                .wait_for_fences(&[in_flight], true, u64::MAX)
                 .expect("wait_for_fences");
         }
 
@@ -391,7 +413,7 @@ impl VulkanContext {
             match self.swapchain_loader.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
-                sync.image_available,
+                image_available,
                 vk::Fence::null(),
             ) {
                 Ok(pair) => pair,
@@ -409,19 +431,31 @@ impl VulkanContext {
             self.needs_recreate = true;
         }
 
+        let image_index_usize = image_index as usize;
+        let previous_fence = self.images_in_flight[image_index_usize];
+        if previous_fence != vk::Fence::null() {
+            unsafe {
+                self.shared
+                    .wait_for_fences(&[previous_fence], true, u64::MAX)
+                    .expect("wait_for_swapchain_image");
+            }
+        }
+        self.images_in_flight[image_index_usize] = in_flight;
+        let old_layout = self.swapchain_image_layouts[image_index_usize];
+
         // Only reset *after* we've committed to submitting — resetting
         // before acquire_next_image would leave us deadlocked if the
         // acquire returned OUT_OF_DATE and we bailed out.
         unsafe {
             self.shared
-                .reset_fences(&[sync.in_flight])
+                .reset_fences(&[in_flight])
                 .expect("reset_fences");
             self.shared
-                .reset_command_pool(sync.cmd_pool, vk::CommandPoolResetFlags::empty())
+                .reset_command_pool(cmd_pool, vk::CommandPoolResetFlags::empty())
                 .expect("reset_command_pool");
             self.shared
                 .begin_command_buffer(
-                    sync.cmd_buffer,
+                    cmd_buffer,
                     &vk::CommandBufferBeginInfo::default()
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
@@ -432,9 +466,10 @@ impl VulkanContext {
             image_index,
             image: self.swapchain_images[image_index as usize],
             image_view: self.swapchain_views[image_index as usize],
-            cmd_buffer: sync.cmd_buffer,
+            cmd_buffer,
             extent: self.swapchain_extent,
             format: self.swapchain_format,
+            old_layout,
             slot,
         })
     }
@@ -459,6 +494,9 @@ impl VulkanContext {
             self.shared
                 .queue_submit(self.queue, &[submit], sync.in_flight)
                 .expect("queue_submit");
+
+            self.swapchain_image_layouts[frame.image_index as usize] =
+                vk::ImageLayout::PRESENT_SRC_KHR;
 
             let swapchains = [self.swapchain];
             let image_indices = [frame.image_index];
@@ -1509,10 +1547,12 @@ fn create_swapchain(
 fn guess_composite_alpha(
     supported_alpha: CompositeAlphaFlagsKHR,
 ) -> CompositeAlphaFlagsKHR {
-    if supported_alpha.contains(CompositeAlphaFlagsKHR::POST_MULTIPLIED) {
-        CompositeAlphaFlagsKHR::POST_MULTIPLIED
-    } else if supported_alpha.contains(CompositeAlphaFlagsKHR::PRE_MULTIPLIED) {
+    // The fragment pipelines emit premultiplied RGB. PRE_MULTIPLIED keeps
+    // the compositor from multiplying those channels by alpha a second time.
+    if supported_alpha.contains(CompositeAlphaFlagsKHR::PRE_MULTIPLIED) {
         CompositeAlphaFlagsKHR::PRE_MULTIPLIED
+    } else if supported_alpha.contains(CompositeAlphaFlagsKHR::POST_MULTIPLIED) {
+        CompositeAlphaFlagsKHR::POST_MULTIPLIED
     } else if supported_alpha.contains(CompositeAlphaFlagsKHR::INHERIT) {
         CompositeAlphaFlagsKHR::INHERIT
     } else {
@@ -1562,4 +1602,31 @@ fn create_frames(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composite_alpha_matches_premultiplied_output() {
+        let supported = CompositeAlphaFlagsKHR::PRE_MULTIPLIED
+            | CompositeAlphaFlagsKHR::POST_MULTIPLIED;
+        assert_eq!(
+            guess_composite_alpha(supported),
+            CompositeAlphaFlagsKHR::PRE_MULTIPLIED
+        );
+    }
+
+    #[test]
+    fn composite_alpha_falls_back_to_supported_modes() {
+        assert_eq!(
+            guess_composite_alpha(CompositeAlphaFlagsKHR::INHERIT),
+            CompositeAlphaFlagsKHR::INHERIT
+        );
+        assert_eq!(
+            guess_composite_alpha(CompositeAlphaFlagsKHR::OPAQUE),
+            CompositeAlphaFlagsKHR::OPAQUE
+        );
+    }
 }

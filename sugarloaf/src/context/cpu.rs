@@ -99,6 +99,72 @@ impl<'a> CpuRenderTarget<'a> {
     }
 }
 
+/// A destination rectangle and its corresponding source rectangle after
+/// clipping a glyph to both the framebuffer and a square atlas.
+#[derive(Clone, Copy)]
+pub(crate) struct CpuBlitRect {
+    pub(crate) dst_x: usize,
+    pub(crate) dst_y: usize,
+    pub(crate) src_x: usize,
+    pub(crate) src_y: usize,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+}
+
+/// Clip a glyph once before entering its per-pixel loop. The caller must
+/// separately validate that the atlas backing buffer contains the full
+/// `atlas_side x atlas_side` image.
+#[inline]
+pub(crate) fn clip_blit_rect(
+    (glyph_x, glyph_y): (i32, i32),
+    (glyph_width, glyph_height): (i32, i32),
+    (buf_width, buf_height): (i32, i32),
+    atlas_side: usize,
+    (atlas_x, atlas_y): (usize, usize),
+) -> Option<CpuBlitRect> {
+    if glyph_width <= 0 || glyph_height <= 0 || buf_width <= 0 || buf_height <= 0 {
+        return None;
+    }
+
+    let side = i64::try_from(atlas_side).ok()?;
+    let source_x = i64::try_from(atlas_x).ok()?;
+    let source_y = i64::try_from(atlas_y).ok()?;
+    if side <= 0 || source_x >= side || source_y >= side {
+        return None;
+    }
+
+    let glyph_x = i64::from(glyph_x);
+    let glyph_y = i64::from(glyph_y);
+    let dst_x0 = glyph_x.max(0);
+    let dst_y0 = glyph_y.max(0);
+    let mut dst_x1 = (glyph_x + i64::from(glyph_width)).min(i64::from(buf_width));
+    let mut dst_y1 = (glyph_y + i64::from(glyph_height)).min(i64::from(buf_height));
+    if dst_x1 <= dst_x0 || dst_y1 <= dst_y0 {
+        return None;
+    }
+
+    let source_x = source_x.checked_add(dst_x0.checked_sub(glyph_x)?)?;
+    let source_y = source_y.checked_add(dst_y0.checked_sub(glyph_y)?)?;
+    if source_x >= side || source_y >= side {
+        return None;
+    }
+
+    dst_x1 = dst_x1.min(dst_x0.checked_add(side - source_x)?);
+    dst_y1 = dst_y1.min(dst_y0.checked_add(side - source_y)?);
+    if dst_x1 <= dst_x0 || dst_y1 <= dst_y0 {
+        return None;
+    }
+
+    Some(CpuBlitRect {
+        dst_x: usize::try_from(dst_x0).ok()?,
+        dst_y: usize::try_from(dst_y0).ok()?,
+        src_x: usize::try_from(source_x).ok()?,
+        src_y: usize::try_from(source_y).ok()?,
+        width: usize::try_from(dst_x1 - dst_x0).ok()?,
+        height: usize::try_from(dst_y1 - dst_y0).ok()?,
+    })
+}
+
 fn validate_target(
     width: u32,
     height: u32,
@@ -231,6 +297,26 @@ impl CpuContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blit_rect_clips_destination_and_source_together() {
+        let rect = clip_blit_rect((-2, 1), (6, 5), (4, 5), 8, (2, 3)).unwrap();
+        assert_eq!(rect.dst_x, 0);
+        assert_eq!(rect.dst_y, 1);
+        assert_eq!(rect.src_x, 4);
+        assert_eq!(rect.src_y, 3);
+        assert_eq!(rect.width, 4);
+        assert_eq!(rect.height, 4);
+    }
+
+    #[test]
+    fn blit_rect_clips_atlas_overflow() {
+        let rect = clip_blit_rect((0, 0), (2, 2), (2, 2), 4, (3, 3)).unwrap();
+        assert_eq!(rect.dst_x, 0);
+        assert_eq!(rect.src_x, 3);
+        assert_eq!(rect.width, 1);
+        assert_eq!(rect.height, 1);
+    }
 
     #[test]
     fn target_rejects_invalid_dimensions_stride_and_length() {

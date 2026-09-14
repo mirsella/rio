@@ -362,7 +362,7 @@ impl FontLibrary {
         ch: char,
         fragment_style: &SpanStyle,
     ) -> Option<(usize, bool)> {
-        let primary_family = self.primary_family_name()?;
+        let primary_family = self.primary_family_name();
         let want_bold = fragment_style.font_attrs.weight() == swash::Weight::BOLD;
         let want_italic = fragment_style.font_attrs.style() == swash::Style::Italic;
         // Terminal — always bias toward monospace for consistent cell
@@ -439,13 +439,11 @@ impl FontLibrary {
         all(unix, not(target_os = "macos"), not(target_os = "android")),
         target_os = "windows"
     ))]
-    fn primary_family_name(&self) -> Option<String> {
+    fn primary_family_name(&self) -> String {
         let lib = self.inner.read();
-        let primary = lib.try_get(&FONT_ID_REGULAR)?;
-        primary
-            .postscript_name()
-            .map(|s| s.to_string())
-            .or_else(|| Some(String::from("monospace")))
+        lib.try_get(&FONT_ID_REGULAR)
+            .and_then(|primary| primary.family_name.clone())
+            .unwrap_or_else(|| String::from("monospace"))
     }
 
     /// Sorted, deduplicated list of every font family name the host
@@ -1237,6 +1235,11 @@ pub struct FontData {
     /// fonts where the PS name couldn't be parsed (rare — corrupt
     /// font, or zero-name TTF).
     postscript_name: Option<String>,
+    /// Family name passed to platform fallback discovery. This is kept
+    /// separate from the PostScript name because fontconfig's `FC_FAMILY`
+    /// matcher does not accept name-table ID 6.
+    #[cfg(not(target_os = "macos"))]
+    family_name: Option<String>,
 }
 
 impl PartialEq for FontData {
@@ -1348,34 +1351,35 @@ impl FontData {
             return Some(metrics);
         }
 
-        // Calculate metrics if not cached
-        if let Some(ref data) = self.data {
-            let font_ref = swash::FontRef {
-                data: data.as_ref(),
-                offset: self.offset,
-                key: self.key,
-            };
-
-            let scaled_metrics = font_ref.metrics(&[]).scale(font_size);
-
-            // Use the unified method that always includes CJK measurement
-            let face_metrics = FaceMetrics::from_font(&font_ref, &scaled_metrics);
-
-            // Calculate metrics using consistent approach
-            let metrics = if let Some(primary) = primary_metrics {
-                // Secondary font: use primary font's cell dimensions
-                Metrics::calc_with_primary_cell_dimensions(face_metrics, primary)
-            } else {
-                // Primary font: calculate natural metrics
-                Metrics::calc(face_metrics)
-            };
-
-            // Cache the result
-            self.metrics_cache.insert(size_key, metrics);
-            Some(metrics)
+        #[cfg(not(target_arch = "wasm32"))]
+        let loaded_data = if self.data.is_none() {
+            self.path.as_ref().and_then(load_from_font_source)
         } else {
             None
-        }
+        };
+        #[cfg(target_arch = "wasm32")]
+        let loaded_data: Option<SharedData> = None;
+
+        let data = self.data.as_ref().or(loaded_data.as_ref())?;
+        let font_ref = swash::FontRef {
+            data: data.as_ref(),
+            offset: self.offset,
+            key: self.key,
+        };
+
+        let scaled_metrics = font_ref.metrics(&[]).scale(font_size);
+
+        // Use the unified method that always includes CJK measurement
+        let face_metrics = FaceMetrics::from_font(&font_ref, &scaled_metrics);
+
+        let metrics = if let Some(primary) = primary_metrics {
+            Metrics::calc_with_primary_cell_dimensions(face_metrics, primary)
+        } else {
+            Metrics::calc(face_metrics)
+        };
+
+        self.metrics_cache.insert(size_key, metrics);
+        Some(metrics)
     }
 
     /// Get metrics for rich text rendering
@@ -1425,6 +1429,8 @@ impl FontData {
         let synth = attributes.synthesize(attributes);
         let is_emoji = has_color_tables(&font);
         let postscript_name = parse_postscript_name(&data, face_index);
+        #[cfg(not(target_os = "macos"))]
+        let family_name = parse_family_name(&data, face_index);
 
         let data = (!evictable).then_some(data);
 
@@ -1450,6 +1456,8 @@ impl FontData {
             #[cfg(target_os = "macos")]
             handle: None,
             postscript_name,
+            #[cfg(not(target_os = "macos"))]
+            family_name,
         })
     }
 
@@ -1598,6 +1606,8 @@ impl FontData {
         let synth = attributes.synthesize(attributes);
         let is_emoji = has_color_tables(&font);
         let postscript_name = parse_postscript_name(data, 0);
+        #[cfg(not(target_os = "macos"))]
+        let family_name = parse_family_name(data, 0);
 
         #[cfg(target_os = "macos")]
         let handle = {
@@ -1629,6 +1639,8 @@ impl FontData {
             #[cfg(target_os = "macos")]
             handle,
             postscript_name,
+            #[cfg(not(target_os = "macos"))]
+            family_name,
         })
     }
 
@@ -1648,6 +1660,8 @@ impl FontData {
         let is_emoji = has_color_tables(&font);
 
         let postscript_name = parse_postscript_name(data, 0);
+        #[cfg(not(target_os = "macos"))]
+        let family_name = parse_family_name(data, 0);
         Ok(Self {
             data: Some(SharedData::new(data.to_vec())),
             offset,
@@ -1665,6 +1679,8 @@ impl FontData {
             #[cfg(target_os = "macos")]
             handle: None,
             postscript_name,
+            #[cfg(not(target_os = "macos"))]
+            family_name,
         })
     }
 
@@ -1704,6 +1720,8 @@ impl FontData {
         let synth = attributes.synthesize(attributes);
         let is_emoji = has_color_tables(&font);
         let postscript_name = parse_postscript_name(&data, face_index);
+        #[cfg(not(target_os = "macos"))]
+        let family_name = parse_family_name(&data, face_index);
 
         Ok(Self {
             data: Some(data),
@@ -1720,6 +1738,8 @@ impl FontData {
             is_emoji,
             metrics_cache: FxHashMap::default(),
             postscript_name,
+            #[cfg(not(target_os = "macos"))]
+            family_name,
         })
     }
 }
@@ -1730,18 +1750,22 @@ impl FontData {
 /// without re-parsing. Falls back to the family name (ID 1) if the
 /// PS name is missing — a font without a usable name can't participate
 /// in the cascade-mapping anyway, so `None` is fine.
-fn parse_postscript_name(data: &[u8], face_index: u32) -> Option<String> {
+fn parse_name(data: &[u8], face_index: u32, name_id: u16) -> Option<String> {
     let face = ttf_parser::Face::parse(data, face_index).ok()?;
     face.names()
         .into_iter()
-        .find(|n| n.name_id == ttf_parser::name_id::POST_SCRIPT_NAME && n.is_unicode())
+        .find(|n| n.name_id == name_id && n.is_unicode())
         .and_then(|n| n.to_string())
-        .or_else(|| {
-            face.names()
-                .into_iter()
-                .find(|n| n.name_id == ttf_parser::name_id::FAMILY && n.is_unicode())
-                .and_then(|n| n.to_string())
-        })
+}
+
+fn parse_postscript_name(data: &[u8], face_index: u32) -> Option<String> {
+    parse_name(data, face_index, ttf_parser::name_id::POST_SCRIPT_NAME)
+        .or_else(|| parse_name(data, face_index, ttf_parser::name_id::FAMILY))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_family_name(data: &[u8], face_index: u32) -> Option<String> {
+    parse_name(data, face_index, ttf_parser::name_id::FAMILY)
 }
 
 /// Auto-detect emoji-ness from SFNT color tables (COLR, CBDT, CBLC, SBIX).
