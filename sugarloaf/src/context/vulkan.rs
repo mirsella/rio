@@ -161,20 +161,17 @@ pub struct VulkanContext {
     /// ~10–50ms of pipeline build time on subsequent launches.
     pipeline_cache: vk::PipelineCache,
 
-    // Instance-level state — held last so it outlives everything above in
-    // the Drop impl (drop order = declaration order).
+    // Instance-level state. The debug messenger is taken explicitly in
+    // `Drop` before `shared` can release the instance.
     surface: vk::SurfaceKHR,
     surface_loader: khr::surface::Instance,
     /// Debug-utils messenger, present only when validation layers
-    /// were requested via `RIO_VULKAN_VALIDATION=1`. Drops before
-    /// `instance` (declaration order) so the messenger handle is
-    /// destroyed while the instance is still alive.
+    /// were requested via `RIO_VULKAN_VALIDATION=1`.
     _debug_messenger: Option<DebugMessenger>,
 }
 
 /// Owns one `vk::DebugUtilsMessengerEXT` and its loader. Destroyed
-/// in `Drop` — the loader needs the parent `Instance` to still be
-/// valid, which the field-order convention ensures.
+/// in `Drop` while the parent `Instance` is still valid.
 struct DebugMessenger {
     loader: ash::ext::debug_utils::Instance,
     handle: vk::DebugUtilsMessengerEXT,
@@ -1071,12 +1068,10 @@ impl Drop for VulkanContext {
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
             self.surface_loader.destroy_surface(self.surface, None);
-            // `_debug_messenger` (declared after this Drop's body
-            // unwind path completes) drops before `shared` (declared
-            // before it), so the messenger handle is destroyed while
-            // the instance is still alive. `vkDestroyDevice` and
-            // `vkDestroyInstance` run in `VkShared::drop` once the
-            // last `Arc<VkShared>` clone is gone.
+
+            // Drop this before the context's fields release `shared`, which
+            // owns the Vulkan instance used by the debug-utils loader.
+            drop(self._debug_messenger.take());
         }
     }
 }

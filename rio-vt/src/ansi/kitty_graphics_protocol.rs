@@ -15,6 +15,15 @@ const MAX_DIMENSION: u32 = 10_000;
 /// memory before `create_graphic_data` validates them.
 const MAX_SIZE: usize = 400 * 1024 * 1024;
 
+/// Maximum base64 input that can decode to `MAX_SIZE` bytes. Check this
+/// before handing the payload to a decoder that allocates its output.
+const MAX_ENCODED_SIZE: usize = MAX_SIZE.div_ceil(3) * 4;
+
+/// Bound abandoned uploads independently of the per-image limit. A client
+/// can otherwise keep many small chunk accumulators alive at once.
+const MAX_INCOMPLETE_IMAGES: usize = 16;
+const MAX_INCOMPLETE_BYTES: usize = MAX_SIZE;
+
 /// How long an in-progress chunked upload may sit idle before the
 /// accumulator drops it. Prevents `incomplete_images` from growing
 /// without bound when a client abandons a chunked transmission
@@ -494,6 +503,11 @@ pub fn parse(
         });
     }
 
+    // Discard abandoned uploads before resolving an implicit continuation.
+    // Otherwise a stale current key can be selected and only cleared after
+    // the parser has already decided how to interpret this chunk.
+    evict_stale_chunks(state);
+
     // Handle chunked data
     // Determine the key for this chunk:
     // - If this chunk has an explicit image_id or image_number, use that.
@@ -524,11 +538,6 @@ pub fn parse(
         key
     };
 
-    // Drop any chunked uploads that have been idle for too long. Runs
-    // on every chunk event, so worst case we scan `incomplete_images`
-    // once per APC — O(n) with n bounded by concurrent uploads.
-    evict_stale_chunks(state);
-
     if cmd.more {
         // Pin the key for continuation chunks. Only chunked commands
         // touch `current_transmission_key` so non-chunked commands
@@ -540,27 +549,36 @@ pub fn parse(
         // chunks can simply append their bytes.
         use std::collections::hash_map::Entry;
 
+        let incomplete_bytes = incomplete_payload_bytes(state);
+        let is_new = !state.incomplete_images.contains_key(&image_key);
+        if is_new && state.incomplete_images.len() >= MAX_INCOMPLETE_IMAGES {
+            debug!(
+                "Dropping chunked upload {}: too many incomplete uploads",
+                image_key
+            );
+            state.current_transmission_key = 0;
+            return None;
+        }
+        if incomplete_bytes.saturating_add(cmd.payload.len()) > MAX_INCOMPLETE_BYTES {
+            debug!(
+                "Dropping chunked upload {}: incomplete upload budget exceeded",
+                image_key
+            );
+            state.incomplete_images.remove(&image_key);
+            state.current_transmission_key = 0;
+            return None;
+        }
+
         match state.incomplete_images.entry(image_key) {
             Entry::Vacant(e) => {
                 // First chunk - move cmd into storage (no clone!)
-                // Pre-allocate capacity if size is known to avoid reallocations
-                let expected_size = cmd.size as usize;
-                if expected_size > 0 && cmd.payload.capacity() < expected_size {
-                    cmd.payload
-                        .reserve(expected_size.saturating_sub(cmd.payload.len()));
-                    debug!(
-                        "First chunk for image key {}: {} bytes, reserved {} bytes total",
-                        image_key,
-                        cmd.payload.len(),
-                        expected_size
-                    );
-                } else {
-                    debug!(
-                        "First chunk for image key {}: {} bytes",
-                        image_key,
-                        cmd.payload.len()
-                    );
-                }
+                // Do not reserve the client-declared `S=` size: it is
+                // untrusted and may be much larger than this chunk.
+                debug!(
+                    "First chunk for image key {}: {} bytes",
+                    image_key,
+                    cmd.payload.len()
+                );
                 cmd.last_touched = Instant::now();
                 e.insert(cmd);
             }
@@ -988,9 +1006,6 @@ fn parse_compression(value: &str) -> Compression {
 /// chunk within `CHUNK_STALE_TIMEOUT`. Prevents unbounded growth when
 /// clients abandon chunked uploads.
 fn evict_stale_chunks(state: &mut KittyGraphicsState) {
-    if state.incomplete_images.is_empty() {
-        return;
-    }
     let now = Instant::now();
     let before = state.incomplete_images.len();
     state
@@ -1003,15 +1018,21 @@ fn evict_stale_chunks(state: &mut KittyGraphicsState) {
             before - after,
             CHUNK_STALE_TIMEOUT.as_secs()
         );
-        // If the pinned transmission key was evicted, clear it so that a
-        // new chunkless command can't accidentally resume it.
-        if !state
-            .incomplete_images
-            .contains_key(&state.current_transmission_key)
-        {
-            state.current_transmission_key = 0;
-        }
     }
+    // If the pinned transmission key was evicted or otherwise removed, clear
+    // it so that a new chunkless command cannot accidentally resume it.
+    if !state
+        .incomplete_images
+        .contains_key(&state.current_transmission_key)
+    {
+        state.current_transmission_key = 0;
+    }
+}
+
+fn incomplete_payload_bytes(state: &KittyGraphicsState) -> usize {
+    state.incomplete_images.values().fold(0, |total, command| {
+        total.saturating_add(command.payload.len())
+    })
 }
 
 /// Decode a single APC command's base64 payload.
@@ -1028,11 +1049,18 @@ fn decode_payload_base64(payload: &[u8]) -> Option<Vec<u8>> {
     if payload.is_empty() {
         return Some(Vec::new());
     }
+    if payload.len() > MAX_ENCODED_SIZE {
+        debug!(
+            "Base64 payload exceeds encoded size limit: {} bytes",
+            payload.len()
+        );
+        return None;
+    }
     if let Some(data) = simd_base64::decode(payload) {
-        return Some(data);
+        return (data.len() <= MAX_SIZE).then_some(data);
     }
     if let Some(data) = simd_base64::decode_no_pad(payload) {
-        return Some(data);
+        return (data.len() <= MAX_SIZE).then_some(data);
     }
     debug!("Base64 payload decode failed");
     None
@@ -1218,7 +1246,14 @@ fn create_graphic_data(cmd: &KittyGraphicsCommand) -> Result<GraphicData, Graphi
                         return Err(GraphicError::InvalidData);
                     }
 
-                    let shm_size = stat.st_size as usize;
+                    let shm_size = match usize::try_from(stat.st_size) {
+                        Ok(size) => size,
+                        Err(_) => {
+                            libc::close(fd);
+                            libc::shm_unlink(shm_name.as_ptr());
+                            return Err(GraphicError::InvalidData);
+                        }
+                    };
                     debug!("Shared memory size: {} bytes", shm_size);
 
                     // Use cmd.size if specified, otherwise use the full shm size
@@ -1228,12 +1263,20 @@ fn create_graphic_data(cmd: &KittyGraphicsCommand) -> Result<GraphicData, Graphi
                         shm_size
                     };
 
-                    if data_size > shm_size {
+                    let offset = cmd.offset as usize;
+                    let Some(end) = offset.checked_add(data_size) else {
+                        libc::close(fd);
+                        libc::shm_unlink(shm_name.as_ptr());
+                        debug!("Shared memory offset and size overflow");
+                        return Err(GraphicError::InvalidData);
+                    };
+
+                    if end > shm_size {
                         libc::close(fd);
                         libc::shm_unlink(shm_name.as_ptr());
                         debug!(
-                            "Requested size {} exceeds shared memory size {}",
-                            data_size, shm_size
+                            "Requested offset {} + size {} exceeds shared memory size {}",
+                            offset, data_size, shm_size
                         );
                         return Err(GraphicError::InvalidData);
                     }
@@ -1244,33 +1287,70 @@ fn create_graphic_data(cmd: &KittyGraphicsCommand) -> Result<GraphicData, Graphi
                         return Err(GraphicError::TooLarge);
                     }
 
-                    // Map shared memory
-                    let ptr = libc::mmap(
-                        std::ptr::null_mut(),
-                        data_size,
-                        libc::PROT_READ,
-                        libc::MAP_SHARED,
-                        fd,
-                        cmd.offset as libc::off_t,
-                    );
-
-                    if ptr == libc::MAP_FAILED {
+                    if data_size == 0 {
                         libc::close(fd);
-                        debug!("Failed to mmap shared memory");
-                        return Err(GraphicError::InvalidData);
+                        libc::shm_unlink(shm_name.as_ptr());
+                        Vec::new()
+                    } else {
+                        // mmap requires a page-aligned file offset. Map from
+                        // the preceding page and slice past the alignment.
+                        let page_size = libc::sysconf(libc::_SC_PAGESIZE);
+                        let Ok(page_size) = usize::try_from(page_size) else {
+                            libc::close(fd);
+                            libc::shm_unlink(shm_name.as_ptr());
+                            return Err(GraphicError::InvalidData);
+                        };
+                        if page_size == 0 {
+                            libc::close(fd);
+                            libc::shm_unlink(shm_name.as_ptr());
+                            return Err(GraphicError::InvalidData);
+                        }
+                        let aligned_offset = offset - (offset % page_size);
+                        let delta = offset - aligned_offset;
+                        let Some(map_len) = delta.checked_add(data_size) else {
+                            libc::close(fd);
+                            libc::shm_unlink(shm_name.as_ptr());
+                            return Err(GraphicError::InvalidData);
+                        };
+                        let Ok(map_offset) = libc::off_t::try_from(aligned_offset) else {
+                            libc::close(fd);
+                            libc::shm_unlink(shm_name.as_ptr());
+                            return Err(GraphicError::InvalidData);
+                        };
+
+                        let ptr = libc::mmap(
+                            std::ptr::null_mut(),
+                            map_len,
+                            libc::PROT_READ,
+                            libc::MAP_SHARED,
+                            fd,
+                            map_offset,
+                        );
+
+                        if ptr == libc::MAP_FAILED {
+                            libc::close(fd);
+                            libc::shm_unlink(shm_name.as_ptr());
+                            debug!("Failed to mmap shared memory");
+                            return Err(GraphicError::InvalidData);
+                        }
+
+                        // Copy data from shared memory.
+                        let data = std::slice::from_raw_parts(
+                            (ptr as *const u8).add(delta),
+                            data_size,
+                        )
+                        .to_vec();
+
+                        libc::munmap(ptr, map_len);
+                        libc::close(fd);
+                        libc::shm_unlink(shm_name.as_ptr());
+
+                        debug!(
+                            "Successfully read {} bytes from shared memory",
+                            data.len()
+                        );
+                        data
                     }
-
-                    // Copy data from shared memory
-                    let data =
-                        std::slice::from_raw_parts(ptr as *const u8, data_size).to_vec();
-
-                    // Cleanup
-                    libc::munmap(ptr, data_size);
-                    libc::close(fd);
-                    libc::shm_unlink(shm_name.as_ptr());
-
-                    debug!("Successfully read {} bytes from shared memory", data.len());
-                    data
                 }
             }
             #[cfg(windows)]
@@ -1345,25 +1425,33 @@ fn create_graphic_data(cmd: &KittyGraphicsCommand) -> Result<GraphicData, Graphi
                         shm_size
                     };
 
-                    // Validate offset and size
-                    if cmd.offset as usize + data_size > shm_size {
-                        debug!(
-                            "Requested offset {} + size {} exceeds shared memory size {}",
-                            cmd.offset, data_size, shm_size
-                        );
-                        UnmapViewOfFile(base_ptr);
-                        CloseHandle(handle);
-                        return Err(GraphicError::InvalidData);
-                    }
-
                     if data_size > MAX_SIZE {
                         UnmapViewOfFile(base_ptr);
                         CloseHandle(handle);
                         return Err(GraphicError::TooLarge);
                     }
 
+                    let offset = cmd.offset as usize;
+                    let Some(end) = offset.checked_add(data_size) else {
+                        debug!("Shared memory offset and size overflow");
+                        UnmapViewOfFile(base_ptr);
+                        CloseHandle(handle);
+                        return Err(GraphicError::InvalidData);
+                    };
+
+                    // Validate offset and size
+                    if end > shm_size {
+                        debug!(
+                            "Requested offset {} + size {} exceeds shared memory size {}",
+                            offset, data_size, shm_size
+                        );
+                        UnmapViewOfFile(base_ptr);
+                        CloseHandle(handle);
+                        return Err(GraphicError::InvalidData);
+                    }
+
                     // Copy data from shared memory
-                    let data_ptr = (base_ptr.Value as *const u8).add(cmd.offset as usize);
+                    let data_ptr = (base_ptr.Value as *const u8).add(offset);
                     let data = std::slice::from_raw_parts(data_ptr, data_size).to_vec();
 
                     // Cleanup
@@ -2040,6 +2128,50 @@ mod tests {
             graphic.pixels, expected_pixels,
             "chafa-style padded chunks must merge into the correct byte stream",
         );
+    }
+
+    #[test]
+    fn stale_implicit_continuation_allocates_a_new_image() {
+        let mut state = KittyGraphicsState::default();
+        let first = vec![b"G".as_ref(), b"a=t,f=32,s=1,v=1,m=1", b"/wAA"];
+        parse(&first, &mut state).expect("first chunk");
+
+        let key = state.current_transmission_key;
+        state.incomplete_images.get_mut(&key).unwrap().last_touched =
+            Instant::now() - CHUNK_STALE_TIMEOUT - Duration::from_secs(1);
+
+        let final_chunk = vec![b"G".as_ref(), b"a=t,f=32,s=1,v=1,m=0", b"/wAA/w=="];
+        let response = parse(&final_chunk, &mut state)
+            .expect("a stale continuation must become a fresh transmission");
+        let graphic = response.graphic_data.expect("fresh image data");
+        assert!(graphic.id.get() >= 0x8000_0000);
+        assert!(state.incomplete_images.is_empty());
+    }
+
+    #[test]
+    fn declared_chunk_size_does_not_reserve_untrusted_capacity() {
+        let mut state = KittyGraphicsState::default();
+        let params = vec![
+            b"G".as_ref(),
+            b"a=t,f=32,s=1,v=1,S=4294967295,m=1,i=77",
+            b"AAAA",
+        ];
+        parse(&params, &mut state).expect("chunk should be retained");
+        assert!(state.incomplete_images[&77].payload.capacity() < 1024);
+    }
+
+    #[test]
+    fn incomplete_upload_count_is_bounded() {
+        let mut state = KittyGraphicsState::default();
+        for image_id in 1..=MAX_INCOMPLETE_IMAGES as u32 {
+            let control = format!("a=t,f=32,s=1,v=1,m=1,i={image_id}");
+            let params = vec![b"G".as_ref(), control.as_bytes(), b"AAAA"];
+            assert!(parse(&params, &mut state).is_some());
+        }
+
+        let params = vec![b"G".as_ref(), b"a=t,f=32,s=1,v=1,m=1,i=99", b"AAAA"];
+        assert!(parse(&params, &mut state).is_none());
+        assert_eq!(state.incomplete_images.len(), MAX_INCOMPLETE_IMAGES);
     }
 
     #[test]
