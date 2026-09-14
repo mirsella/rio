@@ -251,16 +251,29 @@ fn parse_quad(chunk: &[Vertex]) -> ParsedQuad {
 /// Returns Some((x0,y0,x1,y1)) or None if fully clipped.
 #[inline(always)]
 fn snap_and_clip(q: &ParsedQuad, buf_w: i32, buf_h: i32) -> Option<(i32, i32, i32, i32)> {
+    if !q.min_x.is_finite()
+        || !q.min_y.is_finite()
+        || !q.max_x.is_finite()
+        || !q.max_y.is_finite()
+        || q.clip.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
     let mut x0 = q.min_x.round() as i32;
     let mut y0 = q.min_y.round() as i32;
     let mut x1 = q.max_x.round() as i32;
     let mut y1 = q.max_y.round() as i32;
 
     if q.clip[2] > 0.0 && q.clip[3] > 0.0 {
+        let clip_x1 = q.clip[0] + q.clip[2];
+        let clip_y1 = q.clip[1] + q.clip[3];
+        if !clip_x1.is_finite() || !clip_y1.is_finite() {
+            return None;
+        }
         let cx0 = q.clip[0].round() as i32;
         let cy0 = q.clip[1].round() as i32;
-        let cx1 = (q.clip[0] + q.clip[2]).round() as i32;
-        let cy1 = (q.clip[1] + q.clip[3]).round() as i32;
+        let cx1 = clip_x1.round() as i32;
+        let cy1 = clip_y1.round() as i32;
         if x0 < cx0 {
             x0 = cx0;
         }
@@ -841,7 +854,7 @@ pub fn draw_image_overlay(
         Some(required) => required,
         None => return,
     };
-    if rgba.len() < required_source {
+    if rgba.len() != required_source {
         return;
     }
     draw_image_overlay_strided(
@@ -867,16 +880,27 @@ fn draw_image_overlay_strided(
     image_height: u32,
     rgba: &[u8],
 ) {
-    if overlay.width <= 0.0 || overlay.height <= 0.0 {
+    if !overlay.x.is_finite()
+        || !overlay.y.is_finite()
+        || !overlay.width.is_finite()
+        || !overlay.height.is_finite()
+        || overlay.width <= 0.0
+        || overlay.height <= 0.0
+    {
         return;
     }
 
     let x0 = overlay.x.round() as i32;
     let y0 = overlay.y.round() as i32;
-    let x1 = (overlay.x + overlay.width).round() as i32;
-    let y1 = (overlay.y + overlay.height).round() as i32;
-    let span_x = (x1 - x0) as f32;
-    let span_y = (y1 - y0) as f32;
+    let x_end = overlay.x + overlay.width;
+    let y_end = overlay.y + overlay.height;
+    if !x_end.is_finite() || !y_end.is_finite() {
+        return;
+    }
+    let x1 = x_end.round() as i32;
+    let y1 = y_end.round() as i32;
+    let span_x = x1 as f32 - x0 as f32;
+    let span_y = y1 as f32 - y0 as f32;
     if span_x <= 0.0 || span_y <= 0.0 {
         return;
     }
@@ -890,21 +914,51 @@ fn draw_image_overlay_strided(
     }
 
     let [u0, v0, u1, v1] = overlay.source_rect;
+    if !u0.is_finite()
+        || !v0.is_finite()
+        || !u1.is_finite()
+        || !v1.is_finite()
+        || u0 < 0.0
+        || v0 < 0.0
+        || u0 > 1.0
+        || v0 > 1.0
+        || u1 < 0.0
+        || v1 < 0.0
+        || u1 > 1.0
+        || v1 > 1.0
+    {
+        return;
+    }
     let iw = image_width as f32;
     let ih = image_height as f32;
-    let max_sx = image_width as i32 - 1;
-    let max_sy = image_height as i32 - 1;
+    let sample_x = |px: i32| {
+        let t_x = ((px as f32 - x0 as f32) + 0.5) / span_x;
+        (u0 + (u1 - u0) * t_x.clamp(0.0, 1.0)) * iw
+    };
+    let sample_y = |py: i32| {
+        let t_y = ((py as f32 - y0 as f32) + 0.5) / span_y;
+        (v0 + (v1 - v0) * t_y.clamp(0.0, 1.0)) * ih
+    };
+    let valid_sample = |sample: f32, bound: f32| {
+        let index = sample.floor();
+        index.is_finite() && index >= 0.0 && index < bound
+    };
+    if !valid_sample(sample_x(cx0), iw)
+        || !valid_sample(sample_x(cx1 - 1), iw)
+        || !valid_sample(sample_y(cy0), ih)
+        || !valid_sample(sample_y(cy1 - 1), ih)
+    {
+        return;
+    }
 
     for py in cy0..cy1 {
-        let t_y = ((py - y0) as f32 + 0.5) / span_y;
-        let v = v0 + (v1 - v0) * t_y;
-        let sy = ((v * ih) as i32).clamp(0, max_sy) as usize;
+        let sy = sample_y(py).floor() as usize;
         let src_row = sy * image_width as usize;
-        let dst_row = (py as usize) * stride;
-        for px in cx0..cx1 {
-            let t_x = ((px - x0) as f32 + 0.5) / span_x;
-            let u = u0 + (u1 - u0) * t_x;
-            let sx = ((u * iw) as i32).clamp(0, max_sx) as usize;
+        let dst_start = (py as usize) * stride + cx0 as usize;
+        let dst_row = &mut buf[dst_start..dst_start + (cx1 - cx0) as usize];
+        for (offset, dst) in dst_row.iter_mut().enumerate() {
+            let px = cx0 + offset as i32;
+            let sx = sample_x(px).floor() as usize;
             let idx = (src_row + sx) * 4;
             let a = rgba[idx + 3];
             if a == 0 {
@@ -917,7 +971,6 @@ fn draw_image_overlay_strided(
                 premul(rgba[idx + 2]),
                 a,
             );
-            let dst = &mut buf[dst_row + px as usize];
             *dst = blend_over_swar(src, *dst);
         }
     }
@@ -997,18 +1050,69 @@ fn draw_glyph(
     atlas_size: u16,
     cache: &mut CpuCache,
 ) {
-    if atlas_size == 0 {
+    if atlas_size == 0
+        || !min_u.is_finite()
+        || !min_v.is_finite()
+        || !(0.0..=1.0).contains(&min_u)
+        || !(0.0..=1.0).contains(&min_v)
+        || !quad_min_x.is_finite()
+        || !quad_min_y.is_finite()
+    {
+        return;
+    }
+    let Some(g_w) = i64::from(x1)
+        .checked_sub(i64::from(x0))
+        .and_then(|width| u16::try_from(width).ok())
+    else {
+        return;
+    };
+    let Some(g_h) = i64::from(y1)
+        .checked_sub(i64::from(y0))
+        .and_then(|height| u16::try_from(height).ok())
+    else {
+        return;
+    };
+    if g_w == 0 || g_h == 0 {
         return;
     }
     let atlas_size_f = atlas_size as f32;
-    let u0_px = (min_u * atlas_size_f) as i32;
-    let v0_px = (min_v * atlas_size_f) as i32;
-    let q_x0 = quad_min_x.round() as i32;
-    let q_y0 = quad_min_y.round() as i32;
-
-    let g_w = (x1 - x0).max(0) as u16;
-    let g_h = (y1 - y0).max(0) as u16;
-    if g_w == 0 || g_h == 0 {
+    let u0_px = min_u * atlas_size_f;
+    let v0_px = min_v * atlas_size_f;
+    if !u0_px.is_finite() || !v0_px.is_finite() {
+        return;
+    }
+    let u0_px = u0_px as i64;
+    let v0_px = v0_px as i64;
+    let q_x0 = quad_min_x.round() as i64;
+    let q_y0 = quad_min_y.round() as i64;
+    let atlas_w_us = atlas_size as usize;
+    let Some(atlas_x_i) = u0_px
+        .checked_add(i64::from(x0))
+        .and_then(|value| value.checked_sub(q_x0))
+    else {
+        return;
+    };
+    let Some(atlas_y_i) = v0_px
+        .checked_add(i64::from(y0))
+        .and_then(|value| value.checked_sub(q_y0))
+    else {
+        return;
+    };
+    let Some(atlas_x) = usize::try_from(atlas_x_i).ok() else {
+        return;
+    };
+    let Some(atlas_y) = usize::try_from(atlas_y_i).ok() else {
+        return;
+    };
+    let g_w_us = g_w as usize;
+    let g_h_us = g_h as usize;
+    if atlas_x
+        .checked_add(g_w_us)
+        .is_none_or(|end| end > atlas_w_us)
+        || atlas_y
+            .checked_add(g_h_us)
+            .is_none_or(|end| end > atlas_w_us)
+    {
         return;
     }
 
@@ -1018,12 +1122,9 @@ fn draw_glyph(
     let a = (color[3].clamp(0.0, 1.0) * 255.0) as u8;
     let color_packed = u32::from_le_bytes([r, g, b, a]);
 
-    let atlas_x = (u0_px + (x0 - q_x0)).max(0) as u16;
-    let atlas_y = (v0_px + (y0 - q_y0)).max(0) as u16;
-
     let key = GlyphKey {
-        atlas_x,
-        atlas_y,
+        atlas_x: atlas_x as u16,
+        atlas_y: atlas_y as u16,
         w: g_w,
         h: g_h,
         color: color_packed,
@@ -1031,22 +1132,24 @@ fn draw_glyph(
 
     if let std::collections::hash_map::Entry::Vacant(e) = cache.glyphs.entry(key) {
         let mask = images.cpu_mask_atlas_buffer();
-        if mask.is_empty() {
+        let required_mask = (atlas_size as usize)
+            .checked_mul(atlas_size as usize)
+            .filter(|required| mask.len() >= *required);
+        if required_mask.is_none() {
             return;
         }
-        let atlas_w_us = atlas_size as usize;
         let r_u = r as u32;
         let g_u = g as u32;
         let b_u = b as u32;
         let a_u = a as u32;
 
-        let mut pixels = vec![0u32; (g_w as usize) * (g_h as usize)];
+        let mut pixels = vec![0u32; g_w_us * g_h_us];
         for yy in 0..g_h as usize {
-            let src_y = (atlas_y as usize + yy).min(atlas_w_us - 1);
+            let src_y = atlas_y + yy;
             let src_row = src_y * atlas_w_us;
-            let dst_row = yy * (g_w as usize);
-            for xx in 0..g_w as usize {
-                let src_x = (atlas_x as usize + xx).min(atlas_w_us - 1);
+            let dst_row = yy * g_w_us;
+            for xx in 0..g_w_us {
+                let src_x = atlas_x + xx;
                 let m = mask[src_row + src_x] as u32;
                 let pa = (m * a_u + 127) / 255;
                 if pa == 0 {
@@ -1112,7 +1215,14 @@ fn draw_color_glyph(
     images: &ImageCache,
     atlas_size: u16,
 ) -> Result<(), CpuRenderError> {
-    let Some(atlas) = images.cpu_color_atlas_buffer((q.color_layer - 1) as usize) else {
+    let Some(color_layer) = q
+        .color_layer
+        .checked_sub(1)
+        .and_then(|layer| usize::try_from(layer).ok())
+    else {
+        return Ok(());
+    };
+    let Some(atlas) = images.cpu_color_atlas_buffer(color_layer) else {
         return Err(CpuRenderError::MissingColorAtlas {
             layer: q.color_layer,
         });
@@ -1136,26 +1246,67 @@ fn draw_color_glyph(
     } else {
         None
     };
+    if !q.min_x.is_finite()
+        || !q.min_y.is_finite()
+        || !q.max_x.is_finite()
+        || !q.max_y.is_finite()
+        || !q.min_u.is_finite()
+        || !q.min_v.is_finite()
+        || !q.max_u.is_finite()
+        || !q.max_v.is_finite()
+        || q.min_u < 0.0
+        || q.min_v < 0.0
+        || q.min_u > 1.0
+        || q.min_v > 1.0
+        || q.max_u < 0.0
+        || q.max_v < 0.0
+        || q.max_u > 1.0
+        || q.max_v > 1.0
+    {
+        return Ok(());
+    }
     let color_alpha = (q.color[3].clamp(0.0, 1.0) * 255.0) as u8;
     let width = q.max_x - q.min_x;
     let height = q.max_y - q.min_y;
-    if width <= 0.0 || height <= 0.0 {
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         return Ok(());
     }
-    let max_sx = atlas_size.saturating_sub(1);
-    let max_sy = atlas_size.saturating_sub(1);
-    for py in y0.max(0)..y1.min(buf_h) {
+    let cx0 = x0.max(0);
+    let cy0 = y0.max(0);
+    let cx1 = x1.min(buf_w);
+    let cy1 = y1.min(buf_h);
+    if cx1 <= cx0 || cy1 <= cy0 {
+        return Ok(());
+    }
+
+    let atlas_size_f = atlas_size as f32;
+    let sample_x = |px: i32| {
+        let u = ((px as f32 + 0.5 - q.min_x) / width).clamp(0.0, 1.0);
+        (q.min_u + (q.max_u - q.min_u) * u) * atlas_size_f
+    };
+    let sample_y = |py: i32| {
         let v = ((py as f32 + 0.5 - q.min_y) / height).clamp(0.0, 1.0);
-        let atlas_y = ((q.min_v + (q.max_v - q.min_v) * v) * atlas_size as f32)
-            .floor()
-            .max(0.0) as usize;
-        let atlas_y = atlas_y.min(max_sy);
-        for px in x0.max(0)..x1.min(buf_w) {
-            let u = ((px as f32 + 0.5 - q.min_x) / width).clamp(0.0, 1.0);
-            let atlas_x = ((q.min_u + (q.max_u - q.min_u) * u) * atlas_size as f32)
-                .floor()
-                .max(0.0) as usize;
-            let atlas_x = atlas_x.min(max_sx);
+        (q.min_v + (q.max_v - q.min_v) * v) * atlas_size_f
+    };
+    let valid_sample = |sample: f32| {
+        let index = sample.floor();
+        index.is_finite() && index >= 0.0 && index < atlas_size_f
+    };
+    if !valid_sample(sample_x(cx0))
+        || !valid_sample(sample_x(cx1 - 1))
+        || !valid_sample(sample_y(cy0))
+        || !valid_sample(sample_y(cy1 - 1))
+    {
+        return Ok(());
+    }
+
+    for py in cy0..cy1 {
+        let atlas_y = sample_y(py).floor() as usize;
+        let dst_start = (py as usize) * stride + cx0 as usize;
+        let dst_row = &mut buf[dst_start..dst_start + (cx1 - cx0) as usize];
+        for (offset, dst) in dst_row.iter_mut().enumerate() {
+            let px = cx0 + offset as i32;
+            let atlas_x = sample_x(px).floor() as usize;
             let src = (atlas_y * atlas_size + atlas_x) * 4;
             let alpha = mask_atlas.map_or(atlas[src + 3], |mask| {
                 ((u16::from(color_alpha)
@@ -1167,8 +1318,7 @@ fn draw_color_glyph(
                 continue;
             }
             let source = pack_premul(atlas[src], atlas[src + 1], atlas[src + 2], alpha);
-            let dst = (py as usize) * stride + px as usize;
-            buf[dst] = blend_over_swar(source, buf[dst]);
+            *dst = blend_over_swar(source, *dst);
         }
     }
     Ok(())
@@ -1186,6 +1336,14 @@ fn draw_quad_instance(
     buf_h: i32,
     inst: &crate::renderer::batch::QuadInstance,
 ) {
+    if inst.pos.iter().any(|value| !value.is_finite())
+        || inst.size.iter().any(|value| !value.is_finite())
+        || inst.color.iter().any(|value| !value.is_finite())
+        || inst.corner_radii.iter().any(|value| !value.is_finite())
+        || inst.clip_rect.iter().any(|value| !value.is_finite())
+    {
+        return;
+    }
     let r = (inst.color[0].clamp(0.0, 1.0) * 255.0) as u8;
     let g = (inst.color[1].clamp(0.0, 1.0) * 255.0) as u8;
     let b = (inst.color[2].clamp(0.0, 1.0) * 255.0) as u8;
@@ -1198,50 +1356,23 @@ fn draw_quad_instance(
     let qy0 = inst.pos[1];
     let qx1 = qx0 + inst.size[0];
     let qy1 = qy0 + inst.size[1];
-
-    let mut x0 = qx0.round() as i32;
-    let mut y0 = qy0.round() as i32;
-    let mut x1 = qx1.round() as i32;
-    let mut y1 = qy1.round() as i32;
-
-    // Apply clip_rect when w & h are both > 0 (matches the shader's
-    // convention that an all-zero clip means "unclipped").
-    let cw = inst.clip_rect[2];
-    let ch = inst.clip_rect[3];
-    if cw > 0.0 && ch > 0.0 {
-        let cx0 = inst.clip_rect[0].round() as i32;
-        let cy0 = inst.clip_rect[1].round() as i32;
-        let cx1 = (inst.clip_rect[0] + cw).round() as i32;
-        let cy1 = (inst.clip_rect[1] + ch).round() as i32;
-        if x0 < cx0 {
-            x0 = cx0;
-        }
-        if y0 < cy0 {
-            y0 = cy0;
-        }
-        if x1 > cx1 {
-            x1 = cx1;
-        }
-        if y1 > cy1 {
-            y1 = cy1;
-        }
-    }
-
-    if x0 < 0 {
-        x0 = 0;
-    }
-    if y0 < 0 {
-        y0 = 0;
-    }
-    if x1 > buf_w {
-        x1 = buf_w;
-    }
-    if y1 > buf_h {
-        y1 = buf_h;
-    }
-    if x1 <= x0 || y1 <= y0 {
+    let q = ParsedQuad {
+        min_x: qx0,
+        min_y: qy0,
+        max_x: qx1,
+        max_y: qy1,
+        min_u: 0.0,
+        min_v: 0.0,
+        max_u: 0.0,
+        max_v: 0.0,
+        color: inst.color,
+        color_layer: 0,
+        mask_layer: 0,
+        clip: inst.clip_rect,
+    };
+    let Some((x0, y0, x1, y1)) = snap_and_clip(&q, buf_w, buf_h) else {
         return;
-    }
+    };
 
     let any_radii = inst.corner_radii.iter().any(|&r| r > 0.0);
     if !any_radii {
@@ -1582,5 +1713,24 @@ mod image_overlay_tests {
             validate_rgba_pixels(1, 1, &[255, 0, 0, 255, 1]),
             Err(CpuRenderError::InvalidImageData { .. })
         ));
+    }
+
+    #[test]
+    fn solid_quad_rejects_nonfinite_geometry() {
+        let mut buf = buffer(2, 2);
+        let instance = crate::renderer::batch::QuadInstance {
+            pos: [f32::NAN, 0.0, 0.0],
+            color: [1.0, 0.0, 0.0, 1.0],
+            uv_rect: [0.0; 4],
+            layers: [0, 0],
+            size: [2.0, 2.0],
+            corner_radii: [0.0; 4],
+            underline_style: 0,
+            clip_rect: [0.0; 4],
+        };
+
+        draw_quad_instance(&mut buf, 2, 2, 2, &instance);
+
+        assert_eq!(buf, vec![0; 4]);
     }
 }

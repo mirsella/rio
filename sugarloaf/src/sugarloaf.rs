@@ -1022,7 +1022,7 @@ impl Sugarloaf<'_> {
         grids: &mut [(&mut crate::grid::GridRenderer, crate::grid::GridUniforms)],
     ) {
         self.renderer
-            .prepare(&mut self.ctx, &mut self.image_data, &self.image_overlays);
+            .prepare(&mut self.ctx, &self.image_data, &self.image_overlays);
 
         match self.ctx.inner {
             #[cfg(feature = "wgpu")]
@@ -1145,7 +1145,7 @@ impl Sugarloaf<'_> {
         self.text.prepare_vulkan(ctx, cmd, frame.slot);
         let image_draws = self.renderer.prepare_vulkan_images(&frame);
 
-        vkr::cmd_acquire_image_for_rendering(&device, cmd, frame.image);
+        vkr::cmd_acquire_image_for_rendering(&device, cmd, frame.image, frame.old_layout);
 
         let color_attachment = vkr::build_color_attachment(&frame, bg);
         let color_attachments = [color_attachment];

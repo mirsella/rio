@@ -113,7 +113,11 @@ pub fn kitty_image_key(image_id: u32) -> u64 {
 /// never collide with an atlas texture.
 #[inline]
 pub fn atlas_image_key(graphic_id: u64) -> u64 {
-    (1u64 << 32) + graphic_id
+    assert!(
+        graphic_id <= u32::MAX as u64,
+        "atlas graphic id does not fit its key namespace"
+    );
+    (1u64 << 32) | graphic_id
 }
 
 /// Bits of an image key below the terminal namespace: the kitty u32
@@ -128,10 +132,15 @@ const IMAGE_KEY_ROUTE_SHIFT: u32 = 33;
 /// identity, which keeps single-terminal embedders on plain keys.
 #[inline]
 pub fn route_image_key(route_id: usize, key: u64) -> u64 {
-    debug_assert!(key < (1u64 << IMAGE_KEY_ROUTE_SHIFT));
-    debug_assert!((route_id as u64) < (1u64 << (64 - IMAGE_KEY_ROUTE_SHIFT)));
-    ((route_id as u64) << IMAGE_KEY_ROUTE_SHIFT)
-        | (key & ((1u64 << IMAGE_KEY_ROUTE_SHIFT) - 1))
+    assert!(
+        key < (1u64 << IMAGE_KEY_ROUTE_SHIFT),
+        "route image key exceeds its local key namespace"
+    );
+    assert!(
+        (route_id as u64) < (1u64 << (64 - IMAGE_KEY_ROUTE_SHIFT)),
+        "route image key exceeds its route namespace"
+    );
+    ((route_id as u64) << IMAGE_KEY_ROUTE_SHIFT) | key
 }
 
 /// The route a namespaced image key belongs to.
@@ -282,7 +291,13 @@ impl GraphicData {
     pub fn is_filled(&self, x: usize, y: usize, width: usize, height: usize) -> bool {
         // If there are pixels outside the picture we assume that the region is
         // not filled.
-        if x + width >= self.width || y + height >= self.height {
+        let Some(x_end) = x.checked_add(width) else {
+            return false;
+        };
+        let Some(y_end) = y.checked_add(height) else {
+            return false;
+        };
+        if x_end > self.width || y_end > self.height {
             return false;
         }
 
@@ -294,9 +309,24 @@ impl GraphicData {
 
         debug_assert!(self.color_type == ColorType::Rgba);
 
-        for offset_y in y..y + height {
-            let offset = offset_y * self.width * 4;
-            let row = &self.pixels[offset..offset + width * 4];
+        let row_bytes = width.checked_mul(4);
+        let Some(row_bytes) = row_bytes else {
+            return false;
+        };
+        for offset_y in y..y_end {
+            let Some(offset) = offset_y
+                .checked_mul(self.width)
+                .and_then(|offset| offset.checked_add(x))
+                .and_then(|offset| offset.checked_mul(4))
+            else {
+                return false;
+            };
+            let Some(row_end) = offset.checked_add(row_bytes) else {
+                return false;
+            };
+            let Some(row) = self.pixels.get(offset..row_end) else {
+                return false;
+            };
 
             if row.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 255) {
                 return false;
@@ -375,15 +405,19 @@ impl GraphicData {
         let mut width = match resize.width {
             ResizeParameter::Auto => 1,
             ResizeParameter::Pixels(n) => n as usize,
-            ResizeParameter::Cells(n) => n as usize * cell_width,
-            ResizeParameter::WindowPercent(n) => n as usize * view_width / 100,
+            ResizeParameter::Cells(n) => (n as usize).saturating_mul(cell_width),
+            ResizeParameter::WindowPercent(n) => {
+                (n as usize).saturating_mul(view_width) / 100
+            }
         };
 
         let mut height = match resize.height {
             ResizeParameter::Auto => 1,
             ResizeParameter::Pixels(n) => n as usize,
-            ResizeParameter::Cells(n) => n as usize * cell_height,
-            ResizeParameter::WindowPercent(n) => n as usize * view_height / 100,
+            ResizeParameter::Cells(n) => (n as usize).saturating_mul(cell_height),
+            ResizeParameter::WindowPercent(n) => {
+                (n as usize).saturating_mul(view_height) / 100
+            }
         };
 
         if width == 0 || height == 0 {
@@ -437,36 +471,37 @@ impl GraphicData {
             return Some(self);
         }
 
-        let mut width = match resize.width {
+        let width = match resize.width {
             ResizeParameter::Auto => 1,
             ResizeParameter::Pixels(n) => n as usize,
-            ResizeParameter::Cells(n) => n as usize * cell_width,
-            ResizeParameter::WindowPercent(n) => n as usize * view_width / 100,
+            ResizeParameter::Cells(n) => (n as usize).saturating_mul(cell_width),
+            ResizeParameter::WindowPercent(n) => {
+                (n as usize).saturating_mul(view_width) / 100
+            }
         };
 
-        let mut height = match resize.height {
+        let height = match resize.height {
             ResizeParameter::Auto => 1,
             ResizeParameter::Pixels(n) => n as usize,
-            ResizeParameter::Cells(n) => n as usize * cell_height,
-            ResizeParameter::WindowPercent(n) => n as usize * view_height / 100,
+            ResizeParameter::Cells(n) => (n as usize).saturating_mul(cell_height),
+            ResizeParameter::WindowPercent(n) => {
+                (n as usize).saturating_mul(view_height) / 100
+            }
         };
 
         if width == 0 || height == 0 {
             return None;
         }
 
-        // Compute "auto" dimensions.
-        if resize.width == ResizeParameter::Auto {
-            width = self.width * height / self.height;
+        let (width, height) = self.compute_display_dimensions(
+            cell_width,
+            cell_height,
+            view_width,
+            view_height,
+        );
+        if width == 0 || height == 0 {
+            return None;
         }
-
-        if resize.height == ResizeParameter::Auto {
-            height = self.height * width / self.width;
-        }
-
-        // Limit size to MAX_GRAPHIC_DIMENSIONS.
-        width = cmp::min(width, MAX_GRAPHIC_DIMENSIONS[0]);
-        height = cmp::min(height, MAX_GRAPHIC_DIMENSIONS[1]);
 
         tracing::trace!("Resize new graphic to width={}, height={}", width, height,);
 
@@ -549,6 +584,7 @@ fn check_opaque_region() {
     };
 
     assert!(graphic.is_filled(1, 1, 3, 3));
+    assert!(graphic.is_filled(0, 0, 10, 10));
     assert!(!graphic.is_filled(8, 8, 10, 10));
 
     let pixels = {
@@ -575,6 +611,9 @@ fn check_opaque_region() {
     };
 
     assert!(graphic.is_filled(0, 0, 3, 3));
+    assert!(graphic.is_filled(0, 0, 10, 3));
+    assert!(graphic.is_filled(3, 3, 7, 3));
+    assert!(!graphic.is_filled(2, 3, 1, 1));
     assert!(!graphic.is_filled(1, 1, 4, 4));
 }
 
@@ -610,5 +649,23 @@ mod route_key_tests {
         assert_eq!(image_key_route(a), 1);
         assert_eq!(image_key_route(b), 2);
         assert_eq!(image_key_route(route_image_key(3, atlas_image_key(9))), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "atlas graphic id does not fit")]
+    fn atlas_key_rejects_ids_outside_its_namespace() {
+        atlas_image_key(u32::MAX as u64 + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "local key namespace")]
+    fn route_key_rejects_oversized_local_keys() {
+        route_image_key(1, 1u64 << IMAGE_KEY_ROUTE_SHIFT);
+    }
+
+    #[test]
+    #[should_panic(expected = "route namespace")]
+    fn route_key_rejects_oversized_routes() {
+        route_image_key(usize::MAX, 0);
     }
 }

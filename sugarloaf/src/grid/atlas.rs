@@ -56,3 +56,13 @@ pub struct RasterizedGlyph<'a> {
     /// the atlas upload uses `bytes_per_row = width`.
     pub bytes: &'a [u8],
 }
+
+impl RasterizedGlyph<'_> {
+    #[inline]
+    pub(crate) fn has_exact_len(&self, bytes_per_pixel: usize) -> bool {
+        (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
+            == Some(self.bytes.len())
+    }
+}

@@ -201,6 +201,9 @@ impl MetalGlyphAtlas {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if !glyph.has_exact_len(self.bytes_per_pixel as usize) {
+            return None;
+        }
         if glyph.width == 0 || glyph.height == 0 {
             let slot = AtlasSlot {
                 x: 0,
@@ -536,6 +539,9 @@ impl MetalGridRenderer {
     }
 
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
+        if !super::valid_row(row, self.rows, self.cols, bg.len()) {
+            return;
+        }
         // FG: stash in the CPU-side per-row vec. All in-flight slots
         // need re-flushing — set every dirty flag so each slot
         // re-uploads when it becomes the active frame.
@@ -546,29 +552,22 @@ impl MetalGridRenderer {
             self.fg_dirty = [true; FRAMES_IN_FLIGHT];
         }
 
-        if row >= self.rows {
-            return;
-        }
         let row_start = (row as usize) * (self.cols as usize);
-        let row_len = (self.cols as usize).min(bg.len());
         let dst = &mut self.bg_cpu[row_start..row_start + self.cols as usize];
-        dst[..row_len].copy_from_slice(&bg[..row_len]);
-        for slot in &mut dst[row_len..] {
-            *slot = CellBg::TRANSPARENT;
-        }
+        dst.copy_from_slice(bg);
         self.bg_dirty = [true; FRAMES_IN_FLIGHT];
     }
 
     pub fn clear_row(&mut self, row: u32) {
+        if row >= self.rows {
+            return;
+        }
         let idx = (row as usize) + 1;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
             if !slot.is_empty() {
                 self.fg_dirty = [true; FRAMES_IN_FLIGHT];
             }
             slot.clear();
-        }
-        if row >= self.rows {
-            return;
         }
         let row_start = (row as usize) * (self.cols as usize);
         let dst = &mut self.bg_cpu[row_start..row_start + self.cols as usize];

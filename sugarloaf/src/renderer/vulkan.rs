@@ -661,23 +661,27 @@ impl VulkanRenderer {
     }
 }
 
-/// Free helper: emit the layout-transition barrier from `UNDEFINED` to
-/// `COLOR_ATTACHMENT_OPTIMAL`. Run once at the top of a frame, before
-/// `cmd_begin_rendering`. The discard of previous contents is
-/// intentional — sugarloaf clears every frame, so we don't need to
-/// preserve what the swapchain image held last present.
+/// Emit the layout-transition barrier for a newly acquired swapchain image.
+/// New images are undefined; reused images are returned from present in
+/// `PRESENT_SRC_KHR`. Run before `cmd_begin_rendering`.
 pub fn cmd_acquire_image_for_rendering(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     image: vk::Image,
+    old_layout: vk::ImageLayout,
 ) {
+    let src_stage_mask = match old_layout {
+        vk::ImageLayout::UNDEFINED => vk::PipelineStageFlags2::TOP_OF_PIPE,
+        vk::ImageLayout::PRESENT_SRC_KHR => vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+        layout => panic!("unexpected swapchain image layout before acquire: {layout:?}"),
+    };
     unsafe {
         let barrier = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+            .src_stage_mask(src_stage_mask)
             .src_access_mask(vk::AccessFlags2::empty())
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
             .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
+            .old_layout(old_layout)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -1366,6 +1370,20 @@ impl VulkanImageTexture {
         descriptor_set_layout: vk::DescriptorSetLayout,
         sampler: vk::Sampler,
     ) -> Self {
+        assert!(
+            width != 0 && height != 0,
+            "Vulkan image dimensions must be non-zero"
+        );
+        let staging_size = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .expect("Vulkan RGBA image size overflowed");
+        assert_eq!(
+            pixels.len(),
+            staging_size,
+            "Vulkan RGBA image length does not match its dimensions"
+        );
+
         let shared = ctx.shared().clone();
         let device = &shared.raw;
 
@@ -1383,7 +1401,6 @@ impl VulkanImageTexture {
         );
 
         // Staging buffer.
-        let staging_size = (width as usize) * (height as usize) * 4;
         let staging = ctx.allocate_host_visible_buffer(
             staging_size as u64,
             vk::BufferUsageFlags::TRANSFER_SRC,

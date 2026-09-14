@@ -9,12 +9,8 @@
 // - full_screen_vertex (line 191 in upstream)
 // - cell_bg_fragment (line 451)
 //
-// Phase 1b scope: bg pass only. Same simplifications as the Metal
-// port — no full Display P3 / linear-blending chain yet (the colors
-// come in already sRGB-encoded from the CPU).
-//
 // Bindings:
-// @group(0) @binding(0) Uniforms (140+4 = 144 bytes)
+// @group(0) @binding(0) Uniforms (160 bytes)
 // @group(0) @binding(1) CellBg[] (cols * rows entries)
 //
 // Must match `WgpuGridRenderer`'s bind group layout in
@@ -309,4 +305,3 @@ fn grid_text_fragment(in: TextVsOut) -> @location(0) vec4<f32> {
         return textureLoad(atlas_color, ic, 0);
     }
 }
-

@@ -919,13 +919,9 @@ pub struct Renderer {
     metal_frame_index: usize,
 }
 
-/// Upload `pixels` to a fresh GPU texture using whatever backend `context`
-/// is bound to. Mirrors the per-image upload in `render_graphic_overlays`,
-/// but produces a standalone `ImageTextureEntry` sized exactly to the image
-/// instead of consuming a slot in the glyph atlas.
-// Linux+no-wgpu: every match arm diverges (Cpu/Vulkan return early, Phantom
-// is unreachable!()), so `gpu` is uninhabited and the trailing `Some(...)`
-// is statically unreachable.
+/// Upload `pixels` to a fresh Wgpu or Metal texture. Vulkan backgrounds use
+/// the renderer-bound upload path because their descriptor layout is owned by
+/// the native renderer.
 #[allow(unused_variables, unreachable_code)]
 fn upload_background_image_texture(
     context: &mut crate::context::Context,
@@ -936,18 +932,6 @@ fn upload_background_image_texture(
     }
     let gpu = match &context.inner {
         crate::context::ContextType::Cpu(_) => return None,
-        // Vulkan path: the renderer owns the descriptor-set layout
-        // and shared sampler; we read them off the live brush_type
-        // here. Only the renderer is on the Sugarloaf struct, not
-        // the context, so the call site below threads them in.
-        // Actually: this function is a free fn taking only the
-        // context — we need to defer the upload until we have the
-        // renderer too. We do that by panicking here and pushing
-        // the real upload into a renderer method (see
-        // `Renderer::upload_background_image_vulkan`). When the
-        // dispatcher (`prepare`) sees a Vulkan ctx + dirty pixels,
-        // it calls the renderer method directly instead of this
-        // free function.
         #[cfg(feature = "wgpu")]
         crate::context::ContextType::Wgpu(ctx) => {
             let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
@@ -975,7 +959,12 @@ fn upload_background_image_texture(
                 &pixels.pixels,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(pixels.width * 4),
+                    bytes_per_row: Some(
+                        pixels
+                            .width
+                            .checked_mul(4)
+                            .expect("validated background image row pitch overflowed"),
+                    ),
                     rows_per_image: Some(pixels.height),
                 },
                 wgpu::Extent3d {
@@ -1022,23 +1011,28 @@ fn upload_background_image_texture(
                 },
                 0,
                 pixels.pixels.as_ptr() as *const std::ffi::c_void,
-                (pixels.width * 4) as u64,
+                (pixels
+                    .width
+                    .checked_mul(4)
+                    .expect("validated background image row pitch overflowed"))
+                    as u64,
             );
             ImageTexture::Metal(mtl_tex)
         }
-        // Vulkan goes through `Renderer::upload_background_image_vulkan`
-        // (the renderer holds the descriptor set + sampler this free fn
-        // can't see), so this match arm just declines and lets the
-        // dispatcher try the renderer-bound path. Linux-only.
         #[cfg(target_os = "linux")]
-        crate::context::ContextType::Vulkan(_) => return None,
+        crate::context::ContextType::Vulkan(_) => {
+            unreachable!("Vulkan backgrounds require the renderer-bound upload path")
+        }
         #[cfg(not(feature = "wgpu"))]
         crate::context::ContextType::_Phantom(_) => unreachable!(),
     };
     Some(ImageTextureEntry {
         gpu,
         transmit_time: std::time::Instant::now(),
-        bytes: (pixels.width as usize) * (pixels.height as usize) * 4,
+        bytes: (pixels.width as usize)
+            .checked_mul(pixels.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .expect("validated background image size overflowed"),
         last_used: 0,
     })
 }
@@ -1110,9 +1104,11 @@ impl Renderer {
         pixels: Option<BackgroundImagePixels>,
     ) -> Result<(), String> {
         if let Some(pixels) = pixels {
-            let required = (pixels.width as usize)
+            let row_bytes = pixels.width.checked_mul(4).ok_or_else(|| {
+                "background image row pitch overflows RGBA8 size".to_owned()
+            })?;
+            let required = (row_bytes as usize)
                 .checked_mul(pixels.height as usize)
-                .and_then(|pixels| pixels.checked_mul(4))
                 .ok_or_else(|| {
                     "background image dimensions overflow RGBA8 size".to_owned()
                 })?;
@@ -1153,7 +1149,7 @@ impl Renderer {
     pub fn prepare(
         &mut self,
         context: &mut crate::context::Context,
-        image_data: &mut rustc_hash::FxHashMap<
+        image_data: &rustc_hash::FxHashMap<
             crate::sugarloaf::graphics::GraphicKey,
             crate::sugarloaf::graphics::GraphicDataEntry,
         >,
@@ -1176,8 +1172,9 @@ impl Renderer {
         // `image_overlays` currently holds.
         let mut overlays: Vec<_> =
             image_overlays.values().flat_map(|v| v.iter()).collect();
+        overlays.sort_by_key(|overlay| (overlay.z_index, overlay.image_id));
         if !overlays.is_empty() {
-            self.render_graphic_overlays(context, image_data, &mut overlays);
+            self.render_graphic_overlays(context, image_data, &overlays);
         } else {
             // No overlays visible — clear draw commands so stale images
             // don't keep rendering. Keep image_textures and image_data
@@ -1231,36 +1228,24 @@ impl Renderer {
         font_size: f32,
         line_height: f32,
     ) -> Option<TextDimensions> {
-        // Use read lock instead of write lock since we're not modifying
-        if let Some(font_library_data) = font_library.inner.try_read() {
-            let font_id = 0; // FONT_ID_REGULAR
+        let mut font_library_data = font_library.inner.write();
+        let font_id = 0; // FONT_ID_REGULAR
+        if let Some((ascent, descent, leading)) =
+            font_library_data.get_font_metrics(&font_id, font_size)
+        {
+            let char_width = font_size * 0.6;
+            let total_line_height = (ascent + descent + leading) * line_height;
 
-            // Use existing method to get cached metrics
-            drop(font_library_data); // Drop read lock
-            let mut font_library_data = font_library.inner.write();
-            if let Some((ascent, descent, leading)) =
-                font_library_data.get_font_metrics(&font_id, font_size)
-            {
-                // Calculate character width using font metrics
-                // For monospace fonts, we can estimate character width
-                let char_width = font_size * 0.6; // Common monospace width ratio
-                let total_line_height = (ascent + descent + leading) * line_height;
-
-                return Some(TextDimensions {
-                    width: char_width.max(1.0),
-                    height: total_line_height.max(1.0),
-                    scale: 1.0,
-                });
-            }
+            return Some(TextDimensions {
+                width: char_width.max(1.0),
+                height: total_line_height.max(1.0),
+                scale: 1.0,
+            });
         }
         None
     }
 
     /// Render image overlays using per-image GPU textures.
-    // Linux+no-wgpu: the kitty-upload match's wgpu/metal arms are
-    // cfg'd out; remaining arms (Cpu unreachable!, Vulkan unreachable!,
-    // Phantom continue) all diverge so `gpu` is uninhabited and the
-    // trailing `image_textures.insert(...)` is statically unreachable.
     #[allow(unused_variables, unreachable_code)]
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -1271,7 +1256,7 @@ impl Renderer {
             crate::sugarloaf::graphics::GraphicKey,
             crate::sugarloaf::graphics::GraphicDataEntry,
         >,
-        overlays: &mut [&crate::sugarloaf::graphics::GraphicOverlay],
+        overlays: &[&crate::sugarloaf::graphics::GraphicOverlay],
     ) {
         // Off-screen textures are kept until the byte budget below
         // forces the least-recently-drawn ones out; they re-upload
@@ -1286,25 +1271,50 @@ impl Renderer {
                 None => continue,
             };
 
-            // Skip if texture is current
-            if let Some(existing) = self.image_textures.get_mut(&overlay.image_id) {
-                if existing.transmit_time == entry.transmit_time {
-                    existing.last_used = current_frame;
-                    continue;
-                }
-            }
-
             let (width, height, pixels) = match &entry.handle.data {
                 crate::components::core::image::Data::Rgba {
                     width,
                     height,
                     pixels,
                 } => (*width, *height, pixels.as_ref()),
-                _ => continue,
+                _ => {
+                    self.evict_image_texture(overlay.image_id);
+                    continue;
+                }
             };
 
             if width == 0 || height == 0 {
+                self.evict_image_texture(overlay.image_id);
                 continue;
+            }
+
+            let Some(bytes_per_row) = (width as usize)
+                .checked_mul(4)
+                .and_then(|row| u32::try_from(row).ok())
+            else {
+                tracing::warn!(width, height, "rejecting oversized RGBA image");
+                self.evict_image_texture(overlay.image_id);
+                continue;
+            };
+            let required_bytes = (bytes_per_row as usize).checked_mul(height as usize);
+            if required_bytes != Some(pixels.len()) {
+                tracing::warn!(
+                    width,
+                    height,
+                    expected = required_bytes,
+                    actual = pixels.len(),
+                    "rejecting RGBA image with invalid pixel length"
+                );
+                self.evict_image_texture(overlay.image_id);
+                continue;
+            }
+
+            // Skip if texture is current, after validating the retained source.
+            if let Some(existing) = self.image_textures.get_mut(&overlay.image_id) {
+                if existing.transmit_time == entry.transmit_time {
+                    existing.last_used = current_frame;
+                    continue;
+                }
             }
 
             // CPU backend composites overlays directly from
@@ -1333,7 +1343,7 @@ impl Renderer {
                     brush.image_texture_descriptor_set_layout,
                     brush.image_sampler,
                 );
-                let bytes = (width as usize) * (height as usize) * 4;
+                let bytes = required_bytes.expect("validated RGBA image size");
                 if let Some(old) = self.image_textures.insert(
                     overlay.image_id,
                     ImageTextureEntry {
@@ -1343,9 +1353,15 @@ impl Renderer {
                         last_used: current_frame,
                     },
                 ) {
-                    self.image_texture_bytes -= old.bytes;
+                    self.image_texture_bytes =
+                        self.image_texture_bytes.checked_sub(old.bytes).expect(
+                            "replaced image texture must be included in byte accounting",
+                        );
                 }
-                self.image_texture_bytes += bytes;
+                self.image_texture_bytes = self
+                    .image_texture_bytes
+                    .checked_add(bytes)
+                    .expect("image texture byte accounting overflowed");
                 continue;
             }
             let gpu = match &context.inner {
@@ -1379,7 +1395,7 @@ impl Renderer {
                         pixels,
                         wgpu::TexelCopyBufferLayout {
                             offset: 0,
-                            bytes_per_row: Some(width * 4),
+                            bytes_per_row: Some(bytes_per_row),
                             rows_per_image: Some(height),
                         },
                         wgpu::Extent3d {
@@ -1422,7 +1438,7 @@ impl Renderer {
                         },
                         0,
                         pixels.as_ptr() as *const std::ffi::c_void,
-                        (width * 4) as u64,
+                        bytes_per_row as u64,
                     );
                     ImageTexture::Metal(mtl_tex)
                 }
@@ -1437,7 +1453,7 @@ impl Renderer {
                 crate::context::ContextType::_Phantom(_) => continue,
             };
 
-            let bytes = (width as usize) * (height as usize) * 4;
+            let bytes = required_bytes.expect("validated RGBA image size");
             if let Some(old) = self.image_textures.insert(
                 overlay.image_id,
                 ImageTextureEntry {
@@ -1447,9 +1463,15 @@ impl Renderer {
                     last_used: current_frame,
                 },
             ) {
-                self.image_texture_bytes -= old.bytes;
+                self.image_texture_bytes = self
+                    .image_texture_bytes
+                    .checked_sub(old.bytes)
+                    .expect("replaced image texture must be included in byte accounting");
             }
-            self.image_texture_bytes += bytes;
+            self.image_texture_bytes = self
+                .image_texture_bytes
+                .checked_add(bytes)
+                .expect("image texture byte accounting overflowed");
         }
 
         // Enforce the VRAM budget: drop the least-recently-drawn
@@ -1466,14 +1488,16 @@ impl Renderer {
             );
             for key in evict {
                 if let Some(old) = self.image_textures.remove(&key) {
-                    self.image_texture_bytes -= old.bytes;
+                    self.image_texture_bytes =
+                        self.image_texture_bytes.checked_sub(old.bytes).expect(
+                            "evicted image texture must be included in byte accounting",
+                        );
                 }
             }
         }
 
         // Build image draw commands (one instance per image placement). Keep
         // painter order independent of which panel produced the overlay.
-        overlays.sort_by_key(|overlay| overlay.z_index);
         self.image_draws.clear();
         for overlay in overlays.iter() {
             if !self.image_textures.contains_key(&overlay.image_id) {
@@ -1735,20 +1759,28 @@ impl Renderer {
     #[inline]
     pub fn evict_image_texture(&mut self, key: crate::sugarloaf::graphics::GraphicKey) {
         if let Some(old) = self.image_textures.remove(&key) {
-            self.image_texture_bytes -= old.bytes;
+            self.image_texture_bytes = self
+                .image_texture_bytes
+                .checked_sub(old.bytes)
+                .expect("evicted image texture must be included in byte accounting");
         }
     }
 
     pub fn evict_route_textures(&mut self, route_id: usize) {
-        let mut freed = 0;
+        let mut freed = 0usize;
         self.image_textures.retain(|key, entry| {
             let keep = key.route_id != route_id;
             if !keep {
-                freed += entry.bytes;
+                freed = freed
+                    .checked_add(entry.bytes)
+                    .expect("evicted image texture byte accounting overflowed");
             }
             keep
         });
-        self.image_texture_bytes -= freed;
+        self.image_texture_bytes = self
+            .image_texture_bytes
+            .checked_sub(freed)
+            .expect("evicted route textures must be included in byte accounting");
     }
     pub fn evict_route_image_textures(
         &mut self,
@@ -1758,7 +1790,11 @@ impl Renderer {
             .image_textures
             .extract_if(|key, _| should_evict(key.route_id))
             .map(|(_, entry)| entry.bytes)
-            .sum::<usize>();
+            .fold(0usize, |total, bytes| {
+                total
+                    .checked_add(bytes)
+                    .expect("evicted image texture byte accounting overflowed")
+            });
         self.image_texture_bytes = self
             .image_texture_bytes
             .checked_sub(removed_bytes)
