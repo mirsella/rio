@@ -52,13 +52,18 @@ colors, selection/cursor/blink state, and bounded graphics data.
 
 ## Wire and security contract
 
-The current protocol is **version 4** and uses native bincode 2
+The current protocol is **version 5** and uses native bincode 2
 `Encode`/`Decode` (not serde), a four-byte little-endian length prefix, strict
 exact decoding, a 16 MiB frame limit, and absolute read/write deadlines.
 Commands, responses, events, frames, graphics, strings, dimensions, and
 collection sizes are validated before use. The transport implementation is
 Unix-only; the integration suite has been exercised on **Linux only**. Do not
 infer macOS or BSD validation from the Unix cfgs.
+
+Version 5 preserves both the ID and URI of each OSC 8 hyperlink. This keeps
+link spans intact across frame decoding, deltas, and attachment transfer.
+Version-4 workers require a version-4 client; start new sessions with the
+updated binary rather than attempting to attach across protocol versions.
 
 `snapshot_since(base_sequence)` returns a typed `FrameUpdate`. A `Delta` carries
 strictly ordered changed rows and the complete bounded cursor, selection,
