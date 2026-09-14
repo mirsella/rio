@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 pub const MAX_ARGUMENTS: usize = 256;
 pub const MAX_ENVIRONMENT: usize = 4096;
@@ -1411,7 +1411,13 @@ impl CellFrame {
 #[derive(Clone, Debug, PartialEq, bincode::Encode, bincode::Decode)]
 pub struct ExtrasFrame {
     pub zero_width: Vec<u32>,
-    pub hyperlink: Option<String>,
+    pub hyperlink: Option<HyperlinkFrame>,
+}
+
+#[derive(Clone, Debug, PartialEq, bincode::Encode, bincode::Decode)]
+pub struct HyperlinkFrame {
+    pub id: String,
+    pub uri: String,
 }
 
 #[derive(Clone, Debug, PartialEq, bincode::Encode, bincode::Decode)]
@@ -1648,7 +1654,8 @@ fn validate_row(row: &RowFrame, columns: u16) -> Result<usize, crate::SessionErr
             ));
         }
         if let Some(hyperlink) = &extra.hyperlink {
-            validate_string(hyperlink)?;
+            validate_string(&hyperlink.id)?;
+            validate_string(&hyperlink.uri)?;
         }
     }
     for style in &row.styles {
