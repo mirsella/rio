@@ -15,6 +15,10 @@ const MAX_DIMENSION: u32 = 10_000;
 /// memory before `create_graphic_data` validates them.
 const MAX_SIZE: usize = 400 * 1024 * 1024;
 
+/// Maximum base64 input that can decode to `MAX_SIZE` bytes. Check this
+/// before handing the payload to a decoder that allocates its output.
+const MAX_ENCODED_SIZE: usize = MAX_SIZE.div_ceil(3) * 4;
+
 /// How long an in-progress chunked upload may sit idle before the
 /// accumulator drops it. Prevents `incomplete_images` from growing
 /// without bound when a client abandons a chunked transmission
@@ -516,6 +520,11 @@ pub fn parse(
         });
     }
 
+    // Discard abandoned uploads before resolving an implicit continuation.
+    // Otherwise a stale current key can be selected and only cleared after
+    // the parser has already decided how to interpret this chunk.
+    evict_stale_chunks(state);
+
     // Handle chunked data
     // Determine the key for this chunk:
     // - If this chunk has an explicit image_id or image_number, use that.
@@ -545,11 +554,6 @@ pub fn parse(
         cmd.implicit_id = true;
         key
     };
-
-    // Drop any chunked uploads that have been idle for too long. Runs
-    // on every chunk event, so worst case we scan `incomplete_images`
-    // once per APC — O(n) with n bounded by concurrent uploads.
-    evict_stale_chunks(state);
 
     if cmd.more {
         // Pin the key for continuation chunks. Only chunked commands
@@ -1020,9 +1024,6 @@ fn parse_compression(value: &str) -> Compression {
 /// chunk within `CHUNK_STALE_TIMEOUT`. Prevents unbounded growth when
 /// clients abandon chunked uploads.
 fn evict_stale_chunks(state: &mut KittyGraphicsState) {
-    if state.incomplete_images.is_empty() {
-        return;
-    }
     let now = Instant::now();
     let before = state.incomplete_images.len();
     state
@@ -1035,14 +1036,14 @@ fn evict_stale_chunks(state: &mut KittyGraphicsState) {
             before - after,
             CHUNK_STALE_TIMEOUT.as_secs()
         );
-        // If the pinned transmission key was evicted, clear it so that a
-        // new chunkless command can't accidentally resume it.
-        if !state
-            .incomplete_images
-            .contains_key(&state.current_transmission_key)
-        {
-            state.current_transmission_key = 0;
-        }
+    }
+    // If the pinned transmission key was evicted or otherwise removed, clear
+    // it so that a new chunkless command cannot accidentally resume it.
+    if !state
+        .incomplete_images
+        .contains_key(&state.current_transmission_key)
+    {
+        state.current_transmission_key = 0;
     }
 }
 
@@ -1060,11 +1061,18 @@ fn decode_payload_base64(payload: &[u8]) -> Option<Vec<u8>> {
     if payload.is_empty() {
         return Some(Vec::new());
     }
+    if payload.len() > MAX_ENCODED_SIZE {
+        debug!(
+            "Base64 payload exceeds encoded size limit: {} bytes",
+            payload.len()
+        );
+        return None;
+    }
     if let Some(data) = simd_base64::decode(payload) {
-        return Some(data);
+        return (data.len() <= MAX_SIZE).then_some(data);
     }
     if let Some(data) = simd_base64::decode_no_pad(payload) {
-        return Some(data);
+        return (data.len() <= MAX_SIZE).then_some(data);
     }
     debug!("Base64 payload decode failed");
     None
@@ -2567,6 +2575,36 @@ mod tests {
             graphic.pixels, expected_pixels,
             "chafa-style padded chunks must merge into the correct byte stream",
         );
+    }
+
+    #[test]
+    fn stale_implicit_continuation_allocates_a_new_image() {
+        let mut state = KittyGraphicsState::default();
+        let first = vec![b"G".as_ref(), b"a=t,f=32,s=1,v=1,m=1", b"/wAA"];
+        parse(&first, &mut state).expect("first chunk");
+
+        let key = state.current_transmission_key;
+        state.incomplete_images.get_mut(&key).unwrap().last_touched =
+            Instant::now() - CHUNK_STALE_TIMEOUT - Duration::from_secs(1);
+
+        let final_chunk = vec![b"G".as_ref(), b"a=t,f=32,s=1,v=1,m=0", b"/wAA/w=="];
+        let response = parse(&final_chunk, &mut state)
+            .expect("a stale continuation must become a fresh transmission");
+        let graphic = response.graphic_data.expect("fresh image data");
+        assert!(graphic.id.get() >= 0x8000_0000);
+        assert!(state.incomplete_images.is_empty());
+    }
+
+    #[test]
+    fn declared_chunk_size_does_not_reserve_untrusted_capacity() {
+        let mut state = KittyGraphicsState::default();
+        let params = vec![
+            b"G".as_ref(),
+            b"a=t,f=32,s=1,v=1,S=4294967295,m=1,i=77",
+            b"AAAA",
+        ];
+        parse(&params, &mut state).expect("chunk should be retained");
+        assert!(state.incomplete_images[&77].payload.capacity() < 1024);
     }
 
     #[test]

@@ -19,10 +19,12 @@ pub struct ImageId(u32);
 
 impl ImageId {
     fn new(index: u32, alpha: bool) -> Option<Self> {
-        if index & ID_INDEX_MASK != index {
+        // Zero is reserved for the empty image, so encode entries one-based.
+        let encoded_index = index.checked_add(1)?;
+        if encoded_index & ID_INDEX_MASK != encoded_index {
             return None;
         }
-        let mut handle = index & ID_INDEX_MASK;
+        let mut handle = encoded_index;
         if alpha {
             handle |= ID_ALPHA_BIT
         }
@@ -35,7 +37,8 @@ impl ImageId {
     }
 
     fn index(self) -> usize {
-        (self.0 & ID_INDEX_MASK) as usize
+        debug_assert!(!self.is_empty());
+        ((self.0 & ID_INDEX_MASK).saturating_sub(1)) as usize
     }
 
     /// Returns true if this is an empty image ID.
@@ -102,3 +105,18 @@ impl<'a> ImageData<'a> {
 
 const ID_INDEX_MASK: u32 = 0x007FFFFF;
 const ID_ALPHA_BIT: u32 = 0x00800000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_ids_reserve_empty_value() {
+        let first = ImageId::new(0, false).unwrap();
+
+        assert_eq!(first.index(), 0);
+        assert!(!first.is_empty());
+        assert_eq!(ImageId::empty(), ImageId(0));
+        assert!(ImageId::new(ID_INDEX_MASK, false).is_none());
+    }
+}

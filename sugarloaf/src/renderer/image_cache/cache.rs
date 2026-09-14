@@ -330,7 +330,8 @@ impl ImageCache {
             return None;
         }
 
-        let entry_index = self.entries.len();
+        let entry_index = u32::try_from(self.entries.len()).ok()?;
+        let image_id = ImageId::new(entry_index, request.has_alpha)?;
         let atlas_kind = match request.content_type {
             ContentType::Mask => AtlasKind::Mask,
             ContentType::Color => AtlasKind::Color,
@@ -368,7 +369,7 @@ impl ImageCache {
             );
             self.mask_atlas.dirty = true;
 
-            return ImageId::new(entry_index as u32, request.has_alpha);
+            return Some(image_id);
         }
 
         // Handle color atlases (multiple atlases)
@@ -404,7 +405,7 @@ impl ImageCache {
                     "Allocated {}x{} in existing color atlas {}",
                     width, height, atlas_index
                 );
-                return ImageId::new(entry_index as u32, request.has_alpha);
+                return Some(image_id);
             }
         }
 
@@ -451,7 +452,7 @@ impl ImageCache {
             "Allocated {}x{} in new color atlas {}",
             width, height, new_atlas_index
         );
-        ImageId::new(entry_index as u32, request.has_alpha)
+        Some(image_id)
     }
 
     /// Create a new color atlas with its own GPU texture
@@ -704,6 +705,9 @@ impl ImageCache {
     /// Deallocates the specified image.
     #[allow(unused)]
     pub fn deallocate(&mut self, image: ImageId) -> Option<()> {
+        if image.is_empty() {
+            return None;
+        }
         let entry = self.entries.get_mut(image.index())?;
         if !entry.allocated {
             return None;
@@ -1022,6 +1026,9 @@ impl ImageCache {
 
     /// Get the atlas index for a given image (for setting vertex layer)
     pub fn get_atlas_index(&self, image: ImageId) -> Option<usize> {
+        if image.is_empty() {
+            return None;
+        }
         let entry = self.entries.get(image.index())?;
         if !entry.allocated {
             return None;

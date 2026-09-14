@@ -70,6 +70,7 @@ struct ShapedGlyph {
 #[allow(unused)]
 struct ShapedRun {
     font_id: u32,
+    is_color: bool,
     size_u16: u16,
     size_bucket: u16,
     synthetic_bold: bool,
@@ -300,30 +301,41 @@ impl Text {
             (if opts.bold { 1u8 } else { 0 }) | (if opts.italic { 2u8 } else { 0 });
 
         let first_ch = text.chars().next()?;
-        let (font_id, _is_emoji) = match self.font_resolve.entry((first_ch, style_flags))
-        {
-            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let mut ss = SpanStyle::default();
-                let weight = if opts.bold {
-                    Weight::BOLD
-                } else {
-                    Weight::NORMAL
-                };
-                let fstyle = if opts.italic {
-                    FontStyle::Italic
-                } else {
-                    FontStyle::Normal
-                };
-                ss.font_attrs = Attributes::new(Stretch::NORMAL, weight, fstyle);
-                let resolved =
-                    self.font_library.resolve_font_for_char(first_ch, &ss, None);
-                let v = (resolved.0 as u32, resolved.1);
-                e.insert(v);
-                v
-            }
+        let (resolved_font_id, resolved_is_color) =
+            match self.font_resolve.entry((first_ch, style_flags)) {
+                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let mut ss = SpanStyle::default();
+                    let weight = if opts.bold {
+                        Weight::BOLD
+                    } else {
+                        Weight::NORMAL
+                    };
+                    let fstyle = if opts.italic {
+                        FontStyle::Italic
+                    } else {
+                        FontStyle::Normal
+                    };
+                    ss.font_attrs = Attributes::new(Stretch::NORMAL, weight, fstyle);
+                    let resolved =
+                        self.font_library.resolve_font_for_char(first_ch, &ss, None);
+                    let v = (resolved.0 as u32, resolved.1);
+                    e.insert(v);
+                    v
+                }
+            };
+        let (font_id, is_color) = if let Some(font_id) = opts.font_id {
+            let font_id = font_id as u32;
+            let is_color = self
+                .font_library
+                .inner
+                .read()
+                .get(&(font_id as usize))
+                .is_emoji;
+            (font_id, is_color)
+        } else {
+            (resolved_font_id, resolved_is_color)
         };
-        let font_id = opts.font_id.map(|id| id as u32).unwrap_or(font_id);
 
         let hash = shape_hash(font_id, size_bucket, style_flags, text);
         if let Some(entry) = self.shape_cache.get(&hash) {
@@ -426,6 +438,7 @@ impl Text {
 
         let run = ShapedRun {
             font_id,
+            is_color,
             size_u16,
             size_bucket,
             synthetic_bold,
@@ -522,7 +535,7 @@ impl Text {
                 &handle,
                 glyph_id,
                 run.size_u16 as f32,
-                /* is_emoji: */ false,
+                run.is_color,
                 run.synthetic_italic,
                 run.synthetic_bold,
                 self.font_library.inner.read().antialias,
@@ -701,7 +714,7 @@ impl Text {
                 &handle,
                 glyph_id,
                 run.size_u16 as f32,
-                /* is_emoji: */ false,
+                run.is_color,
                 run.synthetic_italic,
                 run.synthetic_bold,
                 self.font_library.inner.read().antialias,
