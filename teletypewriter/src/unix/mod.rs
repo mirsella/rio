@@ -1156,25 +1156,47 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>, Error> {
             &mut res,
         )
     };
-    let entry = unsafe { entry.assume_init() };
-
-    if status < 0 {
-        return Err(Error::other("getpwuid_r failed"));
+    if status != 0 {
+        return Err(if status > 0 {
+            Error::from_raw_os_error(status)
+        } else {
+            Error::other("getpwuid_r failed")
+        });
     }
 
     if res.is_null() {
         return Err(Error::other("pw not found"));
     }
 
-    // Sanity check.
-    assert_eq!(entry.pw_uid, uid);
+    let entry = unsafe { entry.assume_init() };
+    if entry.pw_uid != uid {
+        return Err(Error::other("getpwuid_r returned the wrong user"));
+    }
+
+    let name = if entry.pw_name.is_null() {
+        return Err(Error::other("passwd entry has no user name"));
+    } else {
+        unsafe { CStr::from_ptr(entry.pw_name) }
+            .to_str()
+            .map_err(|_| Error::other("passwd user name is not UTF-8"))?
+    };
+    let dir = if entry.pw_dir.is_null() {
+        return Err(Error::other("passwd entry has no home directory"));
+    } else {
+        unsafe { CStr::from_ptr(entry.pw_dir) }
+            .to_str()
+            .map_err(|_| Error::other("passwd home directory is not UTF-8"))?
+    };
+    let shell = if entry.pw_shell.is_null() {
+        return Err(Error::other("passwd entry has no shell"));
+    } else {
+        unsafe { CStr::from_ptr(entry.pw_shell) }
+            .to_str()
+            .map_err(|_| Error::other("passwd shell is not UTF-8"))?
+    };
 
     // Build a borrowed Passwd struct.
-    Ok(Passwd {
-        name: unsafe { CStr::from_ptr(entry.pw_name).to_str().unwrap() },
-        dir: unsafe { CStr::from_ptr(entry.pw_dir).to_str().unwrap() },
-        shell: unsafe { CStr::from_ptr(entry.pw_shell).to_str().unwrap() },
-    })
+    Ok(Passwd { name, dir, shell })
 }
 
 pub fn foreground_process_name(main_fd: RawFd, shell_pid: u32) -> String {

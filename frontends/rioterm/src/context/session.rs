@@ -1343,6 +1343,12 @@ impl RemoteView {
     }
 
     fn apply_frame(&mut self, frame: FullFrame) -> Result<(), String> {
+        if frame.columns == 0 || frame.lines == 0 {
+            return Err("passive frame dimensions must be non-zero".into());
+        }
+        if frame.rows.len() != usize::from(frame.lines) {
+            return Err("passive frame row count does not match its dimensions".into());
+        }
         let graphics_changed = self
             .frame
             .as_ref()
@@ -2176,6 +2182,16 @@ mod tests {
             title: String::new(),
             working_dir: None,
         }
+    }
+
+    #[test]
+    fn malformed_full_frame_row_count_is_reported() {
+        let view = RemoteView::from_frame(frame(1, 1, Vec::new()), WindowId::from(0));
+
+        assert_eq!(
+            view.decoder_error(),
+            Some("passive frame row count does not match its dimensions")
+        );
     }
 
     #[test]
