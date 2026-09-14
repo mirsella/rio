@@ -82,6 +82,9 @@ impl CpuGridAtlas {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if !glyph.has_exact_len(self.bytes_per_pixel as usize) {
+            return None;
+        }
         if glyph.width == 0 || glyph.height == 0 {
             // Zero-sized glyphs (e.g. spaces) still need a cache entry
             // so the rasterizer doesn't keep producing them, but they
@@ -219,32 +222,28 @@ impl CpuGridRenderer {
     }
 
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
+        if !super::valid_row(row, self.rows, self.cols, bg.len()) {
+            return;
+        }
         let idx = (row as usize) + 1;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
             slot.clear();
             slot.extend_from_slice(fg);
         }
 
-        if row >= self.rows {
-            return;
-        }
         let cols = self.cols as usize;
         let row_start = (row as usize) * cols;
-        let row_len = cols.min(bg.len());
         let dst = &mut self.bg_cells[row_start..row_start + cols];
-        dst[..row_len].copy_from_slice(&bg[..row_len]);
-        for slot in &mut dst[row_len..] {
-            *slot = CellBg::TRANSPARENT;
-        }
+        dst.copy_from_slice(bg);
     }
 
     pub fn clear_row(&mut self, row: u32) {
+        if row >= self.rows {
+            return;
+        }
         let idx = (row as usize) + 1;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
             slot.clear();
-        }
-        if row >= self.rows {
-            return;
         }
         let cols = self.cols as usize;
         let row_start = (row as usize) * cols;
@@ -386,6 +385,12 @@ impl CpuGridRenderer {
         stride_pixels: u32,
         uniforms: &GridUniforms,
     ) {
+        if let Err(error) =
+            crate::context::cpu::CpuRenderTarget::new(buf, buf_w, buf_h, stride_pixels)
+        {
+            tracing::warn!(%error, "skipping CPU grid background render for invalid target");
+            return;
+        }
         let cell_w = uniforms.cell_size[0];
         let cell_h = uniforms.cell_size[1];
         if cell_w <= 0.0 || cell_h <= 0.0 {
@@ -460,6 +465,12 @@ impl CpuGridRenderer {
         stride_pixels: u32,
         uniforms: &GridUniforms,
     ) {
+        if let Err(error) =
+            crate::context::cpu::CpuRenderTarget::new(buf, buf_w, buf_h, stride_pixels)
+        {
+            tracing::warn!(%error, "skipping CPU grid text render for invalid target");
+            return;
+        }
         let cell_w = uniforms.cell_size[0];
         let cell_h = uniforms.cell_size[1];
         if cell_w <= 0.0 || cell_h <= 0.0 {
@@ -549,14 +560,17 @@ impl CpuGridRenderer {
 
 #[inline]
 fn bg_capacity(cols: u32, rows: u32) -> usize {
-    (cols as usize) * (rows as usize)
+    (cols as usize)
+        .checked_mul(rows as usize)
+        .expect("CPU grid dimensions overflow background capacity")
 }
 
 #[inline]
 fn init_fg_rows(rows: u32) -> Vec<Vec<CellText>> {
-    (0..(rows as usize + CURSOR_ROW_SLOTS))
-        .map(|_| Vec::new())
-        .collect()
+    let row_slots = (rows as usize)
+        .checked_add(CURSOR_ROW_SLOTS)
+        .expect("CPU grid dimensions overflow foreground row capacity");
+    (0..row_slots).map(|_| Vec::new()).collect()
 }
 
 #[inline]
@@ -645,32 +659,33 @@ fn blit_mask(
     if color[3] == 0 {
         return;
     }
-    // Clip glyph rect to buffer + atlas bounds in one step.
-    let x_start = glyph_x.max(0);
-    let y_start = glyph_y.max(0);
-    let x_end = (glyph_x + gw).min(buf_w);
-    let y_end = (glyph_y + gh).min(buf_h);
-    if x_end <= x_start || y_end <= y_start {
+    let Some(atlas_len) = atlas_side.checked_mul(atlas_side) else {
+        return;
+    };
+    if atlas.len() < atlas_len {
         return;
     }
+    let Some(rect) = crate::context::cpu::clip_blit_rect(
+        (glyph_x, glyph_y),
+        (gw, gh),
+        (buf_w, buf_h),
+        atlas_side,
+        (ax, ay),
+    ) else {
+        return;
+    };
     let r = color[0] as u32;
     let g = color[1] as u32;
     let b = color[2] as u32;
     let ca = color[3] as u32;
 
-    for dst_y in y_start..y_end {
-        let src_y = (dst_y - glyph_y) as usize + ay;
-        if src_y >= atlas_side {
-            continue;
-        }
-        let atlas_row = src_y * atlas_side;
-        let buf_row = (dst_y as usize) * stride;
-        for dst_x in x_start..x_end {
-            let src_x = (dst_x - glyph_x) as usize + ax;
-            if src_x >= atlas_side {
-                continue;
-            }
-            let m = atlas[atlas_row + src_x] as u32;
+    for row in 0..rect.height {
+        let src_start = (rect.src_y + row) * atlas_side + rect.src_x;
+        let src_row = &atlas[src_start..src_start + rect.width];
+        let dst_start = (rect.dst_y + row) * stride + rect.dst_x;
+        let dst_row = &mut buf[dst_start..dst_start + rect.width];
+        for (&mask, dst) in src_row.iter().zip(dst_row.iter_mut()) {
+            let m = mask as u32;
             if m == 0 {
                 continue;
             }
@@ -683,8 +698,7 @@ fn blit_mask(
             let pg = (g * a + 127) / 255;
             let pb = (b * a + 127) / 255;
             let src = [pr as u8, pg as u8, pb as u8, a as u8];
-            let idx = buf_row + (dst_x as usize);
-            buf[idx] = blend_over(src, buf[idx]);
+            *dst = blend_over(src, *dst);
         }
     }
 }
@@ -704,38 +718,82 @@ fn blit_color(
     ax: usize,
     ay: usize,
 ) {
-    let x_start = glyph_x.max(0);
-    let y_start = glyph_y.max(0);
-    let x_end = (glyph_x + gw).min(buf_w);
-    let y_end = (glyph_y + gh).min(buf_h);
-    if x_end <= x_start || y_end <= y_start {
+    let Some(atlas_len) = atlas_side
+        .checked_mul(atlas_side)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return;
+    };
+    if atlas.len() < atlas_len {
         return;
     }
-    for dst_y in y_start..y_end {
-        let src_y = (dst_y - glyph_y) as usize + ay;
-        if src_y >= atlas_side {
-            continue;
-        }
-        let atlas_row = src_y * atlas_side * 4;
-        let buf_row = (dst_y as usize) * stride;
-        for dst_x in x_start..x_end {
-            let src_x = (dst_x - glyph_x) as usize + ax;
-            if src_x >= atlas_side {
-                continue;
-            }
-            let off = atlas_row + src_x * 4;
-            let r = atlas[off];
-            let g = atlas[off + 1];
-            let b = atlas[off + 2];
-            let a = atlas[off + 3];
+    let Some(rect) = crate::context::cpu::clip_blit_rect(
+        (glyph_x, glyph_y),
+        (gw, gh),
+        (buf_w, buf_h),
+        atlas_side,
+        (ax, ay),
+    ) else {
+        return;
+    };
+    let atlas_stride = atlas_side * 4;
+    for row in 0..rect.height {
+        let src_start = (rect.src_y + row) * atlas_stride + rect.src_x * 4;
+        let src_row = &atlas[src_start..src_start + rect.width * 4];
+        let dst_start = (rect.dst_y + row) * stride + rect.dst_x;
+        let dst_row = &mut buf[dst_start..dst_start + rect.width];
+        for (src, dst) in src_row.as_chunks::<4>().0.iter().zip(dst_row.iter_mut()) {
+            let r = src[0];
+            let g = src[1];
+            let b = src[2];
+            let a = src[3];
             if a == 0 {
                 continue;
             }
             // Atlas already holds premultiplied RGBA (color emoji
             // rasterizer convention).
             let src = [r, g, b, a];
-            let idx = buf_row + (dst_x as usize);
-            buf[idx] = blend_over(src, buf[idx]);
+            *dst = blend_over(src, *dst);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn uniforms() -> GridUniforms {
+        GridUniforms {
+            projection: [0.0; 16],
+            grid_padding: [0.0; 4],
+            cursor_color: [0.0; 4],
+            cursor_bg_color: [0.0; 4],
+            cell_size: [1.0; 2],
+            grid_size: [1, 1],
+            cursor_pos: [u32::MAX; 2],
+            _pad_cursor: [0; 2],
+            min_contrast: 0.0,
+            flags: 0,
+            padding_extend: 0,
+            input_colorspace: 0,
+        }
+    }
+
+    #[test]
+    fn strided_render_rejects_invalid_targets() {
+        let grid = CpuGridRenderer::new(1, 1);
+        let uniforms = uniforms();
+        let mut short = [0u32; 1];
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            grid.render_bg_strided(&mut short, 2, 2, 2, &uniforms);
+        }))
+        .is_ok());
+
+        let mut zero_stride = [0u32; 1];
+        assert!(catch_unwind(AssertUnwindSafe(|| {
+            grid.render_text_strided(&mut zero_stride, 1, 1, 0, &uniforms);
+        }))
+        .is_ok());
     }
 }

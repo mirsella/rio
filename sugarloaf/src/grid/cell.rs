@@ -106,7 +106,7 @@ const _: () = {
 /// - Group scalars into 16-byte blocks or add explicit `_pad` fields.
 /// - Struct size must be a multiple of 16 bytes.
 ///
-/// Current layout: 144 bytes, 16-byte aligned.
+/// Current layout: 160 bytes, 16-byte aligned.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct GridUniforms {

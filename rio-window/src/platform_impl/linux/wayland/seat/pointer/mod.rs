@@ -419,20 +419,23 @@ impl WinitPointerData {
         pointer: &WlPointer,
         queue_handle: &QueueHandle<WinitState>,
     ) {
-        self.inner.lock().unwrap().confined_pointer =
-            Some(pointer_constraints.confine_pointer(
-                surface,
-                pointer,
-                None,
-                Lifetime::Persistent,
-                queue_handle,
-                GlobalData,
-            ));
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(previous) = inner.confined_pointer.take() {
+            previous.destroy();
+        }
+        inner.confined_pointer = Some(pointer_constraints.confine_pointer(
+            surface,
+            pointer,
+            None,
+            Lifetime::Persistent,
+            queue_handle,
+            GlobalData,
+        ));
     }
 
     pub fn unconfine_pointer(&self) {
-        let inner = self.inner.lock().unwrap();
-        if let Some(confined_pointer) = inner.confined_pointer.as_ref() {
+        if let Some(confined_pointer) = self.inner.lock().unwrap().confined_pointer.take()
+        {
             confined_pointer.destroy();
         }
     }
