@@ -1588,9 +1588,10 @@ fn endpoint_directory(
 ) -> Result<(PathBuf, FileIdentity), SessionError> {
     use std::os::unix::fs::DirBuilderExt;
 
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+    let configured_base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
+    let base = endpoint_base(&configured_base, session_id)?;
     let mut base_builder = std::fs::DirBuilder::new();
     base_builder.recursive(true).mode(0o700).create(&base)?;
     let directory = base.join(format!("rio-session-{}", session_id.hex()));
@@ -1604,6 +1605,38 @@ fn endpoint_directory(
         }
     };
     Ok((directory, identity))
+}
+
+#[cfg(unix)]
+fn endpoint_base(
+    configured_base: &Path,
+    session_id: SessionId,
+) -> Result<PathBuf, SessionError> {
+    let name = format!("rio-session-{}", session_id.hex());
+    if unix_socket_path_fits(&configured_base.join(&name).join("session.sock")) {
+        return Ok(configured_base.to_owned());
+    }
+
+    let fallback = Path::new("/var/tmp");
+    if unix_socket_path_fits(&fallback.join(&name).join("session.sock")) {
+        tracing::warn!(
+            "session runtime directory is too long for a Unix socket; using a short private directory"
+        );
+        return Ok(fallback.to_owned());
+    }
+
+    Err(SessionError::invalid(
+        "no usable Unix socket directory is available",
+    ))
+}
+
+#[cfg(unix)]
+fn unix_socket_path_fits(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    let address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    !bytes.contains(&0) && bytes.len() < address.sun_path.len()
 }
 
 #[cfg(unix)]
@@ -2163,6 +2196,16 @@ mod tests {
 
     #[test]
     fn child_listener_is_moved_above_stdio_fds() {
+        if std::env::var_os("RIO_LISTENER_FD_TEST_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("child_listener_is_moved_above_stdio_fds")
+                .env("RIO_LISTENER_FD_TEST_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
         let path = std::env::temp_dir()
             .join(format!("rio-session-listener-fd-{}", std::process::id()));
         let listener = UnixListener::bind(&path).unwrap();
@@ -2199,6 +2242,16 @@ mod tests {
         assert!(child_listener.as_raw_fd() > 2);
         drop(child_listener);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn long_runtime_directory_uses_a_short_socket_base() {
+        let configured = PathBuf::from(format!("/{}", "runtime".repeat(20)));
+        assert_eq!(
+            super::endpoint_base(&configured, crate::protocol::SessionId([7; 16]))
+                .unwrap(),
+            PathBuf::from("/var/tmp")
+        );
     }
 
     #[test]

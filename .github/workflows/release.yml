@@ -64,6 +64,7 @@ jobs:
         include:
           - os: macos-latest
             cache-subdir: darwin
+            _ids: --id macos
           - os: ubuntu-22.04
             cache-subdir: linux
             _ids: --id linux-x64-wayland --id linux-x64-x11
@@ -72,9 +73,8 @@ jobs:
             _ids: --id linux-arm64-wayland --id linux-arm64-x11
           - os: windows-latest
             cache-subdir: windows
+            _ids: --id windows-x86_64 --id windows-arm64
       fail-fast: false
-    outputs:
-      cache-hit: ${{ steps.cache-check.outputs.cache-hit }}
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
@@ -112,7 +112,6 @@ jobs:
           path: dist/${{ matrix.cache-subdir }}
           key: goreleaser-${{ matrix.os }}-${{ github.sha }}
           enableCrossOsArchive: ${{ matrix.os == 'windows-latest' }}
-          lookup-only: true
           fail-on-cache-miss: false
         id: cache-check
       - if: startsWith(matrix.os, 'ubuntu')
@@ -194,12 +193,72 @@ jobs:
             fontconfig:p
       - name: Build (release)
         shell: msys2 {0}
-        run: cargo build --release --features wgpu
+        run: cargo build -p rioterm --release --features wgpu
+
+  release-cache:
+    needs: verify-release-credentials
+    runs-on: ubuntu-latest
+    outputs:
+      all-hit: ${{ steps.aggregate.outputs.all-hit }}
+    steps:
+      - name: Check macOS cache
+        id: darwin-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: dist/darwin
+          key: goreleaser-macos-latest-${{ github.sha }}
+          fail-on-cache-miss: false
+      - name: Check Windows cache
+        id: windows-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: dist/windows
+          key: goreleaser-windows-latest-${{ github.sha }}
+          enableCrossOsArchive: true
+          fail-on-cache-miss: false
+      - name: Check Linux ARM cache
+        id: linux-arm-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: dist/linux
+          key: goreleaser-ubuntu-22.04-arm-${{ github.sha }}
+          fail-on-cache-miss: false
+      - name: Check Linux x64 cache
+        id: linux-x64-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: dist/linux
+          key: goreleaser-ubuntu-22.04-${{ github.sha }}
+          fail-on-cache-miss: false
+      - name: Aggregate cache status
+        id: aggregate
+        shell: bash
+        env:
+          DARWIN_HIT: ${{ steps.darwin-cache.outputs.cache-hit }}
+          WINDOWS_HIT: ${{ steps.windows-cache.outputs.cache-hit }}
+          LINUX_ARM_HIT: ${{ steps.linux-arm-cache.outputs.cache-hit }}
+          LINUX_X64_HIT: ${{ steps.linux-x64-cache.outputs.cache-hit }}
+        run: |
+          if [[ "$DARWIN_HIT" == true && "$WINDOWS_HIT" == true && \
+            "$LINUX_ARM_HIT" == true && "$LINUX_X64_HIT" == true ]]; then
+            echo "all-hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "all-hit=false" >> "$GITHUB_OUTPUT"
+          fi
 
   release:
-    # skip if cache exists for same commit, since we probably already released
-    if: needs.build.outputs.cache-hit != 'true'
-    needs: build
+    # The MSYS2 gate only runs for tags/manual releases. A skipped gate is
+    # therefore valid for the ordinary main-branch nightly release.
+    if: >-
+      always() && needs.build.result == 'success' &&
+      (needs['msys2-build'].result == 'success' ||
+      needs['msys2-build'].result == 'skipped') &&
+      needs['release-cache'].result == 'success' &&
+      needs['release-cache'].outputs.all-hit != 'true'
+    needs:
+      - build
+      - msys2-build
+      - release-cache
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

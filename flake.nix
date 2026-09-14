@@ -31,8 +31,9 @@
         lib,
         ...
       }: let
-        # Defines a devshell using the `rust-toolchain`, allowing for
-        # different versions of rust to be used.
+        cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+        rustVersion = builtins.getAttr "rust-version" cargoToml.workspace.package;
+        # Defines a devshell using the selected Rust toolchain.
         mkDevShell = rust-toolchain: let
           runtimeDeps = self'.packages.rio.runtimeDependencies;
           tools =
@@ -43,7 +44,7 @@
             LD_LIBRARY_PATH = "${lib.makeLibraryPath runtimeDeps}";
           };
         toolchains = rec {
-          msrv = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          msrv = pkgs.rust-bin.stable.${rustVersion}.minimal;
           stable = pkgs.rust-bin.stable.latest.minimal;
           nightly = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.minimal);
           rio = msrv;

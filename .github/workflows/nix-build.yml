@@ -11,18 +11,23 @@ on:
       - 'flake.nix'
       - 'flake.lock'
       - 'pkgRio.nix'
+      - 'Cargo.toml'
+      - '**/Cargo.toml'
       - 'Cargo.lock'
+      - 'misc/**'
       - '.github/workflows/nix-build.yml'
   push:
     branches:
       - main
     paths:
       - '**/*.rs'
+      - 'Cargo.toml'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - 'flake.nix'
       - 'flake.lock'
       - 'pkgRio.nix'
+      - 'misc/**'
       - '.github/workflows/nix-build.yml'
 
 concurrency:
