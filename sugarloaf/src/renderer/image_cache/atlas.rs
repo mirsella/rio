@@ -154,7 +154,14 @@ impl AtlasAllocator {
     /// right and bottom. Caller is responsible for growing the backing
     /// texture in lock-step.
     pub fn grow_to(&mut self, new_width: u16, new_height: u16) {
-        debug_assert!(new_width >= self.width && new_height >= self.height);
+        assert!(
+            new_width >= self.width && new_height >= self.height,
+            "atlas dimensions can only grow"
+        );
+        let extra_width = new_width - self.width;
+        for shelf in &mut self.shelves {
+            shelf.width = shelf.width.saturating_add(extra_width);
+        }
         self.width = new_width;
         self.height = new_height;
     }
@@ -247,6 +254,16 @@ mod tests {
         // Different height should create new shelf
         let pos3 = atlas.allocate(30, 10);
         assert_eq!(pos3, Some((0, 21)));
+    }
+
+    #[test]
+    fn growth_exposes_new_space_on_existing_shelves() {
+        let mut atlas = AtlasAllocator::new(10, 10);
+        assert_eq!(atlas.allocate(9, 1), Some((0, 0)));
+
+        atlas.grow_to(20, 10);
+
+        assert_eq!(atlas.allocate(9, 1), Some((10, 0)));
     }
 
     #[test]

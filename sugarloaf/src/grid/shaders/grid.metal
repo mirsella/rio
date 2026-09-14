@@ -9,14 +9,8 @@
 // - full_screen_vertex (line 191 in upstream)
 // - cell_bg_fragment (line 451)
 //
-// Phase 1a scope: bg pass only. `cell_text_*` (text pass) is ported in
-// Phase 1c. Color space conversion is deliberately minimal right now:
-// the CAMetalLayer in `sugarloaf/src/context/metal.rs` is tagged
-// DisplayP3 and `setPresentsWithTransaction:false`, and we emit cell
-// colors pre-multiplied in sRGB-gamma space to match the
-// non-linear-blending default. The full `load_color` chain
-// (linearize → sRGB_DP3 → unlinearize) lands when we add the
-// `use_display_p3` / `use_linear_blending` uniform paths.
+// The background and text passes share the same colorspace and blending
+// path. `GridUniforms` carries the input colorspace and blend-mode flags.
 
 #include <metal_stdlib>
 
@@ -42,9 +36,9 @@ struct Uniforms {
 //-------------------------------------------------------------------
 // Color space / transfer curve helpers. Matrices match
 // `sugarloaf/src/renderer/renderer.metal` (Bradford-adapted D65) so
-// the grid's output is byte-identical to sugarloaf's quad pipeline
-// (`draw_bg_fill_metal`, UI overlays). Same role as 's
-// `linearize` / `unlinearize` / `srgb_to_display_p3` at
+// the grid's output follows sugarloaf's quad pipeline
+// (`draw_bg_fill_metal`, UI overlays), using the same
+// `linearize` / `unlinearize` / `srgb_to_display_p3` stages as
 // `ghostty/src/renderer/shaders/shaders.metal:57-85`.
 //-------------------------------------------------------------------
 float3 grid_srgb_to_linear(float3 c) {
@@ -206,11 +200,8 @@ fragment float4 grid_bg_fragment(
 // Cell Text Shader
 //
 // Ported from `ghostty/src/renderer/shaders/shaders.metal:525-761`.
-// Phase 1c simplifications:
-// - No Display P3 / linear-blending conversions; colors land
-// already sRGB-encoded.
-// - No WCAG min_contrast enforcement.
-// - No `cursor_wide` handling (single-cell cursor only for now).
+// The shader still omits WCAG min_contrast enforcement and
+// `cursor_wide` handling (single-cell cursor only for now).
 //-------------------------------------------------------------------
 
 constant uint ATLAS_GRAYSCALE = 0u;

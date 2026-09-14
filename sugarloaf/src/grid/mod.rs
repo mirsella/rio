@@ -32,6 +32,23 @@ use crate::context::{Context, ContextType};
 pub use atlas::{AtlasSlot, GlyphKey, RasterizedGlyph};
 pub use cell::{CellBg, CellText, GridUniforms};
 
+#[inline]
+pub(crate) fn valid_row(row: u32, rows: u32, cols: u32, bg_len: usize) -> bool {
+    if row >= rows {
+        return false;
+    }
+    if bg_len != cols as usize {
+        tracing::warn!(
+            row,
+            expected = cols,
+            actual = bg_len,
+            "rejecting grid row with an invalid background length"
+        );
+        return false;
+    }
+    true
+}
+
 /// Backend-dispatching grid renderer. One of these lives per terminal
 /// panel; it owns the per-panel cell buffers and submits grid draw
 /// calls to the sugarloaf context's encoder / render pass.
@@ -51,8 +68,8 @@ pub enum GridRenderer {
     Metal(metal::MetalGridRenderer),
     #[cfg(feature = "wgpu")]
     Wgpu(webgpu::WgpuGridRenderer),
-    /// Native Vulkan grid renderer. Phase 3 = bg pass; text pass +
-    /// atlases land in Phase 4.
+    /// Native Vulkan grid renderer with persistent cell buffers and glyph
+    /// atlas pages.
     #[cfg(target_os = "linux")]
     Vulkan(vulkan::VulkanGridRenderer),
     /// Software grid renderer. Same `CellBg` / `CellText` storage as
@@ -116,9 +133,7 @@ impl GridRenderer {
 
     /// Overwrite `row`'s background + foreground cells. `bg` must have
     /// exactly `cols` entries; `fg` is variable length (base glyph +
-    /// decorations). Callers that want to clear a row should use
-    /// `clear_row` instead — passing empty slices here is allowed but
-    /// leaves the buffer in an inconsistent state.
+    /// decorations). Invalid rows or background lengths are ignored.
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
         match self {
             #[cfg(target_os = "macos")]

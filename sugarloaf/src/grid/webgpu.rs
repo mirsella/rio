@@ -92,6 +92,9 @@ impl WgpuGlyphAtlas {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if !glyph.has_exact_len(self.bytes_per_pixel as usize) {
+            return None;
+        }
         if glyph.width == 0 || glyph.height == 0 {
             let slot = AtlasSlot {
                 x: 0,
@@ -338,6 +341,9 @@ impl WgpuGridRenderer {
     }
 
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
+        if !super::valid_row(row, self.rows, self.cols, bg.len()) {
+            return;
+        }
         let idx = (row as usize) + 1;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
             slot.clear();
@@ -345,29 +351,22 @@ impl WgpuGridRenderer {
             self.fg_dirty = true;
         }
 
-        if row >= self.rows {
-            return;
-        }
         let row_start = (row as usize) * (self.cols as usize);
-        let row_len = (self.cols as usize).min(bg.len());
         let cpu = &mut self.bg_cpu[0];
-        cpu[row_start..row_start + row_len].copy_from_slice(&bg[..row_len]);
-        for slot in &mut cpu[row_start + row_len..row_start + self.cols as usize] {
-            *slot = CellBg::TRANSPARENT;
-        }
+        cpu[row_start..row_start + self.cols as usize].copy_from_slice(bg);
         self.bg_dirty = true;
     }
 
     pub fn clear_row(&mut self, row: u32) {
+        if row >= self.rows {
+            return;
+        }
         let idx = (row as usize) + 1;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
             if !slot.is_empty() {
                 self.fg_dirty = true;
             }
             slot.clear();
-        }
-        if row >= self.rows {
-            return;
         }
         let row_start = (row as usize) * (self.cols as usize);
         let cpu = &mut self.bg_cpu[0];

@@ -303,6 +303,9 @@ impl VulkanGlyphAtlas {
         key: GlyphKey,
         glyph: RasterizedGlyph<'_>,
     ) -> Option<AtlasSlot> {
+        if !glyph.has_exact_len(self.bytes_per_pixel as usize) {
+            return None;
+        }
         if glyph.width == 0 || glyph.height == 0 {
             // Whitespace / control glyphs — record an empty slot in
             // page 0 so lookups don't keep retrying. The slot has
@@ -843,6 +846,9 @@ impl VulkanGridRenderer {
     }
 
     pub fn write_row(&mut self, row: u32, bg: &[CellBg], fg: &[CellText]) {
+        if !super::valid_row(row, self.rows, self.cols, bg.len()) {
+            return;
+        }
         // FG: stash in CPU per-row vec, mark all slots dirty.
         let idx = (row as usize) + 1;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
@@ -851,29 +857,21 @@ impl VulkanGridRenderer {
             self.fg_dirty = [true; FRAMES_IN_FLIGHT];
         }
 
-        if row >= self.rows {
-            return;
-        }
         let row_start = (row as usize) * (self.cols as usize);
-        let row_len = (self.cols as usize).min(bg.len());
-        self.bg_cpu[row_start..row_start + row_len].copy_from_slice(&bg[..row_len]);
-        for slot in &mut self.bg_cpu[row_start + row_len..row_start + self.cols as usize]
-        {
-            *slot = CellBg::TRANSPARENT;
-        }
+        self.bg_cpu[row_start..row_start + self.cols as usize].copy_from_slice(bg);
         self.bg_dirty = [true; FRAMES_IN_FLIGHT];
     }
 
     pub fn clear_row(&mut self, row: u32) {
+        if row >= self.rows {
+            return;
+        }
         let idx = (row as usize) + 1;
         if let Some(slot) = self.fg_rows.get_mut(idx) {
             if !slot.is_empty() {
                 self.fg_dirty = [true; FRAMES_IN_FLIGHT];
             }
             slot.clear();
-        }
-        if row >= self.rows {
-            return;
         }
         let row_start = (row as usize) * (self.cols as usize);
         for slot in &mut self.bg_cpu[row_start..row_start + self.cols as usize] {
@@ -1049,6 +1047,9 @@ impl VulkanGridRenderer {
             let mut scratch: Vec<((u8, u8), Vec<CellText>)> = Vec::with_capacity(4);
             for row in &self.fg_rows {
                 for cell in row {
+                    if cell.glyph_size[0] == 0 || cell.glyph_size[1] == 0 {
+                        continue;
+                    }
                     let key = (cell.atlas, cell.page);
                     match scratch.iter_mut().find(|(k, _)| *k == key) {
                         Some(b) => b.1.push(*cell),
