@@ -3922,6 +3922,7 @@ dependencies = [
  "librio",
  "rio-graphics",
  "rio-vt",
+ "tracing",
 ]
 
 [[package]]
