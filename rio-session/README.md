@@ -62,8 +62,9 @@ infer macOS or BSD validation from the Unix cfgs.
 
 Version 5 preserves both the ID and URI of each OSC 8 hyperlink. This keeps
 link spans intact across frame decoding, deltas, and attachment transfer.
-Version-4 workers require a version-4 client; start new sessions with the
-updated binary rather than attempting to attach across protocol versions.
+Workers reject every protocol version other than version 5; start new sessions
+with the updated binary rather than attempting to attach across protocol
+versions.
 
 `snapshot_since(base_sequence)` returns a typed `FrameUpdate`. A `Delta` carries
 strictly ordered changed rows and the complete bounded cursor, selection,
@@ -94,8 +95,8 @@ must not become silent data loss.
 only `snapshot` and `write`; it does not spawn sessions:
 
 ```sh
-cargo +nightly run -p rio-session --bin rio-sessionctl -- snapshot /path/to/descriptor
-cargo +nightly run -p rio-session --bin rio-sessionctl -- write /path/to/descriptor $'printf hello\n'
+cargo run -p rio-session --bin rio-sessionctl -- snapshot /path/to/descriptor
+cargo run -p rio-session --bin rio-sessionctl -- write /path/to/descriptor $'printf hello\n'
 ```
 
 Hosts create a `SessionClient`, save `client.descriptor()` with

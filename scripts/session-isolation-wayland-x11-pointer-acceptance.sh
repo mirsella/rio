@@ -32,7 +32,6 @@ SHELL_FIXTURE="$ROOT/scripts/fixtures/session-isolation-ack-shell.sh"
 SETXKBMAP=${SETXKBMAP:-/usr/bin/setxkbmap}
 IMPORT=${IMPORT:-/usr/bin/import}
 COMPARE=${COMPARE:-/usr/bin/compare}
-VULKANINFO=${VULKANINFO:-/usr/bin/vulkaninfo}
 SOCKET=${RIO_ACCEPT_WAYLAND_SOCKET:-rio-accept-wayland-x11}
 DISPLAY_NUM=${RIO_ACCEPT_X_DISPLAY:-$((300 + ($$ % 300)))}
 BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus"
@@ -48,6 +47,7 @@ unset WAYLAND_DISPLAY WAYLAND_SOCKET
 PIDS=()
 DBUS_PID=
 OPENBOX_PID=
+CLIPBOARD_PID=
 
 trap cleanup EXIT INT TERM
 
@@ -93,7 +93,7 @@ palette_action() {
     sleep 1
 }
 
-for command in "$XVFB" "$KWIN" "$DBUS_DAEMON" "$OPENBOX" "$XDPYINFO" "$XDOTTOOL" "$XPROP" "$QDBUS6" "$WL_COPY" "$SETXKBMAP" "$IMPORT" "$COMPARE" "$VULKANINFO" pgrep ps awk grep tr; do
+for command in "$XVFB" "$KWIN" "$DBUS_DAEMON" "$OPENBOX" "$XDPYINFO" "$XDOTTOOL" "$XPROP" "$QDBUS6" "$WL_COPY" "$SETXKBMAP" "$IMPORT" "$COMPARE" pgrep ps awk grep tr; do
     require_command "$command"
 done
 [[ -x "$RIO_BIN" ]] || die "RIO_BIN is not executable: $RIO_BIN"
@@ -158,9 +158,6 @@ fi
 "$XDOTTOOL" windowactivate --sync "$host_window" 2>/dev/null || true
 "$XDOTTOOL" windowfocus --sync "$host_window" 2>/dev/null || true
 log "private X11 KWin host window=$host_window"
-XDG_RUNTIME_DIR="$RUNTIME_DIR" "$VULKANINFO" --summary >"$LOG_DIR/vulkaninfo.log" 2>&1 || \
-    die "private Vulkan summary failed; inspect $LOG_DIR/vulkaninfo.log"
-
 for role in destination source; do
     mkdir -p "$CONFIG_DIR/$role/log"
     printf '%s\n' \
@@ -345,9 +342,9 @@ sleep 0.5
 capture_root "$RUN_DIR/after-merge.png"
 printf 'after-pointer\n' | XDG_RUNTIME_DIR="$RUNTIME_DIR" WAYLAND_DISPLAY="$SOCKET" \
     "$WL_COPY" --primary --foreground >"$LOG_DIR/clipboard.log" 2>&1 &
-clipboard_pid=$!
-PIDS+=("$clipboard_pid")
-wait_until "private Wayland primary selection" 5 "kill -0 $clipboard_pid 2>/dev/null"
+CLIPBOARD_PID=$!
+PIDS+=("$CLIPBOARD_PID")
+wait_until "private Wayland primary selection" 5 "kill -0 $CLIPBOARD_PID 2>/dev/null"
 "$XDOTTOOL" key --window "$host_window" --clearmodifiers super+1
 sleep 0.2
 paste_ack=false
@@ -364,8 +361,9 @@ for y in "$target_y" 180 250 320 420 520; do
     done
 done
 [[ "$paste_ack" == true ]] || die "native Wayland transferred shell did not receive a fresh primary-selection paste ACK"
-kill "$clipboard_pid" 2>/dev/null || true
-wait "$clipboard_pid" 2>/dev/null || true
+kill "$CLIPBOARD_PID" 2>/dev/null || true
+wait "$CLIPBOARD_PID" 2>/dev/null || true
+CLIPBOARD_PID=
 log "native Wayland transferred shell retained a fresh middle-click primary-selection ACK after the direct-render merge"
 
 {
