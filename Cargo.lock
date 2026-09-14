@@ -2554,15 +2554,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
-name = "lru"
-version = "0.16.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
-dependencies = [
- "hashbrown 0.16.1",
-]
-
-[[package]]
 name = "mach2"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4042,12 +4033,10 @@ dependencies = [
  "criterion",
  "dirs",
  "dunce",
- "futures",
  "getrandom 0.3.4",
  "global-hotkey",
  "image",
  "libc",
- "lru",
  "notify",
  "objc-rs 0.3.2",
  "onig",
@@ -4072,7 +4061,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "wgpu",
  "windows-sys 0.60.2",
  "winres",
 ]
