@@ -347,6 +347,7 @@ run_profile_variant() {
     gpu_log="$RUN_DIR/profile-$phase-$variant-radeontop.log"
     "$RADEONTOP" -d "$gpu_log" -i 1 -l 4 >"$LOG_DIR/profile-$phase-$variant-radeontop.stdout" 2>&1 &
     gpu_pid=$!
+    PIDS+=("$gpu_pid")
     sleep 1
     {
         printf 'profile=%s variant=%s phase=%s\n' "$phase" "$variant" "$phase"
