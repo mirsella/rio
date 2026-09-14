@@ -132,7 +132,7 @@ measure_processes() {
     {
         printf '\n[%s] process snapshot (%s)\n' "$(date -u +%H:%M:%S)" "$label"
         printf 'pid ppid cpu_percent rss_kib command\n'
-        mapfile -t _measure_tree < <(printf '%s\n' "$root"; owned_descendants_for_measure "$root")
+        mapfile -t _measure_tree < <(printf '%s\n' "$root"; owned_descendants "$root")
         for pid in "${_measure_tree[@]}"; do
             [[ "$pid" =~ ^[0-9]+$ ]] || continue
             ps -p "$pid" -o pid=,ppid=,%cpu=,rss=,args= 2>/dev/null || true
@@ -217,10 +217,6 @@ image_dimensions_changed() {
     local before=$1 after=$2
     [[ -f "$before" && -f "$after" ]] || return 1
     [[ "$($IDENTIFY -format '%wx%h' "$before")" != "$($IDENTIFY -format '%wx%h' "$after")" ]]
-}
-
-owned_descendants_for_measure() {
-    owned_descendants "$1"
 }
 
 for command in "$XVFB" "$XDOTTOOL" "$XPROP" "$XDPYINFO" "$IMPORT" "$CONVERT" "$COMPARE" "$IDENTIFY" pgrep ps awk grep; do
@@ -423,13 +419,13 @@ wait_until "retained source tab ACK after selected-tab merge" 8 \
     "(( \$(grep -Fc 'ACK pid=$source_shell_pid input=tab-keep' \"$source_ack\") >= 2 ))"
 log "selected transferred shell ACK and retained source tab ACK both remained live"
 
-mapfile -t before_detach_tree < <(printf '%s\n' "$destination_pid"; owned_descendants_for_measure "$destination_pid")
+mapfile -t before_detach_tree < <(printf '%s\n' "$destination_pid"; owned_descendants "$destination_pid")
 mapfile -t before_detach_windows < <(visible_window_ids)
 palette_action "$destination_window" "Move Current Tab to New Window"
 detached_window=$(wait_for_new_window "$destination_window" 20 "${before_detach_windows[@]}")
 detached_pid=$(window_pid "$detached_window" 2>/dev/null || true)
 if [[ ! "$detached_pid" =~ ^[0-9]+$ ]]; then
-    mapfile -t after_detach_tree < <(printf '%s\n' "$destination_pid"; owned_descendants_for_measure "$destination_pid")
+    mapfile -t after_detach_tree < <(printf '%s\n' "$destination_pid"; owned_descendants "$destination_pid")
     for candidate in "${after_detach_tree[@]}"; do
         [[ "$candidate" =~ ^[0-9]+$ ]] || continue
         [[ " ${before_detach_tree[*]} " == *" $candidate "* ]] && continue

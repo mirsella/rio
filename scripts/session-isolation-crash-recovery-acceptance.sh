@@ -49,7 +49,7 @@ shell_child() {
         args=$(ps -p "$pid" -o args= 2>/dev/null || true)
         [[ "$args" == *"$SHELL_FIXTURE"* ]] && { printf '%s\n' "$pid"; return 0; }
     done
-    pgrep -P "$worker" | head -n 1
+    return 1
 }
 
 start_gui() {
