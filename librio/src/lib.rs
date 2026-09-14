@@ -1223,6 +1223,10 @@ impl Surface {
         &self,
         bytes: B,
     ) -> Result<(), InputError> {
+        let bytes = bytes.into();
+        if bytes.is_empty() {
+            return Ok(());
+        }
         self.try_write_response(bytes)?;
 
         // Input snaps the view back to the live screen and drops any
@@ -1247,6 +1251,10 @@ impl Surface {
         &self,
         bytes: B,
     ) -> Result<(), InputError> {
+        let bytes = bytes.into();
+        if bytes.is_empty() {
+            return Ok(());
+        }
         let write = self.try_reserve_response(bytes)?;
         self.send_pty_write(write)
     }
