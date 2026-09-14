@@ -75,7 +75,7 @@ pub enum ContentType {
 }
 
 impl<'a> AddImage<'a> {
-    fn data(&'a self) -> Option<&'a [u8]> {
+    fn data(&self) -> &[u8] {
         self.data.data()
     }
 }
@@ -83,7 +83,6 @@ impl<'a> AddImage<'a> {
 /// Representations of image data for submission to a cache.
 #[derive(Clone)]
 pub enum ImageData<'a> {
-    // None,
     Borrowed(&'a [u8]),
     #[allow(unused)]
     Owned(Vec<u8>),
@@ -92,14 +91,12 @@ pub enum ImageData<'a> {
 }
 
 impl<'a> ImageData<'a> {
-    fn data(&'a self) -> Option<&'a [u8]> {
-        Some(match self {
-            // Self::None => return None,
-            // Self::Borrowed(data) => *data,
+    fn data(&self) -> &[u8] {
+        match self {
             Self::Borrowed(data) => data,
             Self::Owned(data) => data,
             Self::Shared(data) => data,
-        })
+        }
     }
 }
 

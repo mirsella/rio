@@ -106,10 +106,10 @@ enum DeviceQueue {
 }
 
 #[inline]
-pub fn buffer_size(width: u32, height: u32) -> Option<usize> {
+pub fn buffer_size(width: u32, height: u32, channels: usize) -> Option<usize> {
     (width as usize)
-        .checked_add(height as usize)?
-        .checked_add(4)
+        .checked_mul(height as usize)?
+        .checked_mul(channels)
 }
 
 impl ImageCache {
@@ -304,8 +304,15 @@ impl ImageCache {
             return None;
         }
 
-        // Check buffer size
-        buffer_size(width as u32, height as u32)?;
+        let channels = match request.content_type {
+            ContentType::Mask => 1,
+            ContentType::Color => 4,
+        };
+        let required_bytes = buffer_size(width as u32, height as u32, channels)?;
+        let data = request.data();
+        if data.len() != required_bytes {
+            return None;
+        }
 
         // Too big to allocate - try to grow texture size for Metal
         if !(width <= self.max_texture_size && height <= self.max_texture_size) {
@@ -348,21 +355,18 @@ impl ImageCache {
                 color_atlas_index: 0, // Not used for mask
             });
 
-            if let Some(data) = request.data() {
-                fill(
-                    FillParams {
-                        x,
-                        y,
-                        width,
-                        _height: height,
-                        target_width: self.max_texture_size,
-                        channels: self.mask_atlas.channels,
-                    },
-                    data,
-                    &mut self.mask_atlas.buffer,
-                );
-                self.mask_atlas.dirty = true;
-            }
+            fill(
+                FillParams {
+                    x,
+                    y,
+                    width,
+                    target_width: self.max_texture_size,
+                    channels: self.mask_atlas.channels,
+                },
+                data,
+                &mut self.mask_atlas.buffer,
+            );
+            self.mask_atlas.dirty = true;
 
             return ImageId::new(entry_index as u32, request.has_alpha);
         }
@@ -383,21 +387,18 @@ impl ImageCache {
                     color_atlas_index: atlas_index,
                 });
 
-                if let Some(data) = request.data() {
-                    fill(
-                        FillParams {
-                            x,
-                            y,
-                            width,
-                            _height: height,
-                            target_width: self.max_texture_size,
-                            channels: atlas_with_texture.atlas.channels,
-                        },
-                        data,
-                        &mut atlas_with_texture.atlas.buffer,
-                    );
-                    atlas_with_texture.atlas.dirty = true;
-                }
+                fill(
+                    FillParams {
+                        x,
+                        y,
+                        width,
+                        target_width: self.max_texture_size,
+                        channels: atlas_with_texture.atlas.channels,
+                    },
+                    data,
+                    &mut atlas_with_texture.atlas.buffer,
+                );
+                atlas_with_texture.atlas.dirty = true;
 
                 debug!(
                     "Allocated {}x{} in existing color atlas {}",
@@ -433,21 +434,18 @@ impl ImageCache {
             color_atlas_index: new_atlas_index,
         });
 
-        if let Some(data) = request.data() {
-            fill(
-                FillParams {
-                    x,
-                    y,
-                    width,
-                    _height: height,
-                    target_width: self.max_texture_size,
-                    channels: atlas_with_texture.atlas.channels,
-                },
-                data,
-                &mut atlas_with_texture.atlas.buffer,
-            );
-            atlas_with_texture.atlas.dirty = true;
-        }
+        fill(
+            FillParams {
+                x,
+                y,
+                width,
+                target_width: self.max_texture_size,
+                channels: atlas_with_texture.atlas.channels,
+            },
+            data,
+            &mut atlas_with_texture.atlas.buffer,
+        );
+        atlas_with_texture.atlas.dirty = true;
 
         debug!(
             "Allocated {}x{} in new color atlas {}",
@@ -565,6 +563,7 @@ impl ImageCache {
             let mut new_mask_atlas = Atlas::new(AtlasKind::Mask, new_size);
             // Copy the allocator state to preserve allocated regions
             new_mask_atlas.alloc = self.mask_atlas.alloc.clone();
+            new_mask_atlas.alloc.grow_to(new_size, new_size);
 
             // Copy old mask buffer data to new buffer
             let new_mask_buffer_len = new_size as usize * new_size as usize;
@@ -629,6 +628,7 @@ impl ImageCache {
                 // Create new atlas and copy allocator state
                 let mut new_atlas = Atlas::new(AtlasKind::Color, new_size);
                 new_atlas.alloc = old_atlas_with_texture.atlas.alloc.clone();
+                new_atlas.alloc.grow_to(new_size, new_size);
 
                 // Copy old color buffer data to new buffer
                 let new_buffer_len = new_size as usize * new_size as usize * 4;
@@ -1039,22 +1039,19 @@ struct FillParams {
     x: u16,
     y: u16,
     width: u16,
-    _height: u16,
     target_width: u16,
     channels: usize,
 }
 
-fn fill(params: FillParams, image: &[u8], target: &mut [u8]) -> Option<()> {
+fn fill(params: FillParams, image: &[u8], target: &mut [u8]) {
+    // allocate() validates the pixels and obtains an in-bounds atlas rectangle.
     let image_pitch = params.width as usize * params.channels;
     let buffer_pitch = params.target_width as usize * params.channels;
-    let mut offset =
-        params.y as usize * buffer_pitch + params.x as usize * params.channels;
-    for row in image.chunks(image_pitch) {
-        let dest = target.get_mut(offset..offset + image_pitch)?;
-        dest.copy_from_slice(row);
-        offset += buffer_pitch;
+    let offset = params.y as usize * buffer_pitch + params.x as usize * params.channels;
+    for (row, source) in image.chunks_exact(image_pitch).enumerate() {
+        let start = offset + row * buffer_pitch;
+        target[start..start + image_pitch].copy_from_slice(source);
     }
-    Some(())
 }
 
 #[cfg(test)]

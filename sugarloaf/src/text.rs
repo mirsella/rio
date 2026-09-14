@@ -787,6 +787,12 @@ impl Text {
         buf_h: u32,
         stride_pixels: u32,
     ) {
+        if let Err(error) =
+            crate::context::cpu::CpuRenderTarget::new(buf, buf_w, buf_h, stride_pixels)
+        {
+            tracing::warn!(%error, "skipping CPU text render for invalid target");
+            return;
+        }
         if self.instances.is_empty() {
             return;
         }
@@ -1851,31 +1857,33 @@ fn blit_text_mask(
     if color[3] == 0 {
         return;
     }
-    let x_start = glyph_x.max(0);
-    let y_start = glyph_y.max(0);
-    let x_end = (glyph_x + gw).min(buf_w);
-    let y_end = (glyph_y + gh).min(buf_h);
-    if x_end <= x_start || y_end <= y_start {
+    let Some(atlas_len) = atlas_side.checked_mul(atlas_side) else {
+        return;
+    };
+    if atlas.len() < atlas_len {
         return;
     }
+    let Some(rect) = crate::context::cpu::clip_blit_rect(
+        (glyph_x, glyph_y),
+        (gw, gh),
+        (buf_w, buf_h),
+        atlas_side,
+        (ax, ay),
+    ) else {
+        return;
+    };
     let r = color[0] as u32;
     let g = color[1] as u32;
     let b = color[2] as u32;
     let ca = color[3] as u32;
 
-    for dst_y in y_start..y_end {
-        let src_y = (dst_y - glyph_y) as usize + ay;
-        if src_y >= atlas_side {
-            continue;
-        }
-        let atlas_row = src_y * atlas_side;
-        let buf_row = (dst_y as usize) * stride;
-        for dst_x in x_start..x_end {
-            let src_x = (dst_x - glyph_x) as usize + ax;
-            if src_x >= atlas_side {
-                continue;
-            }
-            let m = atlas[atlas_row + src_x] as u32;
+    for row in 0..rect.height {
+        let src_start = (rect.src_y + row) * atlas_side + rect.src_x;
+        let src_row = &atlas[src_start..src_start + rect.width];
+        let dst_start = (rect.dst_y + row) * stride + rect.dst_x;
+        let dst_row = &mut buf[dst_start..dst_start + rect.width];
+        for (&mask, dst) in src_row.iter().zip(dst_row.iter_mut()) {
+            let m = mask as u32;
             if m == 0 {
                 continue;
             }
@@ -1887,8 +1895,7 @@ fn blit_text_mask(
             let pg = (g * a + 127) / 255;
             let pb = (b * a + 127) / 255;
             let src = [pr as u8, pg as u8, pb as u8, a as u8];
-            let idx = buf_row + (dst_x as usize);
-            buf[idx] = blend_premul_over(src, buf[idx]);
+            *dst = blend_premul_over(src, *dst);
         }
     }
 }
@@ -1908,36 +1915,40 @@ fn blit_text_color(
     ax: usize,
     ay: usize,
 ) {
-    let x_start = glyph_x.max(0);
-    let y_start = glyph_y.max(0);
-    let x_end = (glyph_x + gw).min(buf_w);
-    let y_end = (glyph_y + gh).min(buf_h);
-    if x_end <= x_start || y_end <= y_start {
+    let Some(atlas_len) = atlas_side
+        .checked_mul(atlas_side)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return;
+    };
+    if atlas.len() < atlas_len {
         return;
     }
-    for dst_y in y_start..y_end {
-        let src_y = (dst_y - glyph_y) as usize + ay;
-        if src_y >= atlas_side {
-            continue;
-        }
-        let atlas_row = src_y * atlas_side * 4;
-        let buf_row = (dst_y as usize) * stride;
-        for dst_x in x_start..x_end {
-            let src_x = (dst_x - glyph_x) as usize + ax;
-            if src_x >= atlas_side {
-                continue;
-            }
-            let off = atlas_row + src_x * 4;
-            let r = atlas[off];
-            let g = atlas[off + 1];
-            let b = atlas[off + 2];
-            let a = atlas[off + 3];
+    let Some(rect) = crate::context::cpu::clip_blit_rect(
+        (glyph_x, glyph_y),
+        (gw, gh),
+        (buf_w, buf_h),
+        atlas_side,
+        (ax, ay),
+    ) else {
+        return;
+    };
+    let atlas_stride = atlas_side * 4;
+    for row in 0..rect.height {
+        let src_start = (rect.src_y + row) * atlas_stride + rect.src_x * 4;
+        let src_row = &atlas[src_start..src_start + rect.width * 4];
+        let dst_start = (rect.dst_y + row) * stride + rect.dst_x;
+        let dst_row = &mut buf[dst_start..dst_start + rect.width];
+        for (src, dst) in src_row.as_chunks::<4>().0.iter().zip(dst_row.iter_mut()) {
+            let r = src[0];
+            let g = src[1];
+            let b = src[2];
+            let a = src[3];
             if a == 0 {
                 continue;
             }
             let src = [r, g, b, a];
-            let idx = buf_row + (dst_x as usize);
-            buf[idx] = blend_premul_over(src, buf[idx]);
+            *dst = blend_premul_over(src, *dst);
         }
     }
 }
