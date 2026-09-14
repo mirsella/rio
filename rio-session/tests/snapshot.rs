@@ -106,6 +106,41 @@ fn assert_delta_metadata(delta: &FrameDelta, frame: &FullFrame) {
     assert_eq!(delta.working_dir, frame.working_dir);
 }
 
+#[test]
+fn hyperlink_identity_survives_delta_and_takeover() {
+    let mut spec = session_spec();
+    spec.args[1] = "stty raw -echo; printf '\\033]0;ready\\007'; cat".into();
+    let client = SessionClient::spawn_with_worker_path(spec, worker_path()).unwrap();
+    snapshot_until(&client, |frame| frame.title == "ready");
+    client.write(b"\x1b]8;id=first;https://example.com\x1b\\aa\x1b]8;;\x1b\\\x1b]8;id=second;https://example.com\x1b\\bb\x1b]8;;\x1b\\\x1b]8;;https://example.com\x1b\\cc\x1b]8;;\x1b\\".to_vec()).unwrap();
+    let mut cached =
+        snapshot_until(&client, |frame| frame.rows[0].text.starts_with("aabbcc"));
+    let links: Vec<_> = cached.rows[0].extras[..6]
+        .iter()
+        .map(|extra| extra.as_ref().unwrap().hyperlink.clone().unwrap())
+        .collect();
+    assert_eq!(links[0], links[1]);
+    assert_eq!(links[2], links[3]);
+    assert_eq!(links[4], links[5]);
+    assert_eq!(links[0].id, "first");
+    assert_eq!(links[2].id, "second");
+    assert_ne!(links[0].id, links[4].id);
+    assert_ne!(links[2].id, links[4].id);
+    assert!(links.iter().all(|link| link.uri == "https://example.com"));
+
+    client.write(b"\r\nchanged".to_vec()).unwrap();
+    update_until(
+        "hyperlink delta",
+        &client,
+        &mut cached,
+        |update| matches!(update, FrameUpdate::Delta(delta) if delta.rows.iter().any(|row| row.line == 1 && row.row.text.starts_with("changed"))),
+    );
+    let replacement = SessionClient::attach(client.descriptor().clone()).unwrap();
+    let recovered = replacement.snapshot().unwrap();
+    assert_eq!(cached.rows[0].extras, recovered.rows[0].extras);
+    replacement.close().unwrap();
+}
+
 fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
