@@ -1309,12 +1309,10 @@ impl RemoteView {
                             error = %error,
                             "cached session frame delta did not match; requesting full snapshot"
                         );
-                        self.delta_resync_logged = true;
-                    }
-                    if let Some(session) = self.session.as_ref() {
-                        if let Err(error) = session.enqueue(SessionCommand::Snapshot) {
-                            session.record_command_error(error);
-                        }
+                        self.delta_resync_logged =
+                            self.session.as_ref().is_some_and(|session| {
+                                session.enqueue(SessionCommand::Snapshot).is_ok()
+                            });
                     }
                     break;
                 }
@@ -1995,7 +1993,7 @@ fn decode_extras(extra: &rio_session::protocol::ExtrasFrame) -> Extras {
         hyperlink: extra
             .hyperlink
             .as_ref()
-            .map(|uri| Hyperlink::new(None::<String>, uri.clone())),
+            .map(|link| Hyperlink::new(Some(link.id.as_str()), link.uri.as_str())),
     }
 }
 
@@ -2234,7 +2232,10 @@ mod tests {
             styles: vec![default_style()],
             extras: vec![Some(rio_session::protocol::ExtrasFrame {
                 zero_width: vec![0x301],
-                hyperlink: Some("https://example.com".into()),
+                hyperlink: Some(rio_session::protocol::HyperlinkFrame {
+                    id: "example".into(),
+                    uri: "https://example.com".into(),
+                }),
             })],
             kitty_virtual_placeholder: false,
             text: "a\u{301}".into(),
@@ -2311,6 +2312,21 @@ mod tests {
         );
         assert!(!view.grid.rows[0].dirty);
         assert!(view.grid.rows[1].dirty);
+    }
+
+    #[test]
+    fn decoded_hyperlink_preserves_explicit_id() {
+        let extra = rio_session::protocol::ExtrasFrame {
+            zero_width: Vec::new(),
+            hyperlink: Some(rio_session::protocol::HyperlinkFrame {
+                id: "shared-target".into(),
+                uri: "https://example.com".into(),
+            }),
+        };
+
+        let hyperlink = decode_extras(&extra).hyperlink.unwrap();
+        assert_eq!(hyperlink.id(), "shared-target");
+        assert_eq!(hyperlink.uri(), "https://example.com");
     }
 
     #[test]
@@ -2398,6 +2414,56 @@ mod tests {
             view.pending_frame_damage,
             rio_backend::event::TerminalDamage::Noop
         );
+    }
+
+    #[test]
+    fn delta_resync_retries_after_snapshot_queue_pressure() {
+        let (handle, receiver) = selection_test_handle(1);
+        handle
+            .enqueue(SessionCommand::Write(b"occupied".to_vec()))
+            .unwrap();
+        let mut view = RemoteView::from_frame(
+            frame(
+                1,
+                1,
+                vec![RowFrame {
+                    cells: vec![CellFrame {
+                        content: CellContentFrame::Codepoint('a' as u32),
+                        wide: 0,
+                        flags: 0,
+                    }],
+                    styles: vec![default_style()],
+                    extras: vec![None],
+                    kitty_virtual_placeholder: false,
+                    text: "a".into(),
+                }],
+            ),
+            WindowId::from(0),
+        );
+        view.install_session(handle.clone());
+
+        let publish_mismatched_delta = || {
+            let mut update = delta(1, 1, 2, Vec::new());
+            update.base_sequence = 2;
+            handle
+                .state
+                .publish_frame_update(FrameUpdate::Delta(update));
+        };
+
+        publish_mismatched_delta();
+        view.refresh();
+        assert!(!view.delta_resync_logged);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(PumpCommand::Terminal(SessionCommand::Write(_)))
+        ));
+
+        publish_mismatched_delta();
+        view.refresh();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(PumpCommand::Terminal(SessionCommand::Snapshot))
+        ));
     }
 
     #[test]
@@ -3096,7 +3162,10 @@ mod tests {
                 styles: vec![default_style()],
                 extras: vec![Some(rio_session::protocol::ExtrasFrame {
                     zero_width: vec![0x301],
-                    hyperlink: Some("https://example.com".into()),
+                    hyperlink: Some(rio_session::protocol::HyperlinkFrame {
+                        id: "example".into(),
+                        uri: "https://example.com".into(),
+                    }),
                 })],
                 kitty_virtual_placeholder: false,
                 text: "x\u{301}".into(),
@@ -3137,7 +3206,10 @@ mod tests {
                 styles.push(default_style());
                 extras.push(Some(rio_session::protocol::ExtrasFrame {
                     zero_width: vec![],
-                    hyperlink: Some(format!("https://{index}.invalid")),
+                    hyperlink: Some(rio_session::protocol::HyperlinkFrame {
+                        id: index.to_string(),
+                        uri: format!("https://{index}.invalid"),
+                    }),
                 }));
             }
             rows.push(RowFrame {

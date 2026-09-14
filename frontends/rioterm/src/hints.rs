@@ -12,6 +12,7 @@ pub(crate) trait HintGrid {
     fn columns(&self) -> usize;
     fn screen_lines(&self) -> usize;
     fn history_size(&self) -> usize;
+    fn topmost_line(&self) -> Line;
     fn bottommost_line(&self) -> Line;
     fn display_offset(&self) -> usize;
     fn cell(&self, pos: Pos) -> Option<&Square>;
@@ -30,6 +31,10 @@ impl<T: EventListener> HintGrid for Crosswords<T> {
 
     fn history_size(&self) -> usize {
         self.history_size()
+    }
+
+    fn topmost_line(&self) -> Line {
+        Dimensions::topmost_line(self)
     }
 
     fn bottommost_line(&self) -> Line {
@@ -72,8 +77,12 @@ impl HintGrid for crate::context::session::RemoteView {
         self.history_size()
     }
 
+    fn topmost_line(&self) -> Line {
+        Line(-(self.display_offset() as i32))
+    }
+
     fn bottommost_line(&self) -> Line {
-        self.bottommost_line()
+        Line(self.screen_lines() as i32 - 1 - self.display_offset() as i32)
     }
 
     fn display_offset(&self) -> usize {
@@ -81,8 +90,8 @@ impl HintGrid for crate::context::session::RemoteView {
     }
 
     fn cell(&self, pos: Pos) -> Option<&Square> {
-        if pos.row.0 < -(self.history_size() as i32)
-            || pos.row > self.bottommost_line()
+        if pos.row.0 < -(self.display_offset() as i32)
+            || pos.row.0 > self.screen_lines() as i32 - 1 - self.display_offset() as i32
             || pos.col.0 >= self.columns()
         {
             return None;
@@ -97,85 +106,6 @@ impl HintGrid for crate::context::session::RemoteView {
     fn cell_hyperlink(&self, pos: Pos) -> Option<Hyperlink> {
         self.cell_hyperlink(pos)
     }
-}
-
-/// Extract the visible text of `line` together with a byte-offset → grid
-/// column mapping. Spacer cells (the trailing half of a wide glyph, and
-/// the `LeadingSpacer` placed at the soft-wrap boundary) are skipped:
-/// they carry a placeholder `' '` that is not a separate visible
-/// character and would otherwise desynchronize the byte-to-column map.
-///
-/// `byte_to_col[i]` is the grid column of the cell whose codepoint's
-/// UTF-8 encoding contains byte `i` of the returned string. Trailing
-/// whitespace is left intact so the mapping stays aligned across the
-/// full row.
-///
-/// Used by the regex hint pipeline to convert onig's byte offsets
-/// (which would otherwise mis-locate the click target when emoji or
-/// CJK glyphs precede a URL) back into grid columns.
-pub(crate) fn extract_line_text_with_cols<T: HintGrid>(
-    term: &T,
-    line: Line,
-) -> (String, Vec<Column>) {
-    let mut text = String::with_capacity(term.columns());
-    let mut byte_to_col = Vec::with_capacity(term.columns());
-
-    for col in (0..term.columns()).map(Column) {
-        let pos = Pos::new(line, col);
-        let Some(cell) = term.cell(pos) else { continue };
-        if cell.is_spacer() || cell.is_leading_spacer() {
-            continue;
-        }
-
-        for c in term
-            .cell_text(pos)
-            .into_iter()
-            .map(|c| if c == '\0' { ' ' } else { c })
-        {
-            text.push(c);
-            byte_to_col.extend(std::iter::repeat_n(col, c.len_utf8()));
-        }
-    }
-
-    (text, byte_to_col)
-}
-
-pub(crate) fn regex_match<T: HintGrid>(
-    term: &T,
-    line: Line,
-    line_text: &str,
-    byte_to_col: &[Column],
-    start: usize,
-    end: usize,
-    hint: Rc<Hint>,
-) -> Option<HintMatch> {
-    if start == end || end > byte_to_col.len() {
-        return None;
-    }
-
-    let mut text = line_text[start..end].to_string();
-    if hint.post_processing {
-        text = post_process_hyperlink_uri(&text);
-    }
-    if text.is_empty() {
-        return None;
-    }
-
-    let start_col = byte_to_col[start];
-    let mut end_col = byte_to_col[start + text.len() - 1];
-    if term
-        .cell(Pos::new(line, end_col))
-        .is_some_and(|square| square.is_wide())
-    {
-        end_col += 1;
-    }
-
-    Some(HintMatch {
-        text,
-        start: Pos::new(line, start_col),
-        end: Pos::new(line, end_col),
-        hint,
-    })
 }
 
 /// State for hint selection mode
@@ -388,27 +318,41 @@ impl HintState {
         let display_offset = term.display_offset();
         let visible_lines = term.screen_lines();
 
-        // Scan each visible line for matches
+        let visible_top = -(display_offset as i32);
+        let visible_bottom = visible_top + visible_lines as i32 - 1;
+        let mut scanned_lines = HashSet::new();
+
+        // Scan each visible logical line for matches. A terminal soft wrap is
+        // not a newline, so regexes must see the joined text rather than a
+        // truncated row fragment.
         for line_idx in 0..visible_lines {
             let line = Line(line_idx as i32 - display_offset as i32);
-            // Extract text plus a byte→grid-column mapping so regex byte
-            // offsets translate back to the right cells when the line
-            // contains wide glyphs or multibyte codepoints.
-            let (line_text, byte_to_col) = extract_line_text_with_cols(term, line);
+            if scanned_lines.contains(&line.0) {
+                continue;
+            }
+            let Some(logical_line) =
+                LogicalLine::extract(term, Pos::new(line, Column(0)))
+            else {
+                continue;
+            };
+            let Some(last_cell) = logical_line.map.last() else {
+                continue;
+            };
+            scanned_lines.extend(line.0..=last_cell.row.0);
 
-            // Find all matches in this line. Onig yields (byte_start, byte_end);
-            for (start, end) in regex.find_iter(&line_text) {
-                if let Some(hint_match) = regex_match(
-                    term,
-                    line,
-                    &line_text,
-                    &byte_to_col,
-                    start,
-                    end,
-                    hint.clone(),
-                ) {
-                    self.matches.push(hint_match);
+            for grid_match in logical_line.find_matches(term, regex, hint.post_processing)
+            {
+                if grid_match.start.row.0 < visible_top
+                    || grid_match.start.row.0 > visible_bottom
+                {
+                    continue;
                 }
+                self.matches.push(HintMatch {
+                    text: grid_match.text,
+                    start: grid_match.start,
+                    end: grid_match.end,
+                    hint: hint.clone(),
+                });
             }
         }
     }
@@ -594,7 +538,7 @@ impl LogicalLine {
         const SCAN_CELLS: usize = 2048;
 
         let cols = term.columns();
-        let topmost = -(term.history_size() as i32);
+        let topmost = term.topmost_line().0;
         let bottommost = term.bottommost_line().0;
         if cols == 0
             || point.row.0 < topmost
@@ -661,6 +605,91 @@ impl LogicalLine {
         Some(LogicalLine { text, map })
     }
 
+    fn find_matches<'a, T: HintGrid>(
+        &'a self,
+        term: &'a T,
+        regex: &'a onig::Regex,
+        post_processing: bool,
+    ) -> impl Iterator<Item = GridMatch> + 'a {
+        let cols = term.columns();
+        let text = &self.text;
+        let map = &self.map;
+
+        // Manual search loop instead of `find_iter` so each attempt
+        // carries a retry budget. The text is terminal output, i.e.
+        // attacker-controlled, the pattern is user-config, and this
+        // runs on mouse movement: unbounded backtracking here is a
+        // denial of service. Hitting the budget reads as "no more
+        // matches".
+        const RETRY_LIMIT: u32 = 100_000;
+
+        let mut region = onig::Region::new();
+        let mut offset = 0;
+        std::iter::from_fn(move || {
+            while offset < text.len() {
+                region.clear();
+                let match_param = onig::MatchParam::default();
+                // The in-search limit bounds the whole call, every start
+                // position included; the in-match limit the safe wrapper
+                // exposes is per attempt, which a long pathological line
+                // multiplies by its length. Safety: `as_raw` is a live
+                // pointer for the parameter owned just above.
+                unsafe {
+                    onig_sys::onig_set_retry_limit_in_search_of_match_param(
+                        match_param.as_raw(),
+                        RETRY_LIMIT.into(),
+                    );
+                }
+                match regex.search_with_param(
+                    text.as_str(),
+                    offset,
+                    text.len(),
+                    onig::SearchOptions::SEARCH_OPTION_NONE,
+                    Some(&mut region),
+                    match_param,
+                ) {
+                    Ok(Some(_)) => (),
+                    Ok(None) | Err(_) => return None,
+                }
+                let (m_start, m_end) = region.pos(0)?;
+                // Guard against a stalled loop on an empty match.
+                offset = m_end.max(m_start + 1);
+
+                if m_start >= m_end || m_end > map.len() {
+                    continue;
+                }
+                let start = map[m_start];
+
+                let trimmed_len = if post_processing {
+                    trim_match_tail(&text[m_start..m_end])
+                } else {
+                    m_end - m_start
+                };
+                if trimmed_len == 0 {
+                    continue;
+                }
+                let mut end = map[m_start + trimmed_len - 1];
+
+                // A match ending on a wide character owns its spacer cell
+                // too, so the hover underline covers the full glyph.
+                if end.col.0 + 1 < cols
+                    && term
+                        .cell(end)
+                        .is_some_and(|square| square.wide() == Wide::Wide)
+                {
+                    end.col = Column(end.col.0 + 1);
+                }
+
+                return Some(GridMatch {
+                    start,
+                    end,
+                    text: text[m_start..m_start + trimmed_len].to_string(),
+                });
+            }
+            None
+        })
+    }
+
     /// Find the regex match covering `point` in this line.
     ///
     /// Cell bounds come through the byte-to-cell map, never from byte
@@ -676,91 +705,14 @@ impl LogicalLine {
         regex: &onig::Regex,
         post_processing: bool,
     ) -> Option<GridMatch> {
-        let cols = term.columns();
-        let text = &self.text;
-        let map = &self.map;
-
-        // Manual search loop instead of `find_iter` so each attempt
-        // carries a retry budget. The text is terminal output, i.e.
-        // attacker-controlled, the pattern is user-config, and this
-        // runs on mouse movement: unbounded backtracking here is a
-        // denial of service. Hitting the budget reads as "no more
-        // matches".
-        const RETRY_LIMIT: u32 = 100_000;
-
-        let mut region = onig::Region::new();
-        let mut offset = 0;
-        while offset < text.len() {
-            region.clear();
-            let match_param = onig::MatchParam::default();
-            // The in-search limit bounds the whole call, every start
-            // position included; the in-match limit the safe wrapper
-            // exposes is per attempt, which a long pathological line
-            // multiplies by its length. Safety: `as_raw` is a live
-            // pointer for the parameter owned just above.
-            unsafe {
-                onig_sys::onig_set_retry_limit_in_search_of_match_param(
-                    match_param.as_raw(),
-                    RETRY_LIMIT.into(),
-                );
-            }
-            match regex.search_with_param(
-                text.as_str(),
-                offset,
-                text.len(),
-                onig::SearchOptions::SEARCH_OPTION_NONE,
-                Some(&mut region),
-                match_param,
-            ) {
-                Ok(Some(_)) => (),
-                Ok(None) | Err(_) => break,
-            }
-            let Some((m_start, m_end)) = region.pos(0) else {
-                break;
-            };
-            // Guard against a stalled loop on an empty match.
-            offset = m_end.max(m_start + 1);
-
-            if m_start >= m_end || m_end > map.len() {
-                continue;
-            }
-            let start = map[m_start];
-            if point < start {
-                // Matches arrive in order; everything further is past
-                // the point.
+        for grid_match in self.find_matches(term, regex, post_processing) {
+            if point < grid_match.start {
                 break;
             }
-
-            let trimmed_len = if post_processing {
-                trim_match_tail(&text[m_start..m_end])
-            } else {
-                m_end - m_start
-            };
-            if trimmed_len == 0 {
-                continue;
+            if point <= grid_match.end {
+                return Some(grid_match);
             }
-            let mut end = map[m_start + trimmed_len - 1];
-            if point > end {
-                continue;
-            }
-
-            // A match ending on a wide character owns its spacer cell
-            // too, so the hover underline covers the full glyph.
-            if end.col.0 + 1 < cols
-                && term
-                    .cell(end)
-                    .is_some_and(|square| square.wide() == Wide::Wide)
-            {
-                end.col = Column(end.col.0 + 1);
-            }
-
-            return Some(GridMatch {
-                start,
-                end,
-                text: text[m_start..m_start + trimmed_len].to_string(),
-            });
         }
-
         None
     }
 }
@@ -917,7 +869,7 @@ pub(crate) fn post_process_hyperlink_uri(uri: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_backend::config::hints::{HintAction, HintInternalAction};
+    use rio_backend::config::hints::{HintAction, HintInternalAction, DEFAULT_URL_REGEX};
 
     fn hint() -> Rc<Hint> {
         Rc::new(Hint {
@@ -976,11 +928,12 @@ mod tests {
 
     #[test]
     fn extraction_renders_empty_cells_as_spaces() {
-        let terminal = mock_term_with_line("");
-        let (text, columns) = extract_line_text_with_cols(&terminal, Line(0));
+        let mut terminal = mock_term_with_line("a");
+        terminal.grid[Line(0)][Column(4)].set_c('b');
+        let line = LogicalLine::extract(&terminal, Pos::new(Line(0), Column(0))).unwrap();
 
-        assert_eq!(text, " ".repeat(terminal.grid.columns()));
-        assert_eq!(columns.len(), terminal.grid.columns());
+        assert_eq!(line.text, "a   b");
+        assert_eq!(line.map.len(), 5);
     }
 
     #[test]
@@ -1184,7 +1137,6 @@ mod tests {
     // first and last cells.
     // -----------------------------------------------------------------
     use rio_backend::ansi::CursorShape;
-    use rio_backend::config::hints::DEFAULT_URL_REGEX;
     use rio_backend::crosswords::square::Wide;
     use rio_backend::crosswords::Crosswords;
     use rio_backend::crosswords::CrosswordsSize;
@@ -1475,6 +1427,30 @@ mod tests {
         assert_eq!(from_second, from_first);
 
         assert!(match_at(&term, 1, 13).is_none(), "prose after the url");
+    }
+
+    #[test]
+    fn test_regex_matches_wrapped_url_for_labels() {
+        let term = mock_term("see http://examp\nle.com/path here");
+        let regex = url_regex();
+        let hint = Rc::new(Hint {
+            regex: Some(DEFAULT_URL_REGEX.to_string()),
+            hyperlinks: false,
+            post_processing: true,
+            persist: false,
+            action: HintAction::Action {
+                action: HintInternalAction::Copy,
+            },
+            mouse: Default::default(),
+            binding: None,
+        });
+        let mut state = HintState::new("abc".to_string());
+        state.find_regex_matches(&term, &regex, hint);
+
+        assert_eq!(state.matches.len(), 1);
+        assert_eq!(state.matches[0].text, "http://example.com/path");
+        assert_eq!(state.matches[0].start, Pos::new(Line(0), Column(4)));
+        assert_eq!(state.matches[0].end, Pos::new(Line(1), Column(10)));
     }
 
     // A URL deep inside a huge fully-wrapped logical line still
