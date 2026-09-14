@@ -1,7 +1,7 @@
 use crate::protocol::{
     AtlasPlacementFrame, CellContentFrame, CellFrame, ColorFrame, CursorFrame,
     ExtrasFrame, FrameDelta, FrameUpdate, FullFrame, GraphicFrame, GraphicsFrame,
-    KittyPlacementFrame, RowFrame, RowUpdate, SelectionFrame, StyleFrame,
+    HyperlinkFrame, KittyPlacementFrame, RowFrame, RowUpdate, SelectionFrame, StyleFrame,
     VirtualPlacementFrame, MAX_FRAME_GRAPHICS_BYTES, MAX_FRAME_SIZE, MAX_GRAPHICS_ITEMS,
     MAX_IMAGE_BYTES,
 };
@@ -306,10 +306,12 @@ impl Snapshotter {
                     .and_then(|id| self.render_state.extras().get(&id))
                     .map(|extras| ExtrasFrame {
                         zero_width: extras.zerowidth.iter().map(|c| *c as u32).collect(),
-                        hyperlink: extras
-                            .hyperlink
-                            .as_ref()
-                            .map(|hyperlink| hyperlink.uri().to_string()),
+                        hyperlink: extras.hyperlink.as_ref().map(|hyperlink| {
+                            HyperlinkFrame {
+                                id: hyperlink.id().to_string(),
+                                uri: hyperlink.uri().to_string(),
+                            }
+                        }),
                     })
             })
             .collect();
