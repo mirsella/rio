@@ -1,6 +1,6 @@
 # Session Isolation
 
-**Status:** the standalone worker/client boundary is implemented as protocol v4
+**Status:** the standalone worker/client boundary is implemented as protocol v5
 and exercised on Linux. The default `rioterm` compositor owns one session
 client per pane, renders validated passive frames through resident Sugarloaf
 grids, and supports authenticated cross-window transfer and explicit
@@ -60,11 +60,11 @@ commands cover structured snapshots, committed byte/text input, platform-
 neutral key input, resize (including pixel dimensions), scroll, mouse,
 selection, search, VI navigation, focus, terminal requests, child PID, and
 terminal options. Semantic cells, cursor blink state, bounded graphics, and
-serializable callback requests are part of the v4 frame/event contract. Current
+serializable callback requests are part of the v5 frame/event contract. Current
 events are bounded and coalesced, with explicit lifecycle, request refusal and
 expiry, notifications, and clipboard-overflow reporting.
 
-The wire protocol is **v4**, using native bincode 2 `Encode`/`Decode`, not
+The wire protocol is **v5**, using native bincode 2 `Encode`/`Decode`, not
 serde. It has four-byte little-endian length framing, strict exact/trailing-byte
 checks, a 16 MiB semantic frame limit, absolute I/O deadlines, authenticated private
 Unix sockets, and nested bounds for messages, collections, terminal frames,
@@ -96,7 +96,7 @@ writers, so reconnect/reclaim of the current generation is the recovery path.
 
 ## Input and view boundaries
 
-Raw `Write` and `Paste` are not a substitute for key semantics. The v4 `Key`
+Raw `Write` and `Paste` are not a substitute for key semantics. The v5 `Key`
 command uses platform-neutral key types and lets the worker's terminal core
 perform mode/Kitty/Alt-meta encoding.
 
@@ -146,8 +146,8 @@ the repository acceptance harness, not by a unit test alone.
 
 Moving a tab or split between windows is not renderer-buffer handoff. Rio uses a
 distinct authenticated window-control protocol. The current channel is
-**WindowControl v4**, separate from the session wire protocol v4 even though
-both currently use version number 4. Its bounded transfer request carries the
+**WindowControl v4**, separate from the session wire protocol v5.
+Its bounded transfer request carries the
 target insertion index; the destination validates that index against the live
 terminal route and rejects stale targets before commit. The same prepared
 attachment path is used when a compositor explicitly chooses a saved recovery
@@ -427,7 +427,7 @@ the current PTY backend; neither limitation may be silently dropped.
 ### M1 — Standalone worker/client foundation (complete on Linux)
 
 - [x] Worker owns the PTY/parser/grid and survives client detach on Linux.
-- [x] v4 bounded/authenticated protocol, generation-fenced takeover, explicit
+- [x] v5 bounded/authenticated protocol, generation-fenced takeover, explicit
        close, final child status, and hostile transport cases are tested on
        Linux.
 - [x] PTY input queue and selection extraction are bounded before upstream
@@ -446,7 +446,7 @@ the current PTY backend; neither limitation may be silently dropped.
       per-route Sugarloaf grids with dynamic dimensions.
 - [x] Prepare hidden imported tabs through the same direct resource path before
       independent session commits.
-- [ ] Complete GPU effect/underline parity and zero-copy resource paths.
+- [ ] Complete cross-backend GPU effect and underline parity.
 
 ### M4 — Native compositor and cross-window transfer (Linux runtime integrated)
 
@@ -458,16 +458,15 @@ the current PTY backend; neither limitation may be silently dropped.
 ### M5 — Optional acceleration (integrated; parity remains scoped)
 
 - [x] Use the configured Sugarloaf CPU/native/WGPU window backend.
-- [ ] Add GPU zero-copy paths and complete CPU/GPU effect parity.
+- [ ] Profile remaining snapshot/upload costs before adding transport machinery.
 
-## Migration hotspots
+## Maintenance boundaries
 
-The first adapter must remove terminal ownership from the existing paths in
-`frontends/rioterm`: `application.rs`, `context/`, `screen/`, `hints.rs`,
-`layout/`, `renderer/`, bindings, IME, title/cwd handling, and `messenger.rs`.
-The initial slice is `Context`/`Renderable`: consume `FullFrame`, route worker
-commands, and leave layout/window presentation in the compositor. No GUI
-isolation claim is valid until those paths stop reaching `Crosswords`.
+`Context` owns the worker attachment and passive interaction data. `Screen`,
+bindings, hints, and IME use that data or submit worker commands. The window
+compositor owns layout, chrome, and resident GPU resources. Terminal parsing,
+scrollback, and authoritative selection remain in the worker; future frontend
+changes should use the existing command/snapshot boundary.
 
 ## Acceptance checklist
 

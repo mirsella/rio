@@ -46,10 +46,18 @@ window_for_pid() {
 }
 
 stop_tree() {
-    local root=$1 pid index
+    local root pid index
     local -a tree=()
-    [[ "$root" =~ ^[0-9]+$ ]] || return 0
-    mapfile -t tree < <(printf '%s\n' "$root"; owned_descendants "$root")
+    local -A seen=()
+    # Capture every tree before stopping a display can orphan its Rio workers.
+    for root in "$@"; do
+        [[ "$root" =~ ^[1-9][0-9]*$ ]] || continue
+        while read -r pid; do
+            [[ -n "$pid" && ! ${seen[$pid]+present} ]] || continue
+            seen[$pid]=1
+            tree+=("$pid")
+        done < <(printf '%s\n' "$root"; owned_descendants "$root")
+    done
     for ((index = ${#tree[@]} - 1; index >= 0; index--)); do
         kill -TERM "${tree[index]}" 2>/dev/null || true
     done
@@ -63,7 +71,6 @@ stop_tree() {
 
 cleanup() {
     trap - EXIT INT TERM
-    local root
     local -a roots=()
     [[ ${PIDS+x} ]] && roots+=("${PIDS[@]}")
     [[ ${ORPHANS+x} ]] && roots+=("${ORPHANS[@]}")
@@ -72,9 +79,7 @@ cleanup() {
     [[ ${DBUS_PID+x} ]] && roots+=("$DBUS_PID")
     [[ ${CLIPBOARD_PID+x} ]] && roots+=("$CLIPBOARD_PID")
     roots+=("$@")
-    for root in "${roots[@]}"; do
-        stop_tree "$root"
-    done
+    stop_tree "${roots[@]}"
 }
 
 wait_until() {
