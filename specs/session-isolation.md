@@ -78,8 +78,8 @@ cursor, selection, palette, viewport, mode, title, and working-directory
 metadata. Graphics changes, resize, attachment/recovery, stale bases, and any
 publication mismatch return a complete frame. The worker keeps one active base,
 does not retain an unbounded history, and the delta is subject to the same
-encoded 16 MiB limit. Version 3 peers are rejected explicitly; there is no
-legacy delta shim.
+encoded 16 MiB limit. Peers using any other protocol version are rejected
+explicitly; there is no legacy delta shim.
 
 The first attachment completes `Claimed`/`Initial`/`Commit`/`Ready` without an
 `Offer`. A takeover is:
@@ -237,7 +237,7 @@ owned PIDs, logs, ACK files, and a bounded process snapshot:
 
 ```sh
 CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm \
-  cargo +nightly build -p rioterm --features x11,wgpu
+  cargo build -p rioterm --features x11,wgpu
 RIO_BIN="$PWD/target/debug/rio" \
 RIO_ACCEPT_USE_CPU=1 \
   ./scripts/session-isolation-acceptance.sh
@@ -395,7 +395,7 @@ The tested developer environment defaults to Cranelift, whose unsupported SSE2
 intrinsic aborted CPU presentation. Tests/builds used
 `CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm` and
 `CARGO_PROFILE_TEST_CODEGEN_BACKEND=llvm`, without changing user configuration.
-Build with `cargo +nightly build -p rioterm --features x11,wgpu`; default features
+Build with `cargo build -p rioterm --features x11,wgpu`; default features
 also include Wayland. The `wgpu` feature is needed for the frontend to parse and
 forward configured librashader filters. The focused frontend lifecycle test is
 `transferred_gui_exits_only_after_windows_and_preparations_are_gone`.
