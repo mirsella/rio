@@ -1254,15 +1254,17 @@ impl<'a> Application<'a> {
                     source_routes = Some(offer_routes);
                 }
                 let result = route.window.winit_window.start_toplevel_drag(drag_id);
-                if let Some(source_routes) = source_routes {
-                    self.track_outgoing_offer(
-                        state.token.as_bytes(),
-                        source,
-                        source_routes,
-                    );
-                }
                 Some(match result {
-                    Ok(()) => TabDragEvent::OwnerStarted { drag_id, owner },
+                    Ok(()) => {
+                        if let Some(source_routes) = source_routes {
+                            self.track_outgoing_offer(
+                                state.token.as_bytes(),
+                                source,
+                                source_routes,
+                            );
+                        }
+                        TabDragEvent::OwnerStarted { drag_id, owner }
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "could not start source tab drag owner");
                         TabDragEvent::OwnerStartFailed(drag_id)
@@ -1830,14 +1832,15 @@ impl<'a> Application<'a> {
                 TabDragEvent::OfferCancelled(offer_id)
             }
             ToplevelDragEvent::Finished { drag_id } => {
-                if let Some(drag) = self
-                    .tab_drag
-                    .as_mut()
-                    .filter(|drag| drag.drag_id == Some(drag_id) && drag.hover.is_none())
-                {
+                if self.tab_drag.as_ref().is_some_and(|drag| {
+                    drag.drag_id == Some(drag_id) && drag.hover.is_none()
+                }) {
                     // Foreign completion has no local hover. Wait for the
                     // authenticated commit response before removing source routes.
-                    drag.lifecycle = TabDragLifecycle::AwaitingFinish;
+                    self.dispatch_tab_drag_event(
+                        event_loop,
+                        TabDragEvent::ForeignFinished(drag_id),
+                    );
                     return;
                 }
                 TabDragEvent::SourceFinished(drag_id)
@@ -3334,7 +3337,7 @@ impl Application<'_> {
         }
     }
 
-    fn poll_window_control(&mut self) {
+    fn poll_window_control(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_recovery_probes();
         self.expire_merge_selection();
         self.expire_pending_prepared();
@@ -3469,7 +3472,7 @@ impl Application<'_> {
                         committed = result.is_ok(),
                         "received foreign drag commit result"
                     );
-                    self.finish_outgoing_transfer(transfer_id, result)
+                    self.finish_outgoing_transfer(event_loop, transfer_id, result)
                 }
                 crate::router::window_control::WindowControlEvent::ArmSelection {
                     window_id,
@@ -3695,6 +3698,7 @@ impl Application<'_> {
 
     fn finish_outgoing_transfer(
         &mut self,
+        event_loop: &ActiveEventLoop,
         transfer_id: [u8; 16],
         result: Result<Vec<u64>, String>,
     ) {
@@ -3729,14 +3733,6 @@ impl Application<'_> {
             routes = ?routes,
             "applying committed foreign drag routes"
         );
-        #[cfg(all(feature = "wayland", target_os = "linux"))]
-        if let Some(drag) = self
-            .tab_drag
-            .as_mut()
-            .filter(|drag| drag.token.as_bytes() == transfer_id)
-        {
-            drag.lifecycle = TabDragLifecycle::Complete(crate::tab_drag::Outcome::Moved);
-        }
         if let Some(route) = self.router.routes.get_mut(&pending.source_window) {
             route
                 .window
@@ -3767,6 +3763,11 @@ impl Application<'_> {
                 "foreign drag source window disappeared before route removal"
             );
         }
+        #[cfg(all(feature = "wayland", target_os = "linux"))]
+        self.dispatch_tab_drag_event(
+            event_loop,
+            TabDragEvent::ForeignCommitted(transfer_id),
+        );
     }
 
     fn report_outgoing_transfer_error(
@@ -6328,6 +6329,14 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             .set_enabled(true);
                     }
                     Ime::Disabled => {
+                        let had_preedit = route
+                            .window
+                            .screen
+                            .context_manager
+                            .current()
+                            .ime
+                            .preedit()
+                            .is_some();
                         route
                             .window
                             .screen
@@ -6335,6 +6344,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             .current_mut()
                             .ime
                             .set_enabled(false);
+                        if had_preedit {
+                            route.request_redraw();
+                        }
                     }
                 }
             }
@@ -6538,7 +6550,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        self.poll_window_control();
+        self.poll_window_control(event_loop);
 
         if self.poll_deferred_session_exit(event_loop) {
             return;

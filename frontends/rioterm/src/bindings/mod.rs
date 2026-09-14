@@ -967,9 +967,10 @@ pub fn create_hint_bindings(
     for hint_config in hints_config {
         if let Some(binding_config) = &hint_config.binding {
             // Parse key using the same logic as in convert()
-            let (key, location) = match binding_config.key.to_lowercase().as_str() {
+            let key_name = binding_config.key.to_lowercase();
+            let (key, location) = match key_name.as_str() {
                 // Letters
-                single_char if single_char.len() == 1 => {
+                single_char if single_char.chars().count() == 1 => {
                     (Key::Character(single_char.into()), KeyLocation::Standard)
                 }
                 // Named keys
@@ -1024,11 +1025,35 @@ pub fn create_hint_bindings(
                 }
             }
 
+            let mut mode = BindingMode::empty();
+            let mut notmode = BindingMode::SEARCH | BindingMode::VI;
+            for mode_str in &binding_config.mode {
+                match mode_str.trim().to_lowercase().as_str() {
+                    "appcursor" => mode |= BindingMode::APP_CURSOR,
+                    "~appcursor" => notmode |= BindingMode::APP_CURSOR,
+                    "appkeypad" => mode |= BindingMode::APP_KEYPAD,
+                    "~appkeypad" => notmode |= BindingMode::APP_KEYPAD,
+                    "alt" => mode |= BindingMode::ALT_SCREEN,
+                    "~alt" => notmode |= BindingMode::ALT_SCREEN,
+                    "search" => {
+                        mode |= BindingMode::SEARCH;
+                        notmode.remove(BindingMode::SEARCH);
+                    }
+                    "~search" => notmode |= BindingMode::SEARCH,
+                    "vi" => {
+                        mode |= BindingMode::VI;
+                        notmode.remove(BindingMode::VI);
+                    }
+                    "~vi" => notmode |= BindingMode::VI,
+                    _ => tracing::warn!("Unknown mode '{}' in hint binding", mode_str),
+                }
+            }
+
             let hint_binding = KeyBinding {
                 trigger: BindingKey::Keycode { key, location },
                 mods,
-                mode: BindingMode::empty(),
-                notmode: BindingMode::SEARCH | BindingMode::VI,
+                mode,
+                notmode,
                 action: Action::Hint(std::rc::Rc::new(hint_config.clone())),
             };
 
@@ -1675,6 +1700,45 @@ mod tests {
 
         assert_eq!(f2_bindings.len(), 1);
         assert!(matches!(f2_bindings[0].action, Action::Hint(_)));
+    }
+
+    #[test]
+    fn hint_binding_accepts_unicode_character() {
+        let mut config = rio_backend::config::Config::default();
+        config.hints.rules[0].binding = Some(rio_backend::config::hints::HintBinding {
+            key: "Я".into(),
+            mods: Vec::new(),
+            mode: Vec::new(),
+        });
+
+        let bindings = create_hint_bindings(&config.hints.rules);
+
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(
+            bindings[0].trigger,
+            BindingKey::Keycode {
+                key: Key::Character("я".into()),
+                location: KeyLocation::Standard,
+            }
+        );
+    }
+
+    #[test]
+    fn hint_binding_uses_configured_modes() {
+        let mut config = rio_backend::config::Config::default();
+        config.hints.rules[0].binding = Some(rio_backend::config::hints::HintBinding {
+            key: "h".into(),
+            mods: Vec::new(),
+            mode: vec!["AppCursor".into(), "~Alt".into()],
+        });
+
+        let binding = &create_hint_bindings(&config.hints.rules)[0];
+
+        assert_eq!(binding.mode, BindingMode::APP_CURSOR);
+        assert_eq!(
+            binding.notmode,
+            BindingMode::SEARCH | BindingMode::VI | BindingMode::ALT_SCREEN
+        );
     }
 
     #[test]
