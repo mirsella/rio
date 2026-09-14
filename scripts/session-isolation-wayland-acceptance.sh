@@ -19,7 +19,6 @@ TMP_DIR="$ARTIFACT_ROOT/t-$$"
 RIO_BIN=${RIO_BIN:-"$ROOT/target/debug/rio"}
 KWIN=${KWIN:-/usr/bin/kwin_wayland}
 DBUS_RUN_SESSION=${DBUS_RUN_SESSION:-/usr/bin/dbus-run-session}
-VULKANINFO=${VULKANINFO:-/usr/bin/vulkaninfo}
 RIO_ACCEPT_WAYLAND_SOCKET=${RIO_ACCEPT_WAYLAND_SOCKET:-rio-accept-wayland}
 XVFB=${XVFB:-/usr/bin/Xvfb}
 XDPYINFO=${XDPYINFO:-/usr/bin/xdpyinfo}
@@ -57,7 +56,7 @@ if [[ "$USE_PRIVATE_X11" == 1 || "$USE_PRIVATE_X11" == true || "$USE_PRIVATE_X11
     log "private Xvfb host ready display=$DISPLAY pid=$xvfb_pid"
 fi
 
-for command in "$KWIN" "$DBUS_RUN_SESSION" "$VULKANINFO" pgrep ps grep; do
+for command in "$KWIN" "$DBUS_RUN_SESSION" pgrep ps grep; do
     require_command "$command"
 done
 [[ -x "$RIO_BIN" ]] || die "RIO_BIN is not executable: $RIO_BIN"
@@ -106,12 +105,13 @@ wait_until "Wayland Rio direct-render startup" 30 \
     "[[ -f \"$rio_log\" ]] && kill -0 $rio_wrapper_pid 2>/dev/null"
 log "live Wayland frontend reached the direct Sugarloaf render path"
 
-wait_until "Vulkan hardware summary" 15 \
-    "XDG_RUNTIME_DIR=\"$RUNTIME_DIR\" \"$VULKANINFO\" --summary >\"$LOG_DIR/vulkaninfo.log\" 2>&1"
-if ! grep -Eiq 'AMD|RADV|GPU' "$LOG_DIR/vulkaninfo.log"; then
-    die "Vulkan summary did not identify a GPU; inspect $LOG_DIR/vulkaninfo.log"
+if [[ "$rio_use_cpu" == false ]]; then
+    wait_until "Rio GPU device and surface initialization" 30 \
+        "kill -0 $rio_wrapper_pid 2>/dev/null && grep -Eq 'Vulkan device created:|Selected adapter:' \"$rio_log\" && grep -Eq 'Swapchain:|Surface format:' \"$rio_log\""
+    grep -E 'Vulkan device created:|Selected adapter:|Swapchain:|Surface format:' \
+        "$rio_log" | tee -a "$RUN_DIR/summary.log"
+    log "GPU startup verified from the tested Rio process"
 fi
-log "Vulkan hardware summary captured"
 
 {
     printf '\n[%s] process snapshot (nested Wayland direct GPU)\n' "$(date -u +%H:%M:%S)"
@@ -124,5 +124,5 @@ log "Vulkan hardware summary captured"
         ps -p "$pid" -o pid=,ppid=,%cpu=,rss=,args= 2>/dev/null || true
     done
 } | tee -a "$RUN_DIR/summary.log"
-log "PASS: private nested Wayland direct GPU startup completed"
+log "PASS: private nested Wayland direct rendering startup completed (use-cpu=$rio_use_cpu)"
 log "UNVERIFIED: native Wayland DnD and target-local pointer click require a native Wayland input injector not used by this harness"
