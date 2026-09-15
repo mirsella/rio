@@ -45,7 +45,9 @@ mod unix {
     use std::time::{Duration, Instant};
 
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
-    const CONNECTION_TIMEOUT: Duration = Duration::from_millis(250);
+    /// Frames carry terminal output and input, which can be far larger than a
+    /// handshake message, so a client gets much longer to move one.
+    const FRAME_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
     const IDLE_RETENTION: Duration = Duration::from_secs(300);
     const MAX_CONNECTIONS: usize = 8;
     const TERMINAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2026,7 +2028,13 @@ mod unix {
                                 shared: shared_for_thread.clone(),
                                 fd,
                             };
-                            let _ = handle_connection(shared_for_thread, stream, fd);
+                            if let Err(error) =
+                                handle_connection(shared_for_thread, stream, fd)
+                            {
+                                eprintln!(
+                                    "rio-session-worker: connection failed: {error}"
+                                );
+                            }
                         }) {
                         Ok(thread) => connection_threads.push(thread),
                         Err(error) => {
@@ -2060,16 +2068,21 @@ mod unix {
             return Ok(());
         }
         if !peer_is_current_user(&stream) {
+            eprintln!("rio-session-worker: rejected a connection from another user");
             return Ok(());
         }
-        stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
-        stream.set_write_timeout(Some(CONNECTION_TIMEOUT))?;
+        // BSD accept() keeps O_NONBLOCK from the listening socket; the codec
+        // writes and reads directly and waits on poll when it would block.
+        stream
+            .set_nonblocking(true)
+            .map_err(|error| codec::step_error("set connection mode", error))?;
 
         let hello = {
             let message = codec::read_frame_until::<ClientMessage>(
                 &mut stream,
                 Instant::now() + HANDSHAKE_TIMEOUT,
-            )?;
+            )
+            .map_err(|error| codec::step_error("read hello", error))?;
             message.validate()?;
             match message {
                 ClientMessage::Hello {
@@ -2122,14 +2135,6 @@ mod unix {
                 return Err(error);
             }
         };
-        if let Err(error) = stream.set_read_timeout(Some(CONNECTION_TIMEOUT)) {
-            detach(&shared, generation);
-            return Err(error.into());
-        }
-        if let Err(error) = stream.set_write_timeout(Some(CONNECTION_TIMEOUT)) {
-            detach(&shared, generation);
-            return Err(error.into());
-        }
         let result = run_attachment(&shared, &mut stream, generation, &active_wakeup);
         if !shared.closing.load(Ordering::Acquire) && is_active(&shared, generation) {
             detach(&shared, generation);
@@ -2185,11 +2190,13 @@ mod unix {
                     generation: current_generation,
                 },
                 Instant::now() + HANDSHAKE_TIMEOUT,
-            )?;
+            )
+            .map_err(|error| codec::step_error("send offer", error))?;
             let claim = codec::read_frame_until::<ClientMessage>(
                 stream,
                 Instant::now() + HANDSHAKE_TIMEOUT,
-            )?;
+            )
+            .map_err(|error| codec::step_error("read claim", error))?;
             claim.validate()?;
             let ClientMessage::Claim { generation } = claim else {
                 return Err(SessionError::protocol("attachment claim missing"));
@@ -2219,21 +2226,27 @@ mod unix {
                 .runtime
                 .as_mut()
                 .ok_or_else(|| SessionError::protocol("session runtime missing"))?;
-            runtime.snapshots.full_frame(&runtime.surface)?
+            runtime
+                .snapshots
+                .full_frame(&runtime.surface)
+                .map_err(|error| codec::step_error("snapshot frame", error))?
         };
 
         codec::write_frame_until(
             stream,
             &ServerMessage::Claimed { generation },
             Instant::now() + HANDSHAKE_TIMEOUT,
-        )?;
+        )
+        .map_err(|error| codec::step_error("send claimed", error))?;
         codec::write_frame_until(
             stream,
             &ServerMessage::Initial { generation, frame },
-            Instant::now() + HANDSHAKE_TIMEOUT,
-        )?;
+            Instant::now() + FRAME_TRANSFER_TIMEOUT,
+        )
+        .map_err(|error| codec::step_error("send initial", error))?;
         let initial_sent_at = Instant::now();
-        read_prepared_commit(stream, generation, initial_sent_at)?;
+        read_prepared_commit(stream, generation, initial_sent_at)
+            .map_err(|error| codec::step_error("read commit", error))?;
 
         let old_fd = {
             let mut state = shared
@@ -2275,7 +2288,8 @@ mod unix {
                 generation,
             },
             Instant::now() + HANDSHAKE_TIMEOUT,
-        );
+        )
+        .map_err(|error| codec::step_error("send ready", error));
         if let Err(error) = ready {
             detach(shared, generation);
             return Err(error);
@@ -2419,7 +2433,7 @@ mod unix {
                                 let write_result = codec::write_frame_until(
                                     stream,
                                     &ServerMessage::Reply { request_id, reply },
-                                    Instant::now() + HANDSHAKE_TIMEOUT,
+                                    Instant::now() + FRAME_TRANSFER_TIMEOUT,
                                 );
                                 shared.request_close();
                                 shared.close_connections();
@@ -2429,7 +2443,7 @@ mod unix {
                             codec::write_frame_until(
                                 stream,
                                 &ServerMessage::Reply { request_id, reply },
-                                Instant::now() + HANDSHAKE_TIMEOUT,
+                                Instant::now() + FRAME_TRANSFER_TIMEOUT,
                             )?;
                         }
                         Err(error) => {
@@ -2475,9 +2489,10 @@ mod unix {
                 return Err(SessionError::WorkerExited);
             }
             if readiness::is_readable(poll_fds[0].revents) {
-                let message =
-                    codec::read_frame_until(stream, Instant::now() + HANDSHAKE_TIMEOUT);
-                stream.set_read_timeout(Some(CONNECTION_TIMEOUT))?;
+                let message = codec::read_frame_until(
+                    stream,
+                    Instant::now() + FRAME_TRANSFER_TIMEOUT,
+                );
                 return message.map(Some);
             }
             if readiness::is_readable(poll_fds[1].revents) {
@@ -2833,8 +2848,10 @@ mod unix {
             requeue_critical(shared, &messages, 0);
             return Err(error);
         }
-        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
         for (index, message) in messages.iter().enumerate() {
+            // Each message gets its own stall budget so a long batch does not
+            // spend the deadline of the messages behind it.
+            let deadline = Instant::now() + FRAME_TRANSFER_TIMEOUT;
             if let Err(error) = codec::write_frame_until(stream, message, deadline) {
                 let start = if is_active(shared, generation) {
                     index
@@ -2908,7 +2925,11 @@ mod unix {
         };
         let response = ServerMessage::Error { code, message };
         response.validate()?;
-        codec::write_frame_until(stream, &response, Instant::now() + HANDSHAKE_TIMEOUT)?;
+        codec::write_frame_until(
+            stream,
+            &response,
+            Instant::now() + FRAME_TRANSFER_TIMEOUT,
+        )?;
         Ok(())
     }
 
@@ -2973,6 +2994,49 @@ mod unix {
         true
     }
 
+    /// Whether the inherited descriptor is still accepting connections.
+    ///
+    /// macOS reports `ENOPROTOOPT` for `SO_ACCEPTCONN`, so there the strongest
+    /// available check is that nothing is connected to it yet.
+    fn accepting_connections(listener: &UnixListener) -> Result<bool, SessionError> {
+        let mut accepting = 0;
+        let mut option_length = std::mem::size_of_val(&accepting) as libc::socklen_t;
+        let queried = unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ACCEPTCONN,
+                (&mut accepting as *mut libc::c_int).cast(),
+                &mut option_length,
+            )
+        };
+        if queried == 0 {
+            return Ok(accepting != 0);
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::ENOPROTOOPT) | Some(libc::EOPNOTSUPP)
+        ) {
+            return Err(error.into());
+        }
+        Ok(listener_has_no_peer(listener))
+    }
+
+    /// True when nothing is connected to the socket.
+    fn listener_has_no_peer(listener: &UnixListener) -> bool {
+        let mut peer = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+        let mut peer_length = std::mem::size_of_val(&peer) as libc::socklen_t;
+        let result = unsafe {
+            libc::getpeername(
+                listener.as_raw_fd(),
+                (&mut peer as *mut libc::sockaddr_un).cast(),
+                &mut peer_length,
+            )
+        };
+        result != 0
+    }
+
     struct EndpointGuard {
         listener: UnixListener,
         endpoint: PathBuf,
@@ -3018,7 +3082,12 @@ mod unix {
                     return Err(io::Error::last_os_error().into());
                 }
                 let address = listener.local_addr()?;
-                if address.as_pathname() != Some(endpoint.as_path()) {
+                // getsockname can report a symlink-resolved path (macOS
+                // /var -> /private/var) while the argument stays literal.
+                let bound = address
+                    .as_pathname()
+                    .and_then(|path| std::fs::canonicalize(path).ok());
+                if bound.is_none() || bound != std::fs::canonicalize(&endpoint).ok() {
                     return Err(SessionError::protocol(
                         "inherited listener does not match the session endpoint",
                     ));
@@ -3054,19 +3123,7 @@ mod unix {
                         "inherited listener is not a stream socket",
                     ));
                 }
-                let mut accepting = 0;
-                option_length = std::mem::size_of_val(&accepting) as libc::socklen_t;
-                if unsafe {
-                    libc::getsockopt(
-                        listener.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        libc::SO_ACCEPTCONN,
-                        (&mut accepting as *mut libc::c_int).cast(),
-                        &mut option_length,
-                    )
-                } == -1
-                    || accepting == 0
-                {
+                if !accepting_connections(&listener)? {
                     return Err(SessionError::protocol(
                         "inherited fd is not a listening socket",
                     ));
@@ -3340,7 +3397,15 @@ mod unix {
     fn frame_ready_retries_after_critical_events_are_flushed() {
         let shared = test_shared();
         let active_wakeup = Arc::new(readiness::Readiness::new().unwrap());
-        let (mut stream, _peer) = UnixStream::pair().unwrap();
+        let (mut stream, peer) = UnixStream::pair().unwrap();
+        // A Unix socket charges each small write far more than its payload
+        // length, so drain the peer to leave the flush writes room.
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut peer = peer;
+            let mut buffer = [0u8; 256];
+            while peer.read(&mut buffer).is_ok_and(|read| read > 0) {}
+        });
         let mut runtime =
             Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         for index in 0..MAX_PENDING_REQUESTS {
