@@ -41,7 +41,7 @@ const MAX_PAGES: usize = 16;
 
 #[inline]
 fn align_staging_offset(offset: usize) -> usize {
-    (offset + 3) & !3
+    offset.next_multiple_of(4)
 }
 
 /// One pending glyph upload — `bytes` were copied at insert time, so
