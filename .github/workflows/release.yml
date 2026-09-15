@@ -16,6 +16,8 @@ jobs:
     name: Verify release credentials
     runs-on: ubuntu-latest
     permissions: {}
+    outputs:
+      credentials: ${{ steps.check.outputs.credentials }}
     env:
       GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
       MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
@@ -28,6 +30,7 @@ jobs:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - name: Check required credentials
+        id: check
         shell: bash
         run: |
           missing=()
@@ -49,12 +52,19 @@ jobs:
           fi
 
           if ((${#missing[@]})); then
-            echo "::error title=Missing release credentials::Configure these repository secrets: ${missing[*]}"
-            exit 1
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              echo "::error title=Missing release credentials::Configure these repository secrets: ${missing[*]}"
+              exit 1
+            fi
+            echo "::warning title=Missing release credentials::Skipping release; configure these repository secrets to publish from this repository: ${missing[*]}"
+            echo "credentials=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "credentials=true" >> "$GITHUB_OUTPUT"
 
   build:
     needs: verify-release-credentials
+    if: needs.verify-release-credentials.outputs.credentials == 'true'
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -197,6 +207,7 @@ jobs:
 
   release-cache:
     needs: verify-release-credentials
+    if: needs.verify-release-credentials.outputs.credentials == 'true'
     runs-on: ubuntu-latest
     outputs:
       all-hit: ${{ steps.aggregate.outputs.all-hit }}
