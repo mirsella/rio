@@ -113,6 +113,13 @@ in
     buildNoDefaultFeatures = true;
     buildFeatures = (lib.optionals withX11 ["x11"]) ++ (lib.optionals withWayland ["wayland"]);
     checkType = "debug";
+    preCheck = ''
+      # The checks open a window registry and keep test artifacts in the user
+      # directories, which a sandboxed builder does not provide.
+      export XDG_RUNTIME_DIR="$TMPDIR/rio-runtime"
+      export HOME="$TMPDIR/home"
+      install -d -m 700 "$XDG_RUNTIME_DIR" "$HOME"
+    '';
     meta = {
       description = rioToml.package.description;
       longDescription = rioToml.package.extended-description;
