@@ -57,6 +57,11 @@ fn temporary_directory() -> PathBuf {
     directory
 }
 
+// Nix check sandboxes keep coreutils in the store, not in /usr/bin.
+fn tool_path() -> String {
+    std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_owned())
+}
+
 fn spec(command: &str, working_dir: Option<&Path>) -> SessionSpec {
     SessionSpec {
         shell: Some("/bin/sh".into()),
@@ -64,7 +69,7 @@ fn spec(command: &str, working_dir: Option<&Path>) -> SessionSpec {
         working_dir: working_dir.map(|path| path.to_str().unwrap().to_owned()),
         environment: vec![
             EnvVar::new("HOME", std::env::temp_dir().to_str().unwrap()),
-            EnvVar::new("PATH", "/usr/bin:/bin"),
+            EnvVar::new("PATH", tool_path()),
             EnvVar::new("RIO_SESSION_TEST", "preserved"),
             EnvVar::new("TERM", "xterm-rio"),
         ],
