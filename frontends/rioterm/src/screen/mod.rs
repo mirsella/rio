@@ -13,7 +13,7 @@ use crate::bindings::{
     ViAction,
 };
 use crate::context;
-use crate::context::renderable::{Cursor, RenderableContent};
+use crate::context::renderable::RenderableContent;
 use crate::context::{next_rich_text_id, process_open_url, ContextManager, GridTransfer};
 use crate::crosswords::{
     grid::Scroll,
@@ -33,7 +33,7 @@ use rio_backend::clipboard::Clipboard;
 use rio_backend::clipboard::ClipboardType;
 use rio_backend::config::layout::Margin;
 use rio_backend::config::renderer::Backend;
-use rio_backend::crosswords::pos::{Boundary, CursorState, Direction, Line};
+use rio_backend::crosswords::pos::{Boundary, Direction, Line};
 use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
 use rio_backend::event::{ClickState, EventProxy, SearchState};
 #[cfg(wgpu_backend)]
@@ -546,6 +546,8 @@ impl Screen<'_> {
             keyboard: config.keyboard.clone(),
             scrollback_history_limit: config.scrollback_history_limit,
             grapheme_clustering: config.grapheme_clustering,
+            cursor_shape: config.cursor.shape,
+            cursor_blinking: config.cursor.blinking,
         };
 
         let rich_text_id = next_rich_text_id();
@@ -576,15 +578,9 @@ impl Screen<'_> {
             margin,
         );
 
-        let cursor = Cursor {
-            content: config.cursor.shape.into(),
-            state: CursorState::new(config.cursor.shape.into()),
-        };
-
         let (context_manager, graphics, transferred) = match screen_context {
             ScreenContext::Fresh(_) => {
                 let context_manager = context::ContextManager::start(
-                    (&cursor, config.cursor.blinking),
                     event_proxy,
                     window_id.into(),
                     rich_text_id,
@@ -1086,7 +1082,10 @@ impl Screen<'_> {
 
         // Update keyboard config in context manager
         self.context_manager.config.keyboard = config.keyboard.clone();
-        self.context_manager.config.title = config.title.clone();
+        // New tabs and splits derive their cursor from the manager config;
+        // keep it in sync with the reloaded value.
+        self.context_manager.config.cursor_shape = config.cursor.shape;
+        self.context_manager.config.cursor_blinking = config.cursor.blinking;
 
         // Re-evaluate the opaque flag — toggling `window.opacity` /
         // `window.blur` at runtime should flip the compositor mode.
