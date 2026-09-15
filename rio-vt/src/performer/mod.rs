@@ -118,21 +118,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_ignores_empty_writes() {
+    fn state_drops_empty_writes() {
         let mut state = State::default();
-        state
-            .write_list
-            .push_back(Writing::new(Cow::Borrowed(&[]), None));
-        state
-            .write_list
-            .push_back(Writing::new(Cow::Borrowed(b"input"), None));
+        state.push(Cow::Borrowed(&[]), None);
+        assert!(!state.needs_write());
 
+        state.push(Cow::Borrowed(b"input"), None);
         assert!(state.needs_write());
-        state.ensure_next();
-        assert_eq!(state.writing.as_ref().unwrap().remaining_bytes(), b"input");
-
-        state.writing = None;
-        state.goto_next();
+        assert_eq!(
+            state.write_list.pop_front().unwrap().remaining_bytes(),
+            b"input"
+        );
         assert!(!state.needs_write());
     }
 }
@@ -147,31 +143,27 @@ pub struct State {
 
 #[cfg(feature = "pty")]
 impl State {
+    /// Queue input for the PTY. Empty writes never enter the queue, so a
+    /// queued or in-flight `Writing` always has bytes left to send.
     #[inline]
-    fn ensure_next(&mut self) {
-        if self.writing.as_ref().is_some_and(Writing::finished) {
-            self.writing = None;
+    fn push(
+        &mut self,
+        source: Cow<'static, [u8]>,
+        reservation: Option<InputReservation>,
+    ) {
+        if source.is_empty() {
+            return;
         }
-        if self.writing.is_none() {
-            self.goto_next();
-        }
-    }
-
-    #[inline]
-    fn goto_next(&mut self) {
-        self.writing = None;
-        while let Some(writing) = self.write_list.pop_front() {
-            if !writing.finished() {
-                self.writing = Some(writing);
-                break;
-            }
-        }
+        self.write_list.push_back(Writing {
+            source,
+            written: 0,
+            reservation,
+        });
     }
 
     #[inline]
     fn needs_write(&self) -> bool {
-        self.writing.is_some()
-            || self.write_list.iter().any(|writing| !writing.finished())
+        self.writing.is_some() || !self.write_list.is_empty()
     }
 }
 
@@ -184,15 +176,6 @@ struct Writing {
 
 #[cfg(feature = "pty")]
 impl Writing {
-    #[inline]
-    fn new(c: Cow<'static, [u8]>, reservation: Option<InputReservation>) -> Writing {
-        Writing {
-            source: c,
-            written: 0,
-            reservation,
-        }
-    }
-
     #[inline]
     fn advance(&mut self, n: usize) {
         self.written += n;
@@ -324,13 +307,10 @@ where
     fn drain_recv_channel(&mut self, state: &mut State) -> bool {
         while let Some(msg) = self.receiver.recv() {
             match msg {
-                Msg::Input(input) if !input.is_empty() => {
-                    state.write_list.push_back(Writing::new(input, None))
+                Msg::Input(input) => state.push(input, None),
+                Msg::InputBounded { input, reservation } => {
+                    state.push(input, Some(reservation))
                 }
-                Msg::InputBounded { input, reservation } if !input.is_empty() => state
-                    .write_list
-                    .push_back(Writing::new(input, Some(reservation))),
-                Msg::Input(_) | Msg::InputBounded { .. } => (),
                 Msg::Resize(window_size) => {
                     let _ = self.pty.set_winsize(window_size.into());
                 }
@@ -343,7 +323,9 @@ where
 
     #[inline]
     fn pty_write(&mut self, state: &mut State) -> io::Result<()> {
-        state.ensure_next();
+        if state.writing.is_none() {
+            state.writing = state.write_list.pop_front();
+        }
 
         'write_many: while let Some(mut current) = state.writing.take() {
             'write_one: loop {
@@ -355,7 +337,7 @@ where
                     Ok(n) => {
                         current.advance(n);
                         if current.finished() {
-                            state.goto_next();
+                            state.writing = state.write_list.pop_front();
                             break 'write_one;
                         }
                     }
