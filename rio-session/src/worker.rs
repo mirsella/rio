@@ -3326,13 +3326,23 @@ mod unix {
         }
     }
 
+    #[cfg(test)]
+    fn test_spec() -> SessionSpec {
+        // An omitted shell resolves through the host passwd database, which
+        // Nix builds fill with `/noshell`.
+        SessionSpec {
+            shell: Some("/bin/sh".to_owned()),
+            ..SessionSpec::default()
+        }
+    }
+
     #[test]
     fn frame_ready_retries_after_critical_events_are_flushed() {
         let shared = test_shared();
         let active_wakeup = Arc::new(readiness::Readiness::new().unwrap());
         let (mut stream, _peer) = UnixStream::pair().unwrap();
         let mut runtime =
-            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+            Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         for index in 0..MAX_PENDING_REQUESTS {
             assert!(queue_event(
                 &mut runtime.pending_events,
@@ -3363,7 +3373,7 @@ mod unix {
     fn detach_does_not_requeue_a_request_with_an_accepted_response() {
         let shared = test_shared();
         let mut runtime =
-            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+            Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         let response = runtime.surface.try_reserve_response(vec![b'\n']).unwrap();
         runtime.pending_replies.push_back(PendingReply::Request {
             request: TerminalRequest::GlyphProtocolQuery {
@@ -3399,8 +3409,7 @@ mod unix {
     #[test]
     fn terminal_replies_preserve_fifo_when_responses_are_reversed() {
         let shared = test_shared();
-        let runtime =
-            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        let runtime = Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         {
             let mut state = shared.state.lock().unwrap();
             state.runtime = Some(runtime);
@@ -3462,8 +3471,7 @@ mod unix {
     #[test]
     fn terminal_reply_fifo_survives_notification_backpressure() {
         let shared = test_shared();
-        let runtime =
-            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        let runtime = Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         {
             let mut state = shared.state.lock().unwrap();
             state.runtime = Some(runtime);
@@ -3503,8 +3511,7 @@ mod unix {
     #[test]
     fn terminal_reply_fifo_keeps_raw_and_request_admission_together() {
         let shared = test_shared();
-        let runtime =
-            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        let runtime = Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         {
             let mut state = shared.state.lock().unwrap();
             state.runtime = Some(runtime);
@@ -3574,8 +3581,7 @@ mod unix {
     #[test]
     fn saturated_clipboard_store_preserves_its_payload() {
         let shared = test_shared();
-        let runtime =
-            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        let runtime = Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         shared.state.lock().unwrap().runtime = Some(runtime);
         for _ in 0..MAX_PENDING_REQUESTS {
             shared.delegate.send(Notification::Action(Action::RingBell));
@@ -3615,8 +3621,7 @@ mod unix {
     #[test]
     fn deferred_notifications_do_not_overtake_newer_queued_notifications() {
         let shared = test_shared();
-        let runtime =
-            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        let runtime = Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         shared.state.lock().unwrap().runtime = Some(runtime);
         for _ in 0..MAX_PENDING_REQUESTS {
             shared.delegate.send(Notification::Action(Action::RingBell));
@@ -3650,8 +3655,7 @@ mod unix {
     #[test]
     fn older_deferred_color_change_precedes_newer_terminal_request() {
         let shared = test_shared();
-        let runtime =
-            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        let runtime = Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         shared.state.lock().unwrap().runtime = Some(runtime);
 
         for _ in 0..MAX_PENDING_REQUESTS {
@@ -3685,8 +3689,7 @@ mod unix {
     #[test]
     fn expired_ordered_request_releases_following_raw_reply() {
         let shared = test_shared();
-        let runtime =
-            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        let runtime = Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         {
             let mut state = shared.state.lock().unwrap();
             state.runtime = Some(runtime);
@@ -3740,8 +3743,7 @@ mod unix {
     #[test]
     fn invalid_terminal_response_keeps_request_for_retry() {
         let shared = test_shared();
-        let runtime =
-            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        let runtime = Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         {
             let mut state = shared.state.lock().unwrap();
             state.runtime = Some(runtime);
@@ -3898,7 +3900,7 @@ mod unix {
     fn expired_request_refreshes_detached_retention() {
         let shared = test_shared();
         let mut runtime =
-            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+            Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         runtime.pending_replies.push_back(PendingReply::Request {
             request: TerminalRequest::GlyphProtocolQuery {
                 request_id: 7,
@@ -3936,8 +3938,7 @@ mod unix {
     #[test]
     fn accepted_request_refreshes_detached_retention() {
         let shared = test_shared();
-        let runtime =
-            Runtime::new(SessionSpec::default(), Arc::clone(&shared.delegate)).unwrap();
+        let runtime = Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
         let before = Instant::now();
         {
             let mut state = shared.state.lock().unwrap();
