@@ -29,13 +29,18 @@ fn worker_path() -> PathBuf {
     );
 }
 
+// Nix check sandboxes keep coreutils in the store, not in /usr/bin.
+fn tool_path() -> String {
+    std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_owned())
+}
+
 fn session_spec() -> SessionSpec {
     SessionSpec {
         shell: Some("/bin/sh".into()),
         args: vec!["-c".into(), "stty raw -echo; cat".into()],
         environment: vec![
             EnvVar::new("HOME", std::env::temp_dir().to_str().unwrap()),
-            EnvVar::new("PATH", "/usr/bin:/bin"),
+            EnvVar::new("PATH", tool_path()),
             EnvVar::new("TERM", "xterm-rio"),
         ],
         ..Default::default()
