@@ -4042,7 +4042,7 @@ mod unix {
         ));
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-        let endpoint = directory.join("session.sock");
+        let endpoint = directory.join(crate::SESSION_SOCKET_FILE);
         let guard = EndpointGuard::bind(endpoint.clone()).unwrap();
         fs::remove_file(&endpoint).unwrap();
         let replacement = UnixListener::bind(&endpoint).unwrap();
@@ -4064,7 +4064,7 @@ mod unix {
         ));
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-        let endpoint = directory.join("session.sock");
+        let endpoint = directory.join(crate::SESSION_SOCKET_FILE);
         let listener = UnixListener::bind(&endpoint).unwrap();
         fs::set_permissions(&endpoint, fs::Permissions::from_mode(0o600)).unwrap();
         let expected_identity = crate::path_identity(&endpoint).unwrap();
