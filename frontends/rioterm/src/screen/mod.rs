@@ -5489,7 +5489,11 @@ mod tests {
         let target_hidden = scaled_margin_for_tabs(&navigation, margin, false, 1, 1.25);
         let target_visible = scaled_margin_for_tabs(&navigation, margin, false, 2, 1.25);
 
+        // macOS keeps the island padding for a single tab.
+        #[cfg(not(target_os = "macos"))]
         assert_ne!(source_visible.top, source_hidden.top);
+        #[cfg(target_os = "macos")]
+        assert_eq!(source_visible.top, source_hidden.top);
         assert_eq!(target_visible.top, source_visible.top);
         assert_eq!(target_hidden.top, source_hidden.top);
         assert_eq!(source_hidden.right, 5.0);
