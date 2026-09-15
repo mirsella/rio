@@ -53,6 +53,10 @@ const SESSION_TRANSPORT_SUPPORTED: bool = cfg!(any(
 #[cfg(unix)]
 const FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Listening socket name inside a session's private directory.
+#[cfg(unix)]
+pub(crate) const SESSION_SOCKET_FILE: &str = "session.sock";
+
 #[cfg(unix)]
 type FileIdentity = (u64, u64);
 
@@ -488,7 +492,7 @@ impl SessionClient {
         let capability = random_capability()?;
         let activity_wakeup = readiness::Readiness::new()?;
         let (endpoint_dir, endpoint_dir_identity) = endpoint_directory(session_id)?;
-        let endpoint = endpoint_dir.join("session.sock");
+        let endpoint = endpoint_dir.join(SESSION_SOCKET_FILE);
 
         let mut cleanup = WorkerCleanup {
             child: None,
@@ -1594,7 +1598,7 @@ fn endpoint_directory(
     let base = endpoint_base(&configured_base, session_id)?;
     let mut base_builder = std::fs::DirBuilder::new();
     base_builder.recursive(true).mode(0o700).create(&base)?;
-    let directory = base.join(format!("rio-session-{}", session_id.hex()));
+    let directory = session_directory(&base, session_id);
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(0o700).create(&directory)?;
     let identity = match private_directory_identity(&directory) {
@@ -1608,17 +1612,31 @@ fn endpoint_directory(
 }
 
 #[cfg(unix)]
+fn session_directory(base: &Path, session_id: SessionId) -> PathBuf {
+    base.join(format!("rio-session-{}", session_id.hex()))
+}
+
+/// Pick the directory that keeps the session socket within `SUN_LEN`.
+///
+/// `XDG_RUNTIME_DIR` is preferred, but a long base silently produced
+/// unusable sockets, so fall back to `/var/tmp` when the path would not fit.
+#[cfg(unix)]
 fn endpoint_base(
     configured_base: &Path,
     session_id: SessionId,
 ) -> Result<PathBuf, SessionError> {
-    let name = format!("rio-session-{}", session_id.hex());
-    if unix_socket_path_fits(&configured_base.join(&name).join("session.sock")) {
+    let fits = |base: &Path| {
+        unix_socket_path_fits(
+            &session_directory(base, session_id).join(SESSION_SOCKET_FILE),
+        )
+    };
+
+    if fits(configured_base) {
         return Ok(configured_base.to_owned());
     }
 
     let fallback = Path::new("/var/tmp");
-    if unix_socket_path_fits(&fallback.join(&name).join("session.sock")) {
+    if fits(fallback) {
         tracing::warn!(
             "session runtime directory is too long for a Unix socket; using a short private directory"
         );
@@ -1634,9 +1652,10 @@ fn endpoint_base(
 fn unix_socket_path_fits(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
 
+    let capacity = std::mem::size_of::<libc::sockaddr_un>()
+        - std::mem::offset_of!(libc::sockaddr_un, sun_path);
     let bytes = path.as_os_str().as_bytes();
-    let address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
-    !bytes.contains(&0) && bytes.len() < address.sun_path.len()
+    !bytes.contains(&0) && bytes.len() < capacity
 }
 
 #[cfg(unix)]
@@ -2261,7 +2280,7 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
             .unwrap();
-        let endpoint = directory.join("session.sock");
+        let endpoint = directory.join(super::SESSION_SOCKET_FILE);
         let listener = UnixListener::bind(&endpoint).unwrap();
         let endpoint_identity = super::path_identity(&endpoint).unwrap();
         let endpoint_dir_identity = super::path_identity(&directory).unwrap();
