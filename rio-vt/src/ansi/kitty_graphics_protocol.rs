@@ -1068,14 +1068,20 @@ fn decode_payload_base64(payload: &[u8]) -> Option<Vec<u8>> {
         );
         return None;
     }
-    if let Some(data) = simd_base64::decode(payload) {
-        return (data.len() <= MAX_SIZE).then_some(data);
+    let Some(data) =
+        simd_base64::decode(payload).or_else(|| simd_base64::decode_no_pad(payload))
+    else {
+        debug!("Base64 payload decode failed");
+        return None;
+    };
+    if data.len() > MAX_SIZE {
+        debug!(
+            "Base64 payload exceeds decoded size limit: {} bytes",
+            data.len()
+        );
+        return None;
     }
-    if let Some(data) = simd_base64::decode_no_pad(payload) {
-        return (data.len() <= MAX_SIZE).then_some(data);
-    }
-    debug!("Base64 payload decode failed");
-    None
+    Some(data)
 }
 
 /// Error emitted from `create_graphic_data`. Maps directly to kitty
