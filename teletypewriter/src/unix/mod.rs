@@ -1173,30 +1173,34 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>, Error> {
         return Err(Error::other("getpwuid_r returned the wrong user"));
     }
 
-    let name = if entry.pw_name.is_null() {
-        return Err(Error::other("passwd entry has no user name"));
-    } else {
-        unsafe { CStr::from_ptr(entry.pw_name) }
-            .to_str()
-            .map_err(|_| Error::other("passwd user name is not UTF-8"))?
-    };
-    let dir = if entry.pw_dir.is_null() {
-        return Err(Error::other("passwd entry has no home directory"));
-    } else {
-        unsafe { CStr::from_ptr(entry.pw_dir) }
-            .to_str()
-            .map_err(|_| Error::other("passwd home directory is not UTF-8"))?
-    };
-    let shell = if entry.pw_shell.is_null() {
-        return Err(Error::other("passwd entry has no shell"));
-    } else {
-        unsafe { CStr::from_ptr(entry.pw_shell) }
-            .to_str()
-            .map_err(|_| Error::other("passwd shell is not UTF-8"))?
-    };
+    // SAFETY: the passwd strings point into `buf`, which outlives the
+    // returned `Passwd`.
+    unsafe {
+        Ok(Passwd {
+            name: passwd_field(entry.pw_name, "user name")?,
+            dir: passwd_field(entry.pw_dir, "home directory")?,
+            shell: passwd_field(entry.pw_shell, "shell")?,
+        })
+    }
+}
 
-    // Build a borrowed Passwd struct.
-    Ok(Passwd { name, dir, shell })
+/// Borrow one NUL-terminated field of a `getpwuid_r` entry.
+///
+/// # Safety
+///
+/// `field` must be null or a NUL-terminated string that stays valid and
+/// unmodified for the returned borrow.
+unsafe fn passwd_field<'a>(
+    field: *const libc::c_char,
+    what: &str,
+) -> Result<&'a str, Error> {
+    if field.is_null() {
+        return Err(Error::other(format!("passwd entry has no {what}")));
+    }
+
+    unsafe { CStr::from_ptr(field) }
+        .to_str()
+        .map_err(|_| Error::other(format!("passwd {what} is not UTF-8")))
 }
 
 pub fn foreground_process_name(main_fd: RawFd, shell_pid: u32) -> String {
