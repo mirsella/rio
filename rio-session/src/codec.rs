@@ -2,7 +2,7 @@ use crate::{protocol::MAX_FRAME_SIZE, SessionError};
 use bincode::{Decode, Encode};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 fn config() -> impl bincode::config::Config {
     bincode::config::standard().with_limit::<MAX_FRAME_SIZE>()
@@ -65,6 +65,14 @@ pub fn read_frame<R: Read, T: Decode<()>>(reader: &mut R) -> Result<T, SessionEr
 }
 
 #[cfg(unix)]
+fn deadline_exceeded() -> SessionError {
+    SessionError::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "frame deadline exceeded",
+    ))
+}
+
+#[cfg(unix)]
 pub fn write_frame_until<T: Encode>(
     writer: &mut std::os::unix::net::UnixStream,
     value: &T,
@@ -93,15 +101,11 @@ pub fn read_frame_until<T: Decode<()>>(
     let mut payload = vec![0; length];
     read_until(reader, &mut payload, deadline)?;
     if Instant::now() >= deadline {
-        return Err(
-            io::Error::new(io::ErrorKind::TimedOut, "frame deadline exceeded").into(),
-        );
+        return Err(deadline_exceeded());
     }
     let value = decode(&payload)?;
     if Instant::now() >= deadline {
-        return Err(
-            io::Error::new(io::ErrorKind::TimedOut, "frame deadline exceeded").into(),
-        );
+        return Err(deadline_exceeded());
     }
     Ok(value)
 }
@@ -114,8 +118,9 @@ fn write_until(
 ) -> Result<(), SessionError> {
     let mut written = 0;
     while written < bytes.len() {
-        let timeout = remaining(deadline)?;
-        writer.set_write_timeout(Some(timeout))?;
+        if Instant::now() >= deadline {
+            return Err(deadline_exceeded());
+        }
         match writer.write(&bytes[written..]) {
             Ok(0) => {
                 return Err(
@@ -124,6 +129,9 @@ fn write_until(
             }
             Ok(count) => written += count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_ready(writer, libc::POLLOUT, deadline)?;
+            }
             Err(error) => return Err(error.into()),
         }
     }
@@ -138,8 +146,9 @@ fn read_until(
 ) -> Result<(), SessionError> {
     let mut read = 0;
     while read < bytes.len() {
-        let timeout = remaining(deadline)?;
-        reader.set_read_timeout(Some(timeout))?;
+        if Instant::now() >= deadline {
+            return Err(deadline_exceeded());
+        }
         match reader.read(&mut bytes[read..]) {
             Ok(0) => {
                 return Err(
@@ -148,6 +157,9 @@ fn read_until(
             }
             Ok(count) => read += count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                wait_ready(reader, libc::POLLIN, deadline)?;
+            }
             Err(error) => return Err(error.into()),
         }
     }
@@ -155,18 +167,42 @@ fn read_until(
 }
 
 #[cfg(unix)]
-fn remaining(deadline: Instant) -> Result<Duration, SessionError> {
-    let timeout = deadline.saturating_duration_since(Instant::now());
-    if timeout.is_zero() {
-        return Err(
-            io::Error::new(io::ErrorKind::TimedOut, "frame deadline exceeded").into(),
-        );
+fn wait_ready(
+    stream: &std::os::unix::net::UnixStream,
+    events: libc::c_short,
+    deadline: Instant,
+) -> Result<(), SessionError> {
+    let mut poll_fd = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(stream),
+        events,
+        revents: 0,
+    };
+    if crate::readiness::wait(std::slice::from_mut(&mut poll_fd), Some(deadline))? == 0 {
+        return Err(deadline_exceeded());
     }
-    Ok(timeout)
+    if crate::readiness::is_invalid(poll_fd.revents) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session connection fd is invalid",
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub fn is_timeout(error: &SessionError) -> bool {
     matches!(error, SessionError::Io(io_error) if matches!(io_error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock))
+}
+
+/// Prefixes an I/O error with the protocol step that produced it.
+pub fn step_error(step: &str, error: impl Into<SessionError>) -> SessionError {
+    match error.into() {
+        SessionError::Io(io_error) => SessionError::Io(io::Error::new(
+            io_error.kind(),
+            format!("{step}: {io_error}"),
+        )),
+        other => other,
+    }
 }
 
 #[cfg(test)]
