@@ -1056,14 +1056,20 @@ fn decode_payload_base64(payload: &[u8]) -> Option<Vec<u8>> {
         );
         return None;
     }
-    if let Some(data) = simd_base64::decode(payload) {
-        return (data.len() <= MAX_SIZE).then_some(data);
+    let Some(data) =
+        simd_base64::decode(payload).or_else(|| simd_base64::decode_no_pad(payload))
+    else {
+        debug!("Base64 payload decode failed");
+        return None;
+    };
+    if data.len() > MAX_SIZE {
+        debug!(
+            "Base64 payload exceeds decoded size limit: {} bytes",
+            data.len()
+        );
+        return None;
     }
-    if let Some(data) = simd_base64::decode_no_pad(payload) {
-        return (data.len() <= MAX_SIZE).then_some(data);
-    }
-    debug!("Base64 payload decode failed");
-    None
+    Some(data)
 }
 
 /// Error emitted from `create_graphic_data`. Maps directly to kitty
@@ -1206,152 +1212,7 @@ fn create_graphic_data(cmd: &KittyGraphicsCommand) -> Result<GraphicData, Graphi
         TransmissionMedium::SharedMemory => {
             #[cfg(unix)]
             {
-                use std::ffi::CString;
-                use std::os::unix::io::RawFd;
-
-                // Payload is already base64-decoded by parse(); the bytes
-                // directly represent the shared memory name.
-                debug!("Shared memory name payload: {} bytes", cmd.payload.len());
-                let shm_name_str = std::str::from_utf8(&cmd.payload)
-                    .map_err(|_| GraphicError::InvalidData)?;
-                let shm_name =
-                    CString::new(shm_name_str).map_err(|_| GraphicError::InvalidData)?;
-
-                debug!(
-                    "Opening shared memory: {}, expected size: {}",
-                    shm_name_str,
-                    cmd.width as usize * cmd.height as usize * 3 // RGB24
-                );
-
-                unsafe {
-                    // Open shared memory
-                    let fd: RawFd = libc::shm_open(shm_name.as_ptr(), libc::O_RDONLY, 0);
-
-                    if fd < 0 {
-                        let err = std::io::Error::last_os_error();
-                        let errno = err.raw_os_error().unwrap_or(-1);
-                        debug!(
-                            "Failed to open shared memory '{}': {} (errno: {})",
-                            shm_name_str, err, errno
-                        );
-                        return Err(GraphicError::FileNotFound);
-                    }
-
-                    // Get size of shared memory
-                    let mut stat: libc::stat = std::mem::zeroed();
-                    if libc::fstat(fd, &mut stat) < 0 {
-                        libc::close(fd);
-                        libc::shm_unlink(shm_name.as_ptr());
-                        debug!("Failed to fstat shared memory");
-                        return Err(GraphicError::InvalidData);
-                    }
-
-                    let shm_size = match usize::try_from(stat.st_size) {
-                        Ok(size) => size,
-                        Err(_) => {
-                            libc::close(fd);
-                            libc::shm_unlink(shm_name.as_ptr());
-                            return Err(GraphicError::InvalidData);
-                        }
-                    };
-                    debug!("Shared memory size: {} bytes", shm_size);
-
-                    // Use cmd.size if specified, otherwise use the full shm size
-                    let data_size = if cmd.size > 0 {
-                        cmd.size as usize
-                    } else {
-                        shm_size
-                    };
-
-                    let offset = cmd.offset as usize;
-                    let Some(end) = offset.checked_add(data_size) else {
-                        libc::close(fd);
-                        libc::shm_unlink(shm_name.as_ptr());
-                        debug!("Shared memory offset and size overflow");
-                        return Err(GraphicError::InvalidData);
-                    };
-
-                    if end > shm_size {
-                        libc::close(fd);
-                        libc::shm_unlink(shm_name.as_ptr());
-                        debug!(
-                            "Requested offset {} + size {} exceeds shared memory size {}",
-                            offset, data_size, shm_size
-                        );
-                        return Err(GraphicError::InvalidData);
-                    }
-
-                    if data_size > MAX_SIZE {
-                        libc::close(fd);
-                        libc::shm_unlink(shm_name.as_ptr());
-                        return Err(GraphicError::TooLarge);
-                    }
-
-                    if data_size == 0 {
-                        libc::close(fd);
-                        libc::shm_unlink(shm_name.as_ptr());
-                        Vec::new()
-                    } else {
-                        // mmap requires a page-aligned file offset. Map from
-                        // the preceding page and slice past the alignment.
-                        let page_size = libc::sysconf(libc::_SC_PAGESIZE);
-                        let Ok(page_size) = usize::try_from(page_size) else {
-                            libc::close(fd);
-                            libc::shm_unlink(shm_name.as_ptr());
-                            return Err(GraphicError::InvalidData);
-                        };
-                        if page_size == 0 {
-                            libc::close(fd);
-                            libc::shm_unlink(shm_name.as_ptr());
-                            return Err(GraphicError::InvalidData);
-                        }
-                        let aligned_offset = offset - (offset % page_size);
-                        let delta = offset - aligned_offset;
-                        let Some(map_len) = delta.checked_add(data_size) else {
-                            libc::close(fd);
-                            libc::shm_unlink(shm_name.as_ptr());
-                            return Err(GraphicError::InvalidData);
-                        };
-                        let Ok(map_offset) = libc::off_t::try_from(aligned_offset) else {
-                            libc::close(fd);
-                            libc::shm_unlink(shm_name.as_ptr());
-                            return Err(GraphicError::InvalidData);
-                        };
-
-                        let ptr = libc::mmap(
-                            std::ptr::null_mut(),
-                            map_len,
-                            libc::PROT_READ,
-                            libc::MAP_SHARED,
-                            fd,
-                            map_offset,
-                        );
-
-                        if ptr == libc::MAP_FAILED {
-                            libc::close(fd);
-                            libc::shm_unlink(shm_name.as_ptr());
-                            debug!("Failed to mmap shared memory");
-                            return Err(GraphicError::InvalidData);
-                        }
-
-                        // Copy data from shared memory.
-                        let data = std::slice::from_raw_parts(
-                            (ptr as *const u8).add(delta),
-                            data_size,
-                        )
-                        .to_vec();
-
-                        libc::munmap(ptr, map_len);
-                        libc::close(fd);
-                        libc::shm_unlink(shm_name.as_ptr());
-
-                        debug!(
-                            "Successfully read {} bytes from shared memory",
-                            data.len()
-                        );
-                        data
-                    }
-                }
+                read_shared_memory(cmd)?
             }
             #[cfg(windows)]
             {
@@ -1689,6 +1550,75 @@ fn create_graphic_data(cmd: &KittyGraphicsCommand) -> Result<GraphicData, Graphi
             })
         }
     }
+}
+
+/// Read `cmd.size` bytes at `cmd.offset` from the POSIX shared-memory object
+/// named by `cmd.payload`.
+///
+/// The object is unlinked as soon as it is opened, so the name is released
+/// even if a later read fails.
+#[cfg(unix)]
+fn read_shared_memory(cmd: &KittyGraphicsCommand) -> Result<Vec<u8>, GraphicError> {
+    use std::ffi::CString;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let name =
+        std::str::from_utf8(&cmd.payload).map_err(|_| GraphicError::InvalidData)?;
+    let name = CString::new(name).map_err(|_| GraphicError::InvalidData)?;
+    debug!(
+        "Opening shared memory {name:?}, expected size: {}",
+        cmd.width as usize * cmd.height as usize * 3
+    );
+
+    let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDONLY, 0) };
+    if fd < 0 {
+        debug!(
+            "Failed to open shared memory {name:?}: {}",
+            std::io::Error::last_os_error()
+        );
+        return Err(GraphicError::FileNotFound);
+    }
+    // SAFETY: `shm_open` returned a fresh descriptor, whose ownership moves
+    // into `OwnedFd`; the mapping-by-descriptor stays valid after unlink.
+    let mut file = unsafe { std::fs::File::from(OwnedFd::from_raw_fd(fd)) };
+    unsafe { libc::shm_unlink(name.as_ptr()) };
+
+    let shm_size = usize::try_from(
+        file.metadata()
+            .map_err(|_| GraphicError::InvalidData)?
+            .len(),
+    )
+    .map_err(|_| GraphicError::InvalidData)?;
+    debug!("Shared memory size: {shm_size} bytes");
+
+    let data_size = match cmd.size {
+        0 => shm_size,
+        size => size as usize,
+    };
+    if data_size > MAX_SIZE {
+        return Err(GraphicError::TooLarge);
+    }
+
+    let offset = cmd.offset as usize;
+    let Some(end) = offset.checked_add(data_size) else {
+        debug!("Shared memory offset and size overflow");
+        return Err(GraphicError::InvalidData);
+    };
+    if end > shm_size {
+        debug!(
+            "Requested offset {offset} + size {data_size} exceeds shared memory size {shm_size}"
+        );
+        return Err(GraphicError::InvalidData);
+    }
+
+    let mut data = vec![0u8; data_size];
+    file.seek(SeekFrom::Start(offset as u64))
+        .map_err(|_| GraphicError::InvalidData)?;
+    file.read_exact(&mut data)
+        .map_err(|_| GraphicError::InvalidData)?;
+    debug!("Successfully read {} bytes from shared memory", data.len());
+    Ok(data)
 }
 
 #[cfg(test)]
