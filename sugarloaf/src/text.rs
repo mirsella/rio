@@ -301,8 +301,12 @@ impl Text {
             (if opts.bold { 1u8 } else { 0 }) | (if opts.italic { 2u8 } else { 0 });
 
         let first_ch = text.chars().next()?;
-        let (resolved_font_id, resolved_is_color) =
-            match self.font_resolve.entry((first_ch, style_flags)) {
+        let (font_id, is_color) = match opts.font_id {
+            Some(font_id) => {
+                let is_color = self.font_library.inner.read().get(&font_id).is_emoji;
+                (font_id as u32, is_color)
+            }
+            None => match self.font_resolve.entry((first_ch, style_flags)) {
                 std::collections::hash_map::Entry::Occupied(e) => *e.get(),
                 std::collections::hash_map::Entry::Vacant(e) => {
                     let mut ss = SpanStyle::default();
@@ -323,18 +327,7 @@ impl Text {
                     e.insert(v);
                     v
                 }
-            };
-        let (font_id, is_color) = if let Some(font_id) = opts.font_id {
-            let font_id = font_id as u32;
-            let is_color = self
-                .font_library
-                .inner
-                .read()
-                .get(&(font_id as usize))
-                .is_emoji;
-            (font_id, is_color)
-        } else {
-            (resolved_font_id, resolved_is_color)
+            },
         };
 
         let hash = shape_hash(font_id, size_bucket, style_flags, text);
