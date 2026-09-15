@@ -24,6 +24,21 @@ pub struct Cursor {
     pub is_ime_enabled: bool,
 }
 
+impl Cursor {
+    /// Cursor a fresh pane starts from. Derived from config only: a new
+    /// tab must never inherit a sibling's live state, which may be hidden
+    /// (DECTCEM, scrolled viewport) at a moment the user does not control.
+    pub fn from_shape(shape: rio_backend::ansi::CursorShape) -> Self {
+        let content: char = shape.into();
+        Cursor {
+            state: CursorState::new(content),
+            content,
+            content_ref: content,
+            is_ime_enabled: false,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct RenderableContent {
     // TODO: Should not use default
@@ -80,13 +95,7 @@ impl RenderableContent {
     }
 
     pub fn from_cursor_config(config_cursor: &CursorConfig) -> Self {
-        let cursor = Cursor {
-            content: config_cursor.shape.into(),
-            content_ref: config_cursor.shape.into(),
-            state: CursorState::new(config_cursor.shape.into()),
-            is_ime_enabled: false,
-        };
-        Self::new(cursor)
+        Self::new(Cursor::from_shape(config_cursor.shape))
     }
 }
 

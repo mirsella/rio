@@ -100,16 +100,6 @@ impl<T: EventListener> Context<T> {
         self.renderable_content.selection_range = selection_range;
     }
 
-    #[inline]
-    pub fn cursor_from_ref(&self) -> Cursor {
-        Cursor {
-            state: self.renderable_content.cursor.state.new_from_self(),
-            content: self.renderable_content.cursor.content_ref,
-            content_ref: self.renderable_content.cursor.content_ref,
-            is_ime_enabled: false,
-        }
-    }
-
     pub fn commit_pending_session(
         &mut self,
         event_proxy: T,
@@ -161,6 +151,18 @@ pub struct ContextManagerConfig {
     pub keyboard: rio_backend::config::keyboard::Keyboard,
     pub scrollback_history_limit: usize,
     pub grapheme_clustering: bool,
+    pub cursor_shape: rio_backend::ansi::CursorShape,
+    pub cursor_blinking: bool,
+}
+
+impl ContextManagerConfig {
+    /// Fresh terminals always start from the configured cursor, never from a
+    /// sibling tab's live state (`Cursor::from_shape`). The live state can be
+    /// hidden (DECTCEM, scrolled viewport), and inheriting it made new tabs
+    /// start with an invisible cursor.
+    fn initial_cursor(&self) -> Cursor {
+        Cursor::from_shape(self.cursor_shape)
+    }
 }
 
 const DEFAULT_CONTEXT_CAPACITY: usize = 28;
@@ -203,6 +205,7 @@ pub fn create_dead_context<T>(
     route_id: usize,
     rich_text_id: usize,
     dimension: ContextDimension,
+    cursor: Cursor,
 ) -> Context<T>
 where
     T: rio_backend::event::EventListener + Clone,
@@ -218,7 +221,7 @@ where
         route_id,
         window_target,
         pending_session: None,
-        renderable_content: RenderableContent::new(Cursor::default()),
+        renderable_content: RenderableContent::new(cursor),
         terminal,
         rich_text_id,
         dimension,
@@ -392,7 +395,6 @@ pub fn create_mock_context<
         ..ContextManagerConfig::default()
     };
     ContextManager::create_context(
-        (&Cursor::default(), false),
         event_proxy.clone(),
         window_id,
         rich_text_id,
@@ -424,7 +426,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     fn create_context(
-        cursor_state: (&Cursor, bool),
         event_proxy: T,
         window_id: WindowId,
         rich_text_id: usize,
@@ -432,7 +433,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         config: &ContextManagerConfig,
     ) -> Result<Context<T>, Box<dyn Error>> {
         Self::create_context_with_route_id(
-            cursor_state,
             event_proxy,
             window_id,
             rich_text_id,
@@ -442,9 +442,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn create_context_with_route_id(
-        cursor_state: (&Cursor, bool),
         event_proxy: T,
         window_id: WindowId,
         rich_text_id: usize,
@@ -452,6 +450,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         config: &ContextManagerConfig,
         route_id: usize,
     ) -> Result<Context<T>, Box<dyn Error>> {
+        let cursor = config.initial_cursor();
         #[cfg(test)]
         if config.dead_pty {
             return Ok(create_dead_context(
@@ -460,6 +459,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 route_id,
                 rich_text_id,
                 dimension,
+                cursor,
             ));
         }
 
@@ -496,14 +496,14 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         )));
         terminal
             .lock()
-            .set_cursor_style(cursor_state.0.state.content, cursor_state.1);
+            .set_cursor_style(cursor.state.content, config.cursor_blinking);
         Ok(Context {
             route_id,
             window_target,
             pending_session: None,
             terminal,
             rich_text_id,
-            renderable_content: RenderableContent::new(cursor_state.0.clone()),
+            renderable_content: RenderableContent::new(cursor),
             dimension,
             title: ContextTitle::default(),
             ime: Ime::new(),
@@ -514,7 +514,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn start(
-        cursor_state: (&Cursor, bool),
         event_proxy: T,
         window_id: WindowId,
         rich_text_id: usize,
@@ -536,10 +535,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 route_id,
                 rich_text_id,
                 size,
+                ctx_config.initial_cursor(),
             )
         } else {
             match ContextManager::create_context_with_route_id(
-                cursor_state,
                 event_proxy.clone(),
                 window_id,
                 rich_text_id,
@@ -617,7 +616,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             ..ContextManagerConfig::default()
         };
         let initial_context = ContextManager::create_context(
-            (&Cursor::default(), false),
             event_proxy.clone(),
             window_id,
             0,
@@ -1550,11 +1548,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         let mut cloned_config = self.config.clone();
         cloned_config.working_dir = self.working_dir_for_new_context();
 
-        let current = self.current();
-        let cursor = current.cursor_from_ref();
-
         match ContextManager::create_context(
-            (&cursor, current.renderable_content.has_blinking_enabled),
             self.event_proxy.clone(),
             self.window_id,
             rich_text_id,
@@ -1603,13 +1597,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             keyboard: config.keyboard,
             scrollback_history_limit: config.scrollback_history_limit,
             grapheme_clustering: config.grapheme_clustering,
+            cursor_shape: config.cursor.shape,
+            cursor_blinking: config.cursor.blinking,
         };
 
-        let current = self.current();
-        let cursor = current.cursor_from_ref();
-
         match ContextManager::create_context(
-            (&cursor, current.renderable_content.has_blinking_enabled),
             self.event_proxy.clone(),
             self.window_id,
             rich_text_id,
@@ -1647,7 +1639,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             cloned_config.working_dir = working_dir;
 
             let current = self.current();
-            let cursor = current.cursor_from_ref();
             let mut dimension = current.dimension;
 
             // If current has splits then shouldn't use that dimension
@@ -1656,7 +1647,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             }
 
             match ContextManager::create_context(
-                (&cursor, current.renderable_content.has_blinking_enabled),
                 self.event_proxy.clone(),
                 self.window_id,
                 rich_text_id,
@@ -2004,6 +1994,7 @@ pub mod test {
                 split_route,
                 99,
                 ContextDimension::default(),
+                Cursor::default(),
             ));
         manager.current_mut().title.content = "active split".into();
         let extracted_id = manager.current_grid().id();
@@ -2040,6 +2031,7 @@ pub mod test {
             hidden_split_route,
             2,
             ContextDimension::default(),
+            Cursor::default(),
         ));
 
         let hidden_index = manager
@@ -2067,6 +2059,7 @@ pub mod test {
                 1_000_001,
                 1,
                 ContextDimension::default(),
+                Cursor::default(),
             ));
         let routes = source.current_grid().route_ids();
         let queued = EventPayload::new(
@@ -2162,7 +2155,6 @@ pub mod test {
         config.shell.program = Some("/rio/does/not/exist".into());
 
         let manager = ContextManager::start(
-            (&Cursor::default(), false),
             VoidListener {},
             WindowId::from(1),
             7,
@@ -2176,6 +2168,52 @@ pub mod test {
         assert_ne!(manager.current_route(), 0);
         assert_eq!(manager.current().route_id, manager.current_route());
         assert_eq!(manager.current().rich_text_id, 7);
+    }
+
+    /// A manager whose current tab reports a hidden cursor, as a fullscreen
+    /// app or scrolled viewport would.
+    fn manager_with_hidden_source_cursor(
+        shape: rio_backend::ansi::CursorShape,
+    ) -> ContextManager<VoidListener> {
+        let mut manager =
+            ContextManager::start_with_capacity(2, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        manager.config.cursor_shape = shape;
+        manager
+            .current_mut()
+            .renderable_content
+            .cursor
+            .state
+            .content = rio_backend::ansi::CursorShape::Hidden;
+        manager
+    }
+
+    #[test]
+    fn new_tab_starts_with_the_configured_cursor() {
+        let mut manager =
+            manager_with_hidden_source_cursor(rio_backend::ansi::CursorShape::Beam);
+
+        manager.add_context(true, 1);
+
+        let cursor = &manager.current().renderable_content.cursor;
+        assert_eq!(cursor.state.content, rio_backend::ansi::CursorShape::Beam);
+        assert!(cursor.state.is_visible());
+        assert_eq!(cursor.content_ref, '|');
+    }
+
+    #[test]
+    fn new_split_starts_with_the_configured_cursor() {
+        let mut manager =
+            manager_with_hidden_source_cursor(rio_backend::ansi::CursorShape::Underline);
+
+        manager.split(1, false);
+
+        let cursor = &manager.current().renderable_content.cursor;
+        assert_eq!(
+            cursor.state.content,
+            rio_backend::ansi::CursorShape::Underline
+        );
+        assert!(cursor.state.is_visible());
     }
 
     #[test]
