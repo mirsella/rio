@@ -521,7 +521,9 @@ impl SessionClient {
                 .arg(listener_fd.to_string())
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                // The worker reports startup and connection failures on its
+                // stderr, the only visible side of a failed handshake.
+                .stderr(std::process::Stdio::inherit())
                 .pre_exec(move || {
                     let flags = libc::fcntl(listener_fd, libc::F_GETFD);
                     if flags == -1 {
@@ -1192,13 +1194,6 @@ impl SessionClient {
                 &mut connection.stream,
                 Instant::now() + FRAME_TIMEOUT,
             );
-            if let Err(error) = connection
-                .stream
-                .set_read_timeout(Some(Duration::from_millis(250)))
-            {
-                self.poison_stream(&connection.stream);
-                return Err(error.into());
-            }
             match result {
                 Ok(message) => match message {
                     ServerMessage::Event { generation, event } => {
@@ -1931,7 +1926,8 @@ fn connect_with_deadline(
         }
         break;
     }
-    stream.set_nonblocking(false)?;
+    // Frame deadlines poll the socket, so it must never block a transfer.
+    stream.set_nonblocking(true)?;
     Ok(stream)
 }
 
@@ -1948,14 +1944,14 @@ fn connect_until_ready(
         spec,
     };
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut stream = connect_with_deadline(&descriptor.endpoint, deadline)?;
-    stream.set_read_timeout(Some(Duration::from_millis(250)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(250)))?;
+    let mut stream = connect_with_deadline(&descriptor.endpoint, deadline)
+        .map_err(|error| codec::step_error("connect", error))?;
     codec::write_frame_until(
         &mut stream,
         &hello,
         deadline.min(Instant::now() + FRAME_TIMEOUT),
-    )?;
+    )
+    .map_err(|error| codec::step_error("send hello", error))?;
     let mut offered_generation = None;
     let mut claimed_generation = None;
     let mut initial_frame = None;
@@ -1963,7 +1959,8 @@ fn connect_until_ready(
         let message: ServerMessage = codec::read_frame_until(
             &mut stream,
             deadline.min(Instant::now() + FRAME_TIMEOUT),
-        )?;
+        )
+        .map_err(|error| codec::step_error("read handshake frame", error))?;
         message.validate()?;
         match message {
             ServerMessage::Ready {
@@ -2003,7 +2000,8 @@ fn connect_until_ready(
                     &mut stream,
                     &ClientMessage::Claim { generation },
                     deadline.min(Instant::now() + FRAME_TIMEOUT),
-                )?;
+                )
+                .map_err(|error| codec::step_error("send claim", error))?;
             }
             ServerMessage::Claimed { generation } => {
                 if generation == 0 {
@@ -2025,7 +2023,8 @@ fn connect_until_ready(
                     let message: ServerMessage = codec::read_frame_until(
                         &mut stream,
                         deadline.min(Instant::now() + FRAME_TIMEOUT),
-                    )?;
+                    )
+                    .map_err(|error| codec::step_error("read initial frame", error))?;
                     message.validate()?;
                     match message {
                         ServerMessage::Initial {
@@ -2062,7 +2061,8 @@ fn connect_until_ready(
                     &mut stream,
                     &ClientMessage::Commit { generation },
                     deadline.min(Instant::now() + FRAME_TIMEOUT),
-                )?;
+                )
+                .map_err(|error| codec::step_error("send commit", error))?;
             }
             ServerMessage::Initial { .. } => {
                 return Err(SessionError::protocol(
