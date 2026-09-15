@@ -32,7 +32,7 @@ use std::sync::Mutex;
 #[cfg(unix)]
 use std::thread;
 #[cfg(unix)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd};
@@ -47,6 +47,12 @@ const MAX_LAYOUT_NODES: usize = MAX_OFFERS * 4;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(unix)]
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// A response that waits on the user, such as a drag or offer decision.
+#[cfg(unix)]
+const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a discovery probe waits on one peer.
+#[cfg(unix)]
+const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, bincode::Encode, bincode::Decode)]
 pub struct WindowEndpoint {
@@ -670,24 +676,29 @@ impl WindowControl {
                         }
                         let probe = || -> Result<bool, Box<dyn std::error::Error>> {
                             let mut stream = UnixStream::connect(&target.endpoint)?;
-                            stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-                            stream.set_write_timeout(Some(Duration::from_millis(500)))?;
-                            codec::write_frame(
+                            stream.set_nonblocking(true)?;
+                            let deadline = || Instant::now() + PROBE_TIMEOUT;
+                            codec::write_frame_until(
                                 &mut stream,
                                 &Request::Hello {
                                     version: VERSION,
                                     capability: target.capability,
                                 },
+                                deadline(),
                             )?;
                             if !matches!(
-                                codec::read_frame(&mut stream)?,
+                                codec::read_frame_until(&mut stream, deadline())?,
                                 WindowControlResponse::Hello
                             ) {
                                 return Ok(false);
                             }
-                            codec::write_frame(&mut stream, &Request::Probe)?;
+                            codec::write_frame_until(
+                                &mut stream,
+                                &Request::Probe,
+                                deadline(),
+                            )?;
                             Ok(matches!(
-                                codec::read_frame(&mut stream)?,
+                                codec::read_frame_until(&mut stream, deadline())?,
                                 WindowControlResponse::Hello
                             ))
                         };
@@ -857,13 +868,16 @@ impl WindowControl {
                                     "window control queue is full".to_string()
                                 })?;
                             listener.send_event(RioEvent::Render, window_id);
-                            let response = reply_receiver
-                                .recv_timeout(Duration::from_secs(30))
-                                .map_err(|_| {
-                                    "drag transfer preparation timed out".to_string()
-                                })?;
-                            codec::write_frame(&mut stream, &response)
-                                .map_err(|error| error.to_string())?;
+                            let response =
+                                reply_receiver.recv_timeout(REPLY_TIMEOUT).map_err(
+                                    |_| "drag transfer preparation timed out".to_string(),
+                                )?;
+                            codec::write_frame_until(
+                                &mut stream,
+                                &response,
+                                Instant::now() + REPLY_TIMEOUT,
+                            )
+                            .map_err(|error| error.to_string())?;
                             return match response {
                                 WindowControlResponse::Committed { routes }
                                     if !routes.is_empty() =>
@@ -1423,11 +1437,31 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
         Mutex<HashMap<[u8; 16], TransferOffer>>,
     >,
 ) {
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    let request: Request = match codec::read_frame(&mut stream) {
-        Ok(request) => request,
-        Err(_) => return,
+    // BSD accept() already hands over a nonblocking socket, and the codec polls
+    // between transfers, so a nonblocking stream is what both expect.
+    if stream.set_nonblocking(true).is_err() {
+        return;
+    }
+    fn read_request(stream: &mut UnixStream) -> Option<Request> {
+        match codec::read_frame_until(stream, Instant::now() + IO_TIMEOUT) {
+            Ok(request) => Some(request),
+            Err(error) => {
+                tracing::debug!(%error, "window control request failed");
+                None
+            }
+        }
+    }
+    fn send_response(stream: &mut UnixStream, response: &WindowControlResponse) -> bool {
+        match codec::write_frame_until(stream, response, Instant::now() + IO_TIMEOUT) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::debug!(%error, "window control response failed");
+                false
+            }
+        }
+    }
+    let Some(request) = read_request(&mut stream) else {
+        return;
     };
     let Request::Hello {
         version,
@@ -1439,12 +1473,11 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
     if version != VERSION || presented_capability != expected_capability {
         return;
     }
-    if codec::write_frame(&mut stream, &WindowControlResponse::Hello).is_err() {
+    if !send_response(&mut stream, &WindowControlResponse::Hello) {
         return;
     }
-    let request = match codec::read_frame(&mut stream) {
-        Ok(request) => request,
-        Err(_) => return,
+    let Some(request) = read_request(&mut stream) else {
+        return;
     };
     match &request {
         Request::ArmSelection {
@@ -1456,7 +1489,7 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
                 "received native merge target arm request"
             );
             if source.validate().is_err() || *selection_id == [0; 16] {
-                let _ = codec::write_frame(
+                send_response(
                     &mut stream,
                     &WindowControlResponse::Rejected(
                         "invalid window selection request".into(),
@@ -1474,7 +1507,7 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
                 })
                 .is_err()
             {
-                let _ = codec::write_frame(
+                send_response(
                     &mut stream,
                     &WindowControlResponse::Rejected("target busy".into()),
                 );
@@ -1486,7 +1519,7 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
                 WindowControlResponse::Rejected("target did not arm selection".into())
             });
             tracing::info!(target_window = ?window_id, "native merge target arm response ready");
-            let _ = codec::write_frame(&mut stream, &response);
+            send_response(&mut stream, &response);
             return;
         }
         Request::CancelSelection { selection_id } => {
@@ -1495,10 +1528,7 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
                 selection_id: *selection_id,
             });
             event_proxy.send_event(RioEvent::Render, window_id);
-            let _ = codec::write_frame(
-                &mut stream,
-                &WindowControlResponse::SelectionCancelled,
-            );
+            send_response(&mut stream, &WindowControlResponse::SelectionCancelled);
             return;
         }
         Request::SelectionEvent {
@@ -1517,14 +1547,14 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
                     })
                     .is_err()
             {
-                let _ = codec::write_frame(
+                send_response(
                     &mut stream,
                     &WindowControlResponse::Rejected("source busy".into()),
                 );
                 return;
             }
             event_proxy.send_event(RioEvent::Render, window_id);
-            let _ = codec::write_frame(&mut stream, &WindowControlResponse::Hello);
+            send_response(&mut stream, &WindowControlResponse::Hello);
             return;
         }
         _ => {}
@@ -1537,7 +1567,7 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
             let target_index = match target_index.map(usize::try_from).transpose() {
                 Ok(target_index) => target_index,
                 Err(_) => {
-                    let _ = codec::write_frame(
+                    send_response(
                         &mut stream,
                         &WindowControlResponse::Rejected(
                             "transfer target index is not representable".into(),
@@ -1555,7 +1585,7 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
                 .ok()
                 .and_then(|mut offers| offers.remove(&transfer_id));
             let Some(offer) = offer else {
-                let _ = codec::write_frame(
+                send_response(
                     &mut stream,
                     &WindowControlResponse::Rejected(
                         "drag transfer is unavailable".into(),
@@ -1564,14 +1594,15 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
                 return;
             };
             if offer.validate().is_err()
-                || codec::write_frame(&mut stream, &WindowControlResponse::Offer(offer))
-                    .is_err()
+                || !send_response(&mut stream, &WindowControlResponse::Offer(offer))
             {
                 return;
             }
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-            let result = match codec::read_frame::<_, WindowControlResponse>(&mut stream)
-            {
+            // The user answers a drag, so this waits much longer than a probe.
+            let result = match codec::read_frame_until::<WindowControlResponse>(
+                &mut stream,
+                Instant::now() + REPLY_TIMEOUT,
+            ) {
                 Ok(WindowControlResponse::Committed { routes }) => Ok(routes),
                 Ok(WindowControlResponse::Rejected(reason)) => Err(reason),
                 Ok(_) => Err("target returned an invalid drag commit response".into()),
@@ -1590,7 +1621,7 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
         }
         #[cfg(not(all(feature = "wayland", target_os = "linux")))]
         Request::Take(_) => {
-            let _ = codec::write_frame(
+            send_response(
                 &mut stream,
                 &WindowControlResponse::Rejected("drag transfer is unavailable".into()),
             );
@@ -1604,7 +1635,7 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
             {
                 event_proxy.send_event(RioEvent::Render, window_id);
                 if let Ok(response) = response.recv_timeout(IO_TIMEOUT) {
-                    let _ = codec::write_frame(&mut stream, &response);
+                    send_response(&mut stream, &response);
                 }
             }
             return;
@@ -1615,7 +1646,7 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
         | Request::SelectionEvent { .. } => return,
     };
     if offer.validate().is_err() {
-        let _ = codec::write_frame(
+        send_response(
             &mut stream,
             &WindowControlResponse::Rejected("invalid transfer".into()),
         );
@@ -1631,7 +1662,7 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
         })
         .is_err()
     {
-        let _ = codec::write_frame(
+        send_response(
             &mut stream,
             &WindowControlResponse::Rejected("target busy".into()),
         );
@@ -1639,11 +1670,28 @@ fn handle_connection<T: EventListener + Clone + Send + 'static>(
     }
     event_proxy.send_event(RioEvent::Render, window_id);
     let response = reply_receiver
-        .recv_timeout(Duration::from_secs(30))
+        .recv_timeout(REPLY_TIMEOUT)
         .unwrap_or_else(|_| {
             WindowControlResponse::Rejected("target did not prepare transfer".into())
         });
-    let _ = codec::write_frame(&mut stream, &response);
+    send_response(&mut stream, &response);
+}
+
+/// Sends one authenticated request and reads the target's response.
+#[cfg(unix)]
+fn exchange(
+    target: &WindowEndpoint,
+    request: &Request,
+    reply_timeout: Duration,
+) -> Result<WindowControlResponse, String> {
+    let mut stream = authenticated_stream(target)?;
+    codec::write_frame_until(&mut stream, request, Instant::now() + IO_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    codec::read_frame_until::<WindowControlResponse>(
+        &mut stream,
+        Instant::now() + reply_timeout,
+    )
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(unix)]
@@ -1652,21 +1700,14 @@ fn send_offer(
     offer: &TransferOffer,
     target_index: Option<u32>,
 ) -> Result<Vec<u64>, String> {
-    let mut stream = authenticated_stream(target)?;
-    codec::write_frame(
-        &mut stream,
+    match exchange(
+        target,
         &Request::Offer {
             offer: offer.clone(),
             target_index,
         },
-    )
-    .map_err(|error| error.to_string())?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(|error| error.to_string())?;
-    match codec::read_frame::<_, WindowControlResponse>(&mut stream)
-        .map_err(|error| error.to_string())?
-    {
+        REPLY_TIMEOUT,
+    )? {
         WindowControlResponse::Committed { routes } => Ok(routes),
         WindowControlResponse::Rejected(reason) => Err(reason),
         _ => Err("target returned an invalid transfer response".into()),
@@ -1678,21 +1719,22 @@ fn authenticated_stream(endpoint: &WindowEndpoint) -> Result<UnixStream, String>
     let mut stream = UnixStream::connect(&endpoint.endpoint)
         .map_err(|error| format!("connect window control endpoint: {error}"))?;
     stream
-        .set_read_timeout(Some(IO_TIMEOUT))
+        .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .map_err(|error| error.to_string())?;
-    codec::write_frame(
+    codec::write_frame_until(
         &mut stream,
         &Request::Hello {
             version: VERSION,
             capability: endpoint.capability,
         },
+        Instant::now() + IO_TIMEOUT,
     )
     .map_err(|error| error.to_string())?;
-    match codec::read_frame::<_, WindowControlResponse>(&mut stream)
-        .map_err(|error| error.to_string())?
+    match codec::read_frame_until::<WindowControlResponse>(
+        &mut stream,
+        Instant::now() + IO_TIMEOUT,
+    )
+    .map_err(|error| error.to_string())?
     {
         WindowControlResponse::Hello => Ok(stream),
         _ => Err("window control authentication was rejected".into()),
@@ -1705,18 +1747,14 @@ fn send_arm_selection(
     selection_id: [u8; 16],
     source: &WindowEndpoint,
 ) -> Result<(), String> {
-    let mut stream = authenticated_stream(target)?;
-    codec::write_frame(
-        &mut stream,
+    match exchange(
+        target,
         &Request::ArmSelection {
             selection_id,
             source: source.clone(),
         },
-    )
-    .map_err(|error| error.to_string())?;
-    match codec::read_frame::<_, WindowControlResponse>(&mut stream)
-        .map_err(|error| error.to_string())?
-    {
+        IO_TIMEOUT,
+    )? {
         WindowControlResponse::SelectionArmed => Ok(()),
         WindowControlResponse::Rejected(reason) => Err(reason),
         _ => Err("target returned an invalid selection response".into()),
@@ -1728,12 +1766,11 @@ fn send_cancel_selection(
     target: &WindowEndpoint,
     selection_id: [u8; 16],
 ) -> Result<(), String> {
-    let mut stream = authenticated_stream(target)?;
-    codec::write_frame(&mut stream, &Request::CancelSelection { selection_id })
-        .map_err(|error| error.to_string())?;
-    match codec::read_frame::<_, WindowControlResponse>(&mut stream)
-        .map_err(|error| error.to_string())?
-    {
+    match exchange(
+        target,
+        &Request::CancelSelection { selection_id },
+        IO_TIMEOUT,
+    )? {
         WindowControlResponse::SelectionCancelled => Ok(()),
         WindowControlResponse::Rejected(reason) => Err(reason),
         _ => Err("target returned an invalid selection cleanup response".into()),
@@ -1748,20 +1785,16 @@ fn send_selection_event(
     target_index: u32,
     clicked: bool,
 ) -> Result<(), String> {
-    let mut stream = authenticated_stream(source)?;
-    codec::write_frame(
-        &mut stream,
+    match exchange(
+        source,
         &Request::SelectionEvent {
             selection_id,
             target_window,
             target_index,
             clicked,
         },
-    )
-    .map_err(|error| error.to_string())?;
-    match codec::read_frame::<_, WindowControlResponse>(&mut stream)
-        .map_err(|error| error.to_string())?
-    {
+        IO_TIMEOUT,
+    )? {
         WindowControlResponse::Hello => Ok(()),
         WindowControlResponse::Rejected(reason) => Err(reason),
         _ => Err("source returned an invalid selection event response".into()),
@@ -1774,10 +1807,17 @@ fn take_offer(
     transfer_id: [u8; 16],
 ) -> Result<Option<(TransferOffer, UnixStream)>, String> {
     let mut stream = authenticated_stream(target)?;
-    codec::write_frame(&mut stream, &Request::Take(transfer_id))
-        .map_err(|error| error.to_string())?;
-    match codec::read_frame::<_, WindowControlResponse>(&mut stream)
-        .map_err(|error| error.to_string())?
+    codec::write_frame_until(
+        &mut stream,
+        &Request::Take(transfer_id),
+        Instant::now() + IO_TIMEOUT,
+    )
+    .map_err(|error| error.to_string())?;
+    match codec::read_frame_until::<WindowControlResponse>(
+        &mut stream,
+        Instant::now() + IO_TIMEOUT,
+    )
+    .map_err(|error| error.to_string())?
     {
         WindowControlResponse::Offer(offer) => {
             offer.validate()?;
