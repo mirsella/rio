@@ -78,11 +78,11 @@ fn shorten_path(absolute: &str) -> String {
 fn current_path<T: rio_backend::event::EventListener>(
     context: &Context<T>,
 ) -> Option<String> {
-    context
-        .terminal
-        .lock()
-        .current_directory
-        .clone()
+    // Take an owned copy first: the lock guard must be dropped before the
+    // `or_else` fallback below, because `foreground_process_path` locks the
+    // terminal as well and the mutex is not reentrant.
+    let directory = context.terminal.lock().current_directory.clone();
+    directory
         .and_then(|path| path.into_os_string().into_string().ok())
         .or_else(|| {
             context
@@ -296,6 +296,52 @@ pub mod test {
             update_title("{{ relative_path || title }}", &context),
             String::from("/rio-sandbox-test-dir"),
         );
+    }
+
+    #[test]
+    fn test_update_title_without_cwd_does_not_deadlock() {
+        // Fresh tabs have no CWD yet; resolving a path variable must not
+        // re-lock the terminal while the first guard is still held
+        // (parking_lot mutexes are not reentrant, so the event loop would
+        // park forever and freeze the whole window).
+        let context_dimension = ContextDimension::build(
+            1200.0,
+            800.0,
+            TextDimensions {
+                scale: 2.,
+                width: 18.,
+                height: 9.,
+            },
+            rio_backend::sugarloaf::layout::CellMetrics {
+                cell_width: 18,
+                cell_height: 9,
+                cell_baseline: 0,
+                face_width: 18.0,
+                face_height: 9.0,
+                face_y: 0.0,
+            },
+            1.0,
+            14.0,
+            Margin::default(),
+        );
+        let context =
+            create_mock_context(VoidListener {}, WindowId::from(0), 0, context_dimension);
+        assert!(context.terminal.lock().current_directory.is_none());
+
+        // `Context` is not `Send`, so the update runs on this thread while a
+        // watchdog fails the test run instead of hanging CI forever.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog_done = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            if !watchdog_done.load(std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("title update deadlocked with unset CWD");
+                std::process::exit(42);
+            }
+        });
+        let title = update_title("{{ TITLE || RELATIVE_PATH }}", &context);
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(title, String::from(""));
     }
 
     #[test]
