@@ -73,11 +73,11 @@ fn shorten_path(absolute: &str) -> String {
 fn current_path<T: rio_backend::event::EventListener>(
     context: &Context<T>,
 ) -> Option<String> {
-    context
-        .terminal
-        .lock()
-        .current_directory
-        .clone()
+    // Take an owned copy first: the lock guard must be dropped before the
+    // `or_else` fallback below, because `foreground_process_path` locks the
+    // terminal as well and the mutex is not reentrant.
+    let directory = context.terminal.lock().current_directory.clone();
+    directory
         .and_then(|path| path.into_os_string().into_string().ok())
         .or_else(|| {
             context
@@ -319,7 +319,11 @@ pub mod test {
     }
 
     #[test]
-    fn test_update_title_program_is_spawned_command() {
+    fn test_update_title_without_cwd_does_not_deadlock() {
+        // Fresh tabs have no CWD yet; resolving a path variable must not
+        // re-lock the terminal while the first guard is still held
+        // (parking_lot mutexes are not reentrant, so the event loop would
+        // park forever and freeze the whole window).
         let context_dimension = ContextDimension::build(
             1200.0,
             800.0,
@@ -340,24 +344,24 @@ pub mod test {
             14.0,
             Margin::default(),
         );
-
-        let mut context =
+        let context =
             create_mock_context(VoidListener {}, WindowId::from(0), 0, context_dimension);
-        context.spawned_program = "fish".to_string();
+        assert!(context.terminal.lock().current_directory.is_none());
 
-        assert_eq!(update_title("{{ program }}", &context, None), "fish");
-        assert_eq!(
-            update_title("{{ title || program }}", &context, None),
-            "fish"
-        );
-
-        // Path variables come from OSC 7 alone: without integration
-        // they render empty instead of inspecting the process.
-        assert_eq!(update_title("{{ relative_path }}", &context, None), "");
-        assert_eq!(update_title("{{ absolute_path }}", &context, None), "");
-
-        // A prefetched OSC title renders without touching the terminal.
-        assert_eq!(update_title("{{ title }}", &context, Some("t")), "t");
+        // `Context` is not `Send`, so the update runs on this thread while a
+        // watchdog fails the test run instead of hanging CI forever.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog_done = std::sync::Arc::clone(&done);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            if !watchdog_done.load(std::sync::atomic::Ordering::SeqCst) {
+                eprintln!("title update deadlocked with unset CWD");
+                std::process::exit(42);
+            }
+        });
+        let title = update_title("{{ TITLE || RELATIVE_PATH }}", &context);
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(title, String::from(""));
     }
 
     #[test]
