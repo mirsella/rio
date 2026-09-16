@@ -98,12 +98,9 @@ impl TitleSnapshot {
 }
 
 fn current_path(current_directory: Option<&PathBuf>) -> Option<String> {
-    let directory = current_directory?;
-    match directory.as_os_str().to_str() {
-        Some(valid) => Some(valid.to_owned()),
-        // Fall back to a lossy conversion for non-UTF8 paths.
-        None => Some(directory.to_string_lossy().into_owned()),
-    }
+    // Lossy conversion is the identity for valid UTF-8, so this covers both
+    // cases without branching.
+    current_directory.map(|directory| directory.to_string_lossy().into_owned())
 }
 
 fn variable_value(variable: &str, snapshot: &TitleSnapshot) -> Option<String> {
@@ -243,16 +240,7 @@ pub mod test {
             String::from("64x84")
         );
 
-        assert_eq!(
-            update_title("{{ title }}", &context, None),
-            String::from("")
-        );
-
-        // #[cfg(unix)]
-        // assert_eq!(
-        //     update_title("{{path_absolute}}"), &context)
-        //     String::from("")
-        // );
+        assert_eq!(update_title("{{ title }}", &context), String::from(""));
     }
 
     #[test]

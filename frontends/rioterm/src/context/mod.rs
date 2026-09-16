@@ -445,9 +445,7 @@ fn resolve_context_working_dir<T: EventListener>(
                 window_id,
                 RioErrorType::WorkingDirectoryFallback {
                     requested,
-                    fallback: fallback
-                        .clone()
-                        .unwrap_or_else(|| "the default directory".to_string()),
+                    fallback: fallback.clone(),
                 },
                 RioErrorLevel::Warning,
             );
@@ -2746,9 +2744,17 @@ pub mod test {
         }
     }
 
+    static TEST_DIR_NEXT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     fn scoped_test_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("rio-resolve-wd-test-{name}-{}", std::process::id()));
+        // Unique per call: tests run in parallel in one process, so a bare
+        // name would share one directory across tests.
+        let unique = TEST_DIR_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "rio-resolve-wd-test-{name}-{}-{unique}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
