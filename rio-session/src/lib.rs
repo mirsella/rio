@@ -1243,22 +1243,28 @@ impl SessionClient {
 
     #[cfg(unix)]
     pub fn worker_pid(&self) -> Option<u32> {
-        self.worker
-            .lock()
+        self.lock_worker()
             .ok()?
             .as_ref()
             .map(std::process::Child::id)
+    }
+
+    /// Lock the spawned worker child, mapping poisoning to a protocol error.
+    #[cfg(unix)]
+    fn lock_worker(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<std::process::Child>>, SessionError>
+    {
+        self.worker
+            .lock()
+            .map_err(|_| SessionError::protocol("worker lock poisoned"))
     }
 
     /// Wait for a worker process this client spawned. This never sends a
     /// signal; callers decide whether the worker should still be running.
     #[cfg(unix)]
     pub fn wait_worker(&self) -> Result<Option<std::process::ExitStatus>, SessionError> {
-        let mut worker = self
-            .worker
-            .lock()
-            .map_err(|_| SessionError::protocol("worker lock poisoned"))?;
-        worker
+        self.lock_worker()?
             .as_mut()
             .map(std::process::Child::wait)
             .transpose()
@@ -1271,11 +1277,7 @@ impl SessionClient {
     /// a detached transfer target) is left alone.
     #[cfg(unix)]
     pub fn reap_worker(&self) -> Result<Option<std::process::ExitStatus>, SessionError> {
-        let mut worker = self
-            .worker
-            .lock()
-            .map_err(|_| SessionError::protocol("worker lock poisoned"))?;
-        worker
+        self.lock_worker()?
             .as_mut()
             .map(std::process::Child::try_wait)
             .transpose()
