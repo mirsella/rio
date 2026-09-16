@@ -62,6 +62,12 @@ pub enum RioErrorType {
     // background image referenced in config could not be loaded
     BackgroundImageLoadFailure(String),
 
+    // requested working directory was unusable; the session started elsewhere
+    WorkingDirectoryFallback {
+        requested: String,
+        fallback: String,
+    },
+
     // reports that are ignored by RioErrorType
     IgnoredReport,
 }
@@ -100,6 +106,32 @@ impl std::fmt::Display for RioErrorType {
                     "Could not load the configured background image:\n\n{message}\n\nCheck `window.background-image.path` in your config."
                 )
             }
+            RioErrorType::WorkingDirectoryFallback {
+                requested,
+                fallback,
+            } => {
+                write!(
+                    f,
+                    "Working directory \"{requested}\" is not available; started in \"{fallback}\" instead."
+                )
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn working_directory_fallback_message_names_both_dirs() {
+        let report = RioErrorType::WorkingDirectoryFallback {
+            requested: "/gone/stale".to_string(),
+            fallback: "/home/user".to_string(),
+        };
+        assert_eq!(
+            report.to_string(),
+            "Working directory \"/gone/stale\" is not available; started in \"/home/user\" instead."
+        );
     }
 }
