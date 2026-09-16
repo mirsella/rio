@@ -1558,35 +1558,41 @@ impl ResolvedWorkingDir {
 }
 
 /// Pick a working directory for a new session: the inherited tab directory
-/// first, then the configured one, then the home directory. The first usable
-/// candidate wins; a stale entry degrades to the next one instead of handing
-/// the worker a directory whose shell would die instantly.
+/// first, then the configured one. The first usable candidate wins; a stale
+/// entry degrades to the next one instead of handing the worker a directory
+/// whose shell would die instantly. Home is only a fallback for a requested
+/// directory that went stale: when nothing was requested the worker keeps
+/// its default directory (the GUI's own), exactly as before.
 pub fn resolve_working_dir(
     inherited: Option<String>,
     configured: Option<String>,
     home: Option<String>,
 ) -> ResolvedWorkingDir {
     let mut requested: Option<String> = None;
-    for candidate in [inherited, configured, home].into_iter().flatten() {
-        if usable_directory(std::path::Path::new(&candidate)) {
+    for candidate in [inherited, configured] {
+        let Some(dir) = candidate else {
+            continue;
+        };
+        if usable_directory(std::path::Path::new(&dir)) {
             return match requested {
                 Some(requested) => ResolvedWorkingDir::Stale {
                     requested,
-                    fallback: Some(candidate),
+                    fallback: Some(dir),
                 },
-                None => ResolvedWorkingDir::Direct(candidate),
+                None => ResolvedWorkingDir::Direct(dir),
             };
         }
         if requested.is_none() {
-            requested = Some(candidate);
+            requested = Some(dir);
         }
     }
-    match requested {
-        Some(requested) => ResolvedWorkingDir::Stale {
-            requested,
-            fallback: None,
-        },
-        None => ResolvedWorkingDir::Unset,
+    let Some(requested) = requested else {
+        return ResolvedWorkingDir::Unset;
+    };
+    let fallback = home.filter(|home| usable_directory(std::path::Path::new(home)));
+    ResolvedWorkingDir::Stale {
+        requested,
+        fallback,
     }
 }
 
@@ -2353,10 +2359,22 @@ mod tests {
             resolve_working_dir(None, Some(strings(&configured)), Some(strings(&home))),
             ResolvedWorkingDir::Direct(path) if path == strings(&configured)
         ));
-        // Nothing was requested, so home applies silently.
+        // Nothing was requested, so the worker keeps its default directory
+        // instead of being forced into home.
         assert!(matches!(
             resolve_working_dir(None, None, Some(strings(&home))),
-            ResolvedWorkingDir::Direct(path) if path == strings(&home)
+            ResolvedWorkingDir::Unset
+        ));
+        // A stale configured directory still falls back to home with a notice.
+        assert!(matches!(
+            resolve_working_dir(
+                None,
+                Some("/gone/stale/configured".to_string()),
+                Some(strings(&home)),
+            ),
+            ResolvedWorkingDir::Stale { requested, fallback }
+                if requested == "/gone/stale/configured"
+                    && fallback.as_deref() == Some(strings(&home).as_str())
         ));
 
         std::fs::remove_dir_all(&inherited).unwrap();
