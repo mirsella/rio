@@ -2291,9 +2291,17 @@ mod tests {
         std::fs::remove_dir(directory).unwrap();
     }
 
+    static TEST_DIR_NEXT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     fn scoped_test_dir(name: &str) -> std::path::PathBuf {
-        let directory = std::env::temp_dir()
-            .join(format!("rio-usable-dir-test-{name}-{}", std::process::id()));
+        // Unique per call: tests run in parallel in one process, so a bare
+        // name would share one directory across tests.
+        let unique = TEST_DIR_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "rio-usable-dir-test-{name}-{}-{unique}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         directory
