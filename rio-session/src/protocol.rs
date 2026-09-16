@@ -1533,6 +1533,63 @@ pub fn usable_directory(path: &std::path::Path) -> bool {
     path.is_absolute() && path.is_dir() && std::fs::read_dir(path).is_ok()
 }
 
+/// Where a new tab or split should start.
+pub enum ResolvedWorkingDir {
+    /// No candidate was given; the worker keeps its default directory.
+    Unset,
+    /// A usable directory; start there silently.
+    Direct(String),
+    /// The expected directory is gone. Start in `fallback` — or the default
+    /// directory when it is `None` — and tell the user what happened.
+    Stale {
+        requested: String,
+        fallback: Option<String>,
+    },
+}
+
+impl ResolvedWorkingDir {
+    pub fn into_path(self) -> Option<String> {
+        match self {
+            ResolvedWorkingDir::Unset => None,
+            ResolvedWorkingDir::Direct(path) => Some(path),
+            ResolvedWorkingDir::Stale { fallback, .. } => fallback,
+        }
+    }
+}
+
+/// Pick a working directory for a new session: the inherited tab directory
+/// first, then the configured one, then the home directory. The first usable
+/// candidate wins; a stale entry degrades to the next one instead of handing
+/// the worker a directory whose shell would die instantly.
+pub fn resolve_working_dir(
+    inherited: Option<String>,
+    configured: Option<String>,
+    home: Option<String>,
+) -> ResolvedWorkingDir {
+    let mut requested: Option<String> = None;
+    for candidate in [inherited, configured, home].into_iter().flatten() {
+        if usable_directory(std::path::Path::new(&candidate)) {
+            return match requested {
+                Some(requested) => ResolvedWorkingDir::Stale {
+                    requested,
+                    fallback: Some(candidate),
+                },
+                None => ResolvedWorkingDir::Direct(candidate),
+            };
+        }
+        if requested.is_none() {
+            requested = Some(candidate);
+        }
+    }
+    match requested {
+        Some(requested) => ResolvedWorkingDir::Stale {
+            requested,
+            fallback: None,
+        },
+        None => ResolvedWorkingDir::Unset,
+    }
+}
+
 fn validate_dimensions(columns: u16, lines: u16) -> Result<(), crate::SessionError> {
     if columns == 0 || lines == 0 {
         return Err(crate::SessionError::invalid(
@@ -1550,6 +1607,18 @@ fn validate_dimensions(columns: u16, lines: u16) -> Result<(), crate::SessionErr
         ));
     }
     Ok(())
+}
+
+/// Clamp a surface size into the session protocol limits. A zero-size surface
+/// (minimized or hidden window) or an absurd one degrades to the nearest
+/// valid size; opening a tab never fails on dimensions.
+pub fn sanitize_session_dimensions(columns: usize, lines: usize) -> (u16, u16) {
+    let columns = (columns as u64).clamp(1, u64::from(MAX_COLUMNS));
+    let max_lines = (MAX_FRAME_CELLS as u64 / columns)
+        .max(1)
+        .min(u64::from(MAX_LINES));
+    let lines = (lines as u64).clamp(1, max_lines);
+    (columns as u16, lines as u16)
 }
 
 fn validate_pixel_dimensions(width: u16, height: u16) -> Result<(), crate::SessionError> {
@@ -2263,5 +2332,93 @@ mod tests {
             return;
         }
         assert!(!usable);
+    }
+
+    #[test]
+    fn resolver_prefers_inherited_then_configured_then_home() {
+        let inherited = scoped_test_dir("inherited");
+        let configured = scoped_test_dir("configured");
+        let home = scoped_test_dir("home");
+        let strings = |dir: &std::path::PathBuf| dir.to_string_lossy().into_owned();
+
+        assert!(matches!(
+            resolve_working_dir(
+                Some(strings(&inherited)),
+                Some(strings(&configured)),
+                Some(strings(&home)),
+            ),
+            ResolvedWorkingDir::Direct(path) if path == strings(&inherited)
+        ));
+        assert!(matches!(
+            resolve_working_dir(None, Some(strings(&configured)), Some(strings(&home))),
+            ResolvedWorkingDir::Direct(path) if path == strings(&configured)
+        ));
+        // Nothing was requested, so home applies silently.
+        assert!(matches!(
+            resolve_working_dir(None, None, Some(strings(&home))),
+            ResolvedWorkingDir::Direct(path) if path == strings(&home)
+        ));
+
+        std::fs::remove_dir_all(&inherited).unwrap();
+        std::fs::remove_dir_all(&configured).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn resolver_reports_the_first_stale_entry() {
+        let configured = scoped_test_dir("configured");
+        let configured_path = configured.to_string_lossy().into_owned();
+
+        let resolution = resolve_working_dir(
+            Some("/gone/stale/inherited".to_string()),
+            Some(configured_path.clone()),
+            Some("/home/someone".to_string()),
+        );
+        assert!(matches!(
+            &resolution,
+            ResolvedWorkingDir::Stale { requested, fallback }
+                if requested == "/gone/stale/inherited"
+                    && fallback.as_deref() == Some(configured_path.as_str())
+        ));
+        assert_eq!(resolution.into_path(), Some(configured_path));
+
+        std::fs::remove_dir_all(&configured).unwrap();
+    }
+
+    #[test]
+    fn resolver_without_anything_usable_reports_without_a_path() {
+        let resolution = resolve_working_dir(
+            Some("/gone/stale/inherited".to_string()),
+            Some("/gone/stale/configured".to_string()),
+            None,
+        );
+        assert!(matches!(
+            &resolution,
+            ResolvedWorkingDir::Stale { requested, fallback }
+                if requested == "/gone/stale/inherited" && fallback.is_none()
+        ));
+        assert_eq!(resolution.into_path(), None);
+    }
+
+    #[test]
+    fn resolver_with_no_candidates_is_unset() {
+        assert!(matches!(
+            resolve_working_dir(None, None, None),
+            ResolvedWorkingDir::Unset
+        ));
+        assert_eq!(resolve_working_dir(None, None, None).into_path(), None);
+    }
+
+    #[test]
+    fn session_dimensions_degrade_instead_of_failing() {
+        assert_eq!(sanitize_session_dimensions(80, 24), (80, 24));
+        assert_eq!(sanitize_session_dimensions(0, 0), (1, 1));
+        assert_eq!(sanitize_session_dimensions(2000, 100), (1024, 100));
+        assert_eq!(sanitize_session_dimensions(80, 5000), (80, 1024));
+        // The cell product stays within the frame transport limit.
+        assert_eq!(
+            sanitize_session_dimensions(usize::MAX, usize::MAX),
+            (1024, 256)
+        );
     }
 }

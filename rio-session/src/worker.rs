@@ -10,11 +10,12 @@ mod unix {
     use super::super::snapshot::Snapshotter;
     use crate::codec;
     use crate::protocol::{
-        usable_directory, ClientMessage, EnvVar, ErrorCode, KeyAction as WireKeyAction,
-        KeyCode, KeyInput, RequestKind, RequestRefusalReason, SearchDirection,
-        SearchMatch, SelectionKind, SelectionSide, ServerMessage, SessionCommand,
-        SessionEvent, SessionId, SessionReply, SessionSpec, MAX_PENDING_INPUT_BYTES,
-        MAX_PENDING_REQUESTS, MAX_SELECTION_LINES, PROTOCOL_VERSION,
+        resolve_working_dir, ClientMessage, EnvVar, ErrorCode,
+        KeyAction as WireKeyAction, KeyCode, KeyInput, RequestKind, RequestRefusalReason,
+        ResolvedWorkingDir, SearchDirection, SearchMatch, SelectionKind, SelectionSide,
+        ServerMessage, SessionCommand, SessionEvent, SessionId, SessionReply,
+        SessionSpec, MAX_PENDING_INPUT_BYTES, MAX_PENDING_REQUESTS, MAX_SELECTION_LINES,
+        PROTOCOL_VERSION,
     };
     use crate::readiness;
     use crate::{
@@ -650,15 +651,32 @@ mod unix {
         current: Option<(rio_vt::crosswords::pos::Pos, rio_vt::crosswords::pos::Pos)>,
     }
 
-    /// Last-resort working directory when the requested one went stale: the
-    /// caller's `$HOME` if usable, otherwise `None` (the worker then
-    /// inherits its own current directory, which always exists).
-    fn fallback_working_dir(environment: &[EnvVar]) -> Option<String> {
-        environment
+    /// Resolve the requested working directory through the shared chain. A
+    /// directory that went stale between the client's check and the spawn
+    /// falls back to the session's `$HOME` instead of killing the tab; the
+    /// GUI already warned unless the race hit after its check, in which case
+    /// the journal records it.
+    fn resolve_worker_working_dir(
+        working_dir: Option<String>,
+        environment: &[EnvVar],
+    ) -> Option<String> {
+        let home = environment
             .iter()
             .find(|var| var.key == b"HOME")
-            .and_then(|var| String::from_utf8(var.value.clone()).ok())
-            .filter(|home| usable_directory(Path::new(home)))
+            .and_then(|var| String::from_utf8(var.value.clone()).ok());
+        match resolve_working_dir(None, working_dir, home) {
+            ResolvedWorkingDir::Stale {
+                requested,
+                fallback,
+            } => {
+                eprintln!(
+                    "rio-session-worker: working directory \"{requested}\" is not available; started in \"{}\" instead",
+                    fallback.as_deref().unwrap_or("the default directory"),
+                );
+                fallback
+            }
+            resolution => resolution.into_path(),
+        }
     }
 
     impl Runtime {
@@ -666,26 +684,16 @@ mod unix {
             mut spec: SessionSpec,
             delegate: Arc<Delegate>,
         ) -> Result<Self, SessionError> {
-            // A stale absolute directory (deleted or revoked between the
-            // client's check and the spawn) must not kill the tab: fall
-            // back instead. A relative path is a programming error and is
-            // still rejected.
+            // A relative path is a programming error and is still rejected.
             if let Some(working_dir) = spec.working_dir.as_deref() {
-                let path = Path::new(working_dir);
-                if !path.is_absolute() {
+                if !Path::new(working_dir).is_absolute() {
                     return Err(SessionError::invalid(
                         "session working directory must be an absolute path",
                     ));
                 }
-                if !usable_directory(path) {
-                    let fallback = fallback_working_dir(&spec.environment);
-                    eprintln!(
-                        "rio-session-worker: working directory \"{working_dir}\" is not available; starting in \"{}\" instead",
-                        fallback.as_deref().unwrap_or("<inherited>"),
-                    );
-                    spec.working_dir = fallback;
-                }
             }
+            let working_dir = spec.working_dir.take();
+            spec.working_dir = resolve_worker_working_dir(working_dir, &spec.environment);
             let SessionSpec {
                 shell,
                 args,
@@ -4209,22 +4217,37 @@ mod unix {
         }
 
         #[test]
-        fn stale_working_dir_falls_back_to_home() {
+        fn worker_keeps_a_usable_directory_silently() {
+            let dir = scoped_test_dir("usable");
+            let path = dir.to_string_lossy().into_owned();
+            assert_eq!(
+                resolve_worker_working_dir(Some(path.clone()), &[]),
+                Some(path)
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn worker_falls_back_to_session_home() {
             let home = scoped_test_dir("home");
             let environment =
                 vec![EnvVar::new("HOME", home.to_string_lossy().into_owned())];
             assert_eq!(
-                fallback_working_dir(&environment),
+                resolve_worker_working_dir(
+                    Some("/gone/stale/dir".to_string()),
+                    &environment
+                ),
                 Some(home.to_string_lossy().into_owned())
             );
             fs::remove_dir_all(&home).unwrap();
         }
 
         #[test]
-        fn stale_home_or_missing_home_yields_no_fallback() {
-            let environment = vec![EnvVar::new("HOME", "/gone/stale/home")];
-            assert_eq!(fallback_working_dir(&environment), None);
-            assert_eq!(fallback_working_dir(&[]), None);
+        fn worker_without_any_usable_directory_keeps_none() {
+            assert_eq!(
+                resolve_worker_working_dir(Some("/gone/stale/dir".to_string()), &[]),
+                None
+            );
         }
     }
 }
