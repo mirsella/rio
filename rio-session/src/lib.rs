@@ -1265,6 +1265,24 @@ impl SessionClient {
             .map_err(Into::into)
     }
 
+    /// Reap the worker if it already exited, without blocking. The session
+    /// pump calls this when it goes away so every closed tab does not leak
+    /// a zombie until its window exits; a still-running worker (for example
+    /// a detached transfer target) is left alone.
+    #[cfg(unix)]
+    pub fn reap_worker(&self) -> Result<Option<std::process::ExitStatus>, SessionError> {
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|_| SessionError::protocol("worker lock poisoned"))?;
+        worker
+            .as_mut()
+            .map(std::process::Child::try_wait)
+            .transpose()
+            .map_err(SessionError::from)
+            .map(|status| status.flatten())
+    }
+
     pub fn close(&self) -> Result<(), SessionError> {
         self.request(SessionCommand::Close, |reply| {
             if matches!(reply, SessionReply::Closed) {

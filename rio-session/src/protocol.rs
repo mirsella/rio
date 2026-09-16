@@ -1526,6 +1526,13 @@ fn validate_string(value: &str) -> Result<(), crate::SessionError> {
     Ok(())
 }
 
+/// A working directory is usable for a new session only if it exists, is a
+/// directory, and can actually be entered: `is_dir` alone still passes for
+/// entries the user cannot access, and shells started there die instantly.
+pub fn usable_directory(path: &std::path::Path) -> bool {
+    path.is_absolute() && path.is_dir() && std::fs::read_dir(path).is_ok()
+}
+
 fn validate_dimensions(columns: u16, lines: u16) -> Result<(), crate::SessionError> {
     if columns == 0 || lines == 0 {
         return Err(crate::SessionError::invalid(
@@ -2207,5 +2214,54 @@ mod tests {
 
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(directory).unwrap();
+    }
+
+    fn scoped_test_dir(name: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir()
+            .join(format!("rio-usable-dir-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn usable_directory_accepts_a_real_directory() {
+        let directory = scoped_test_dir("valid");
+        assert!(usable_directory(&directory));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn usable_directory_rejects_missing_relative_and_files() {
+        let directory = scoped_test_dir("entries");
+        let file = directory.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+
+        assert!(!usable_directory(&directory.join("gone")));
+        assert!(!usable_directory(std::path::Path::new("relative/path")));
+        assert!(!usable_directory(&file));
+
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usable_directory_rejects_unreadable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = scoped_test_dir("unreadable");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let usable = usable_directory(&directory);
+        // A zero mode that still reads means elevated privileges; there is
+        // nothing to assert in that case.
+        let elevated = std::fs::read_dir(&directory).is_ok();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        if elevated {
+            return;
+        }
+        assert!(!usable);
     }
 }
