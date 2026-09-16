@@ -10,11 +10,11 @@ mod unix {
     use super::super::snapshot::Snapshotter;
     use crate::codec;
     use crate::protocol::{
-        ClientMessage, EnvVar, ErrorCode, KeyAction as WireKeyAction, KeyCode, KeyInput,
-        RequestKind, RequestRefusalReason, SearchDirection, SearchMatch, SelectionKind,
-        SelectionSide, ServerMessage, SessionCommand, SessionEvent, SessionId,
-        SessionReply, SessionSpec, MAX_PENDING_INPUT_BYTES, MAX_PENDING_REQUESTS,
-        MAX_SELECTION_LINES, PROTOCOL_VERSION,
+        usable_directory, ClientMessage, EnvVar, ErrorCode, KeyAction as WireKeyAction,
+        KeyCode, KeyInput, RequestKind, RequestRefusalReason, SearchDirection,
+        SearchMatch, SelectionKind, SelectionSide, ServerMessage, SessionCommand,
+        SessionEvent, SessionId, SessionReply, SessionSpec, MAX_PENDING_INPUT_BYTES,
+        MAX_PENDING_REQUESTS, MAX_SELECTION_LINES, PROTOCOL_VERSION,
     };
     use crate::readiness;
     use crate::{
@@ -650,14 +650,40 @@ mod unix {
         current: Option<(rio_vt::crosswords::pos::Pos, rio_vt::crosswords::pos::Pos)>,
     }
 
+    /// Last-resort working directory when the requested one went stale: the
+    /// caller's `$HOME` if usable, otherwise `None` (the worker then
+    /// inherits its own current directory, which always exists).
+    fn fallback_working_dir(environment: &[EnvVar]) -> Option<String> {
+        environment
+            .iter()
+            .find(|var| var.key == b"HOME")
+            .and_then(|var| String::from_utf8(var.value.clone()).ok())
+            .filter(|home| usable_directory(Path::new(home)))
+    }
+
     impl Runtime {
-        fn new(spec: SessionSpec, delegate: Arc<Delegate>) -> Result<Self, SessionError> {
+        fn new(
+            mut spec: SessionSpec,
+            delegate: Arc<Delegate>,
+        ) -> Result<Self, SessionError> {
+            // A stale absolute directory (deleted or revoked between the
+            // client's check and the spawn) must not kill the tab: fall
+            // back instead. A relative path is a programming error and is
+            // still rejected.
             if let Some(working_dir) = spec.working_dir.as_deref() {
                 let path = Path::new(working_dir);
-                if !path.is_absolute() || !path.is_dir() {
+                if !path.is_absolute() {
                     return Err(SessionError::invalid(
-                        "session working directory must be an existing absolute directory",
+                        "session working directory must be an absolute path",
                     ));
+                }
+                if !usable_directory(path) {
+                    let fallback = fallback_working_dir(&spec.environment);
+                    eprintln!(
+                        "rio-session-worker: working directory \"{working_dir}\" is not available; starting in \"{}\" instead",
+                        fallback.as_deref().unwrap_or("<inherited>"),
+                    );
+                    spec.working_dir = fallback;
                 }
             }
             let SessionSpec {
@@ -4166,6 +4192,40 @@ mod unix {
             return Err(SessionError::invalid("worker capability is empty"));
         }
         Ok(capability)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn scoped_test_dir(name: &str) -> PathBuf {
+            let directory = std::env::temp_dir().join(format!(
+                "rio-worker-fallback-test-{name}-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&directory);
+            fs::create_dir_all(&directory).unwrap();
+            directory
+        }
+
+        #[test]
+        fn stale_working_dir_falls_back_to_home() {
+            let home = scoped_test_dir("home");
+            let environment =
+                vec![EnvVar::new("HOME", home.to_string_lossy().into_owned())];
+            assert_eq!(
+                fallback_working_dir(&environment),
+                Some(home.to_string_lossy().into_owned())
+            );
+            fs::remove_dir_all(&home).unwrap();
+        }
+
+        #[test]
+        fn stale_home_or_missing_home_yields_no_fallback() {
+            let environment = vec![EnvVar::new("HOME", "/gone/stale/home")];
+            assert_eq!(fallback_working_dir(&environment), None);
+            assert_eq!(fallback_working_dir(&[]), None);
+        }
     }
 }
 

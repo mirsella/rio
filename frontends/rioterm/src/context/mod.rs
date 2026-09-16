@@ -418,6 +418,99 @@ fn current_index_after_tab_removal(current: usize, removed: usize) -> usize {
     }
 }
 
+/// Notice that a new tab or split could not start in its expected directory.
+pub struct WorkingDirFallback {
+    pub requested: String,
+    pub fallback: String,
+}
+
+fn usable_working_dir(dir: &str) -> bool {
+    rio_session::protocol::usable_directory(std::path::Path::new(dir))
+}
+
+/// Pick a working directory for a new context: the inherited tab directory
+/// first, then the configured one, then the home directory. A stale entry
+/// degrades to the next candidate with a notice instead of handing the
+/// worker a directory whose shell would die instantly.
+fn resolve_working_dir(
+    inherited: Option<String>,
+    configured: Option<String>,
+) -> (Option<String>, Option<WorkingDirFallback>) {
+    let home = dirs::home_dir()
+        .map(|path| path.to_string_lossy().into_owned())
+        .filter(|home| usable_working_dir(home));
+    resolve_working_dir_with_home(inherited, configured, home)
+}
+
+fn resolve_working_dir_with_home(
+    inherited: Option<String>,
+    configured: Option<String>,
+    home: Option<String>,
+) -> (Option<String>, Option<WorkingDirFallback>) {
+    if let Some(requested) = inherited {
+        if usable_working_dir(&requested) {
+            return (Some(requested), None);
+        }
+        let fallback = configured.filter(|dir| usable_working_dir(dir)).or(home);
+        let notice = WorkingDirFallback {
+            requested,
+            fallback: fallback
+                .clone()
+                .unwrap_or_else(|| "the default directory".to_string()),
+        };
+        return (fallback, Some(notice));
+    }
+    if let Some(requested) = configured {
+        if usable_working_dir(&requested) {
+            return (Some(requested), None);
+        }
+        let notice = WorkingDirFallback {
+            requested,
+            fallback: home
+                .clone()
+                .unwrap_or_else(|| "the default directory".to_string()),
+        };
+        return (home, Some(notice));
+    }
+    (home, None)
+}
+
+/// Clamp a surface size into the session protocol limits. A zero-size
+/// surface (minimized or hidden window) or an absurd one degrades to the
+/// nearest valid size; opening a tab never fails on dimensions.
+fn sanitize_session_dimensions(columns: usize, lines: usize) -> (u16, u16) {
+    use rio_session::protocol::{MAX_COLUMNS, MAX_FRAME_CELLS, MAX_LINES};
+
+    let columns = (columns as u64).clamp(1, u64::from(MAX_COLUMNS));
+    let max_lines = (MAX_FRAME_CELLS as u64 / columns)
+        .max(1)
+        .min(u64::from(MAX_LINES));
+    let lines = (lines as u64).clamp(1, max_lines);
+    (columns as u16, lines as u16)
+}
+
+fn report_working_dir_fallback<T: EventListener + Clone + Send + 'static>(
+    event_proxy: &T,
+    window_id: WindowId,
+    fallback: &WorkingDirFallback,
+) {
+    tracing::warn!(
+        requested = %fallback.requested,
+        fallback = %fallback.fallback,
+        "starting tab with a fallback working directory",
+    );
+    event_proxy.send_event(
+        RioEvent::ReportToAssistant(RioError {
+            report: RioErrorType::WorkingDirectoryFallback {
+                requested: fallback.requested.clone(),
+                fallback: fallback.fallback.clone(),
+            },
+            level: RioErrorLevel::Warning,
+        }),
+        window_id,
+    );
+}
+
 impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     fn next_route_id() -> usize {
         ROUTE_ID_COUNTER.fetch_add(1, Ordering::SeqCst)
@@ -467,21 +560,27 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         let mut spec = rio_session::SessionSpec::from_current_environment()?;
         spec.shell = config.shell.program.clone();
         spec.args = config.shell.args.clone();
-        spec.working_dir = config.working_dir.clone();
-        spec.columns = dimension.columns.try_into().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "terminal columns exceed session limit",
-            )
-        })?;
-        spec.lines = dimension.lines.try_into().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "terminal lines exceed session limit",
-            )
-        })?;
-        spec.pixel_width = winsize.width;
-        spec.pixel_height = winsize.height;
+        // Defensive resolution: every entry path (first window, new tab,
+        // split, cross-window transfer) funnels through here, so a stale
+        // directory degrades to a fallback with a warning instead of a
+        // dead blank tab. Callers that already resolved report their own
+        // notice; a usable directory resolves silently here.
+        let (working_dir, fallback) =
+            resolve_working_dir(None, config.working_dir.clone());
+        spec.working_dir = working_dir;
+        if let Some(fallback) = fallback {
+            report_working_dir_fallback(&event_proxy, window_id, &fallback);
+        }
+        let (columns, lines) =
+            sanitize_session_dimensions(dimension.columns, dimension.lines);
+        spec.columns = columns;
+        spec.lines = lines;
+        spec.pixel_width = winsize
+            .width
+            .clamp(1, rio_session::protocol::MAX_GRAPHIC_DIMENSION as u16);
+        spec.pixel_height = winsize
+            .height
+            .clamp(1, rio_session::protocol::MAX_GRAPHIC_DIMENSION as u16);
         spec.scrollback = config.scrollback_history_limit;
         spec.grapheme_clustering = config.grapheme_clustering;
 
@@ -1602,7 +1701,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     pub fn split(&mut self, rich_text_id: usize, split_down: bool) {
         let mut cloned_config = self.config.clone();
-        cloned_config.working_dir = self.working_dir_for_new_context();
+        let (working_dir, fallback) = self.working_dir_for_new_context();
+        cloned_config.working_dir = working_dir;
+        if let Some(fallback) = fallback {
+            report_working_dir_fallback(&self.event_proxy, self.window_id, &fallback);
+        }
 
         match ContextManager::create_context(
             self.event_proxy.clone(),
@@ -1618,8 +1721,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     self.contexts[self.current_index].split_right(new_context);
                 }
             }
-            Err(..) => {
-                tracing::error!("not able to create a new context");
+            Err(error) => {
+                tracing::error!("not able to create a new context: {error:?}");
+                self.report_context_error(format!("could not open a new tab: {error}"));
             }
         }
     }
@@ -1636,6 +1740,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             config.editor.to_owned(),
             None,
         );
+        // A configured directory may have gone stale since startup; resolve
+        // it the same way so the split always opens.
+        let (working_dir, fallback) = resolve_working_dir(None, working_dir);
+        if let Some(fallback) = fallback {
+            report_working_dir_fallback(&self.event_proxy, self.window_id, &fallback);
+        }
 
         let context_manager_config = ContextManagerConfig {
             #[cfg(test)]
@@ -1670,15 +1780,19 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     self.contexts[self.current_index].split_right(new_context);
                 }
             }
-            Err(..) => {
-                tracing::error!("not able to create a new context");
+            Err(error) => {
+                tracing::error!("not able to create a new context: {error:?}");
+                self.report_context_error(format!("could not open a new tab: {error}"));
             }
         }
     }
 
     #[inline]
     pub fn add_context(&mut self, redirect: bool, rich_text_id: usize) {
-        let working_dir = self.working_dir_for_new_context();
+        let (working_dir, fallback) = self.working_dir_for_new_context();
+        if let Some(fallback) = fallback {
+            report_working_dir_fallback(&self.event_proxy, self.window_id, &fallback);
+        }
 
         if self.config.is_native {
             self.event_proxy
@@ -1721,22 +1835,39 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                         self.current_index = last_index;
                     }
                 }
-                Err(..) => {
-                    tracing::error!("not able to create a new context");
+                Err(error) => {
+                    tracing::error!("not able to create a new context: {error:?}");
+                    self.report_context_error(format!(
+                        "could not open a new tab: {error}"
+                    ));
                 }
             }
         }
     }
 
-    fn working_dir_for_new_context(&self) -> Option<String> {
-        if self.config.cwd {
+    fn working_dir_for_new_context(
+        &self,
+    ) -> (Option<String>, Option<WorkingDirFallback>) {
+        let inherited = if self.config.cwd {
             self.current()
                 .foreground_process_path()
                 .map(|path| path.to_string_lossy().into_owned())
-                .or_else(|| self.config.working_dir.clone())
         } else {
-            self.config.working_dir.clone()
-        }
+            None
+        };
+        resolve_working_dir(inherited, self.config.working_dir.clone())
+    }
+
+    /// Surface a context-creation failure in the window instead of failing
+    /// silently: a tab that cannot open must say why.
+    fn report_context_error(&self, message: String) {
+        self.event_proxy.send_event(
+            RioEvent::ReportToAssistant(RioError {
+                report: RioErrorType::InitializationError(message),
+                level: RioErrorLevel::Error,
+            }),
+            self.window_id,
+        );
     }
 
     /// Hide all rich text components except for the current tab
@@ -2651,5 +2782,79 @@ pub mod test {
         context_manager.move_current_tab_to(5);
         assert_eq!(context_manager.current_index, 2);
         assert_eq!(order(&mut context_manager), vec![1, 0, 2, 3, 4]);
+    }
+
+    fn scoped_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("rio-resolve-wd-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn usable_inherited_directory_resolves_silently() {
+        let dir = scoped_test_dir("inherited");
+        let path = dir.to_string_lossy().into_owned();
+        let (resolved, notice) = resolve_working_dir_with_home(
+            Some(path.clone()),
+            Some("/gone/stale/configured".to_string()),
+            Some("/home/someone".to_string()),
+        );
+        assert_eq!(resolved, Some(path));
+        assert!(notice.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stale_inherited_directory_falls_back_with_notice() {
+        let configured = scoped_test_dir("configured");
+        let configured_path = configured.to_string_lossy().into_owned();
+        let (resolved, notice) = resolve_working_dir_with_home(
+            Some("/gone/stale/inherited".to_string()),
+            Some(configured_path.clone()),
+            Some("/home/someone".to_string()),
+        );
+        assert_eq!(resolved, Some(configured_path.clone()));
+        let notice = notice.expect("a stale directory must produce a notice");
+        assert_eq!(notice.requested, "/gone/stale/inherited");
+        assert_eq!(notice.fallback, configured_path);
+        std::fs::remove_dir_all(&configured).unwrap();
+    }
+
+    #[test]
+    fn stale_configured_directory_falls_back_to_home_with_notice() {
+        let home = scoped_test_dir("home");
+        let home_path = home.to_string_lossy().into_owned();
+        let (resolved, notice) = resolve_working_dir_with_home(
+            None,
+            Some("/gone/stale/configured".to_string()),
+            Some(home_path.clone()),
+        );
+        assert_eq!(resolved, Some(home_path.clone()));
+        let notice = notice.expect("a stale directory must produce a notice");
+        assert_eq!(notice.requested, "/gone/stale/configured");
+        assert_eq!(notice.fallback, home_path);
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn no_candidates_yield_no_directory_and_no_notice() {
+        let (resolved, notice) = resolve_working_dir_with_home(None, None, None);
+        assert_eq!(resolved, None);
+        assert!(notice.is_none());
+    }
+
+    #[test]
+    fn session_dimensions_degrade_instead_of_failing() {
+        assert_eq!(sanitize_session_dimensions(80, 24), (80, 24));
+        assert_eq!(sanitize_session_dimensions(0, 0), (1, 1));
+        assert_eq!(sanitize_session_dimensions(2000, 100), (1024, 100));
+        assert_eq!(sanitize_session_dimensions(80, 5000), (80, 1024));
+        // The cell product stays within the frame transport limit.
+        assert_eq!(
+            sanitize_session_dimensions(usize::MAX, usize::MAX),
+            (1024, 256)
+        );
     }
 }
