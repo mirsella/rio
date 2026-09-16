@@ -919,6 +919,12 @@ impl<T: EventListener + Clone + Send + 'static> SessionPump<T> {
 impl<T: EventListener + Clone + Send + 'static> Drop for SessionPump<T> {
     fn drop(&mut self) {
         self.state.pump_done.store(true, Ordering::Release);
+        // Reap an already-exited worker without blocking. Every pump exit
+        // funnels through here, so closed tabs stop leaking zombies until
+        // the window exits; a still-running worker (for example a detached
+        // transfer target) is left alone.
+        #[cfg(unix)]
+        let _ = self.client.reap_worker();
     }
 }
 
