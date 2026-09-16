@@ -65,7 +65,7 @@ pub enum RioErrorType {
     // requested working directory was unusable; the session started elsewhere
     WorkingDirectoryFallback {
         requested: String,
-        fallback: String,
+        fallback: Option<String>,
     },
 
     // reports that are ignored by RioErrorType
@@ -112,7 +112,8 @@ impl std::fmt::Display for RioErrorType {
             } => {
                 write!(
                     f,
-                    "Working directory \"{requested}\" is not available; started in \"{fallback}\" instead."
+                    "Working directory \"{requested}\" is not available; started in \"{}\" instead.",
+                    fallback.as_deref().unwrap_or("the default directory")
                 )
             }
         }
@@ -127,11 +128,19 @@ mod tests {
     fn working_directory_fallback_message_names_both_dirs() {
         let report = RioErrorType::WorkingDirectoryFallback {
             requested: "/gone/stale".to_string(),
-            fallback: "/home/user".to_string(),
+            fallback: Some("/home/user".to_string()),
         };
         assert_eq!(
             report.to_string(),
             "Working directory \"/gone/stale\" is not available; started in \"/home/user\" instead."
+        );
+        let report = RioErrorType::WorkingDirectoryFallback {
+            requested: "/gone/stale".to_string(),
+            fallback: None,
+        };
+        assert_eq!(
+            report.to_string(),
+            "Working directory \"/gone/stale\" is not available; started in \"the default directory\" instead."
         );
     }
 }
