@@ -1,6 +1,8 @@
 use crate::context::Context;
+use crate::context::ContextDimension;
 #[cfg(unix)]
 use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(PartialEq)]
 pub struct ContextTitle {
@@ -70,34 +72,51 @@ fn shorten_path(absolute: &str) -> String {
     }
 }
 
-fn current_path<T: rio_backend::event::EventListener>(
-    context: &Context<T>,
-) -> Option<String> {
-    // Take an owned copy first: the lock guard must be dropped before the
-    // `or_else` fallback below, because `foreground_process_path` locks the
-    // terminal as well and the mutex is not reentrant.
-    let directory = context.terminal.lock().current_directory.clone();
-    directory
-        .and_then(|path| path.into_os_string().into_string().ok())
-        .or_else(|| {
-            context
-                .foreground_process_path()
-                .map(|path| path.to_string_lossy().into_owned())
-        })
+/// Terminal state a title update resolves variables against.
+///
+/// Captured once per [`update_title`] call so variable resolution is pure:
+/// the terminal mutex is not reentrant, and locking it per variable let a
+/// fallback re-lock it while a guard was still held, parking the event loop
+/// forever on fresh tabs (no CWD reported yet).
+struct TitleSnapshot {
+    dimension: ContextDimension,
+    title: String,
+    program: Option<String>,
+    current_directory: Option<PathBuf>,
 }
 
-fn variable_value<T: rio_backend::event::EventListener>(
-    variable: &str,
-    context: &Context<T>,
-) -> Option<String> {
+impl TitleSnapshot {
+    fn capture<T: rio_backend::event::EventListener>(context: &Context<T>) -> Self {
+        let terminal = context.terminal.lock();
+        TitleSnapshot {
+            dimension: context.dimension,
+            title: terminal.title.clone(),
+            program: context.foreground_process_name(),
+            current_directory: terminal.current_directory.clone(),
+        }
+    }
+}
+
+fn current_path(current_directory: Option<&PathBuf>) -> Option<String> {
+    let directory = current_directory?;
+    match directory.as_os_str().to_str() {
+        Some(valid) => Some(valid.to_owned()),
+        // Fall back to a lossy conversion for non-UTF8 paths.
+        None => Some(directory.to_string_lossy().into_owned()),
+    }
+}
+
+fn variable_value(variable: &str, snapshot: &TitleSnapshot) -> Option<String> {
     match variable.trim().to_ascii_lowercase().as_str() {
-        "columns" => Some(context.dimension.columns.to_string()),
-        "lines" => Some(context.dimension.lines.to_string()),
-        "title" => Some(context.terminal.lock().title.clone()),
-        "program" => Some(context.foreground_process_name().unwrap_or_default()),
-        "absolute_path" => Some(current_path(context).unwrap_or_default()),
+        "columns" => Some(snapshot.dimension.columns.to_string()),
+        "lines" => Some(snapshot.dimension.lines.to_string()),
+        "title" => Some(snapshot.title.clone()),
+        "program" => Some(snapshot.program.clone().unwrap_or_default()),
+        "absolute_path" => {
+            Some(current_path(snapshot.current_directory.as_ref()).unwrap_or_default())
+        }
         "relative_path" => Some(
-            current_path(context)
+            current_path(snapshot.current_directory.as_ref())
                 .map(|path| shorten_path(&path))
                 .unwrap_or_default(),
         ),
@@ -124,13 +143,16 @@ pub fn update_title<T: rio_backend::event::EventListener>(
         return template.to_string();
     }
 
+    static VARIABLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = VARIABLE.get_or_init(|| regex::Regex::new(r"\{\{(.*?)\}\}").unwrap());
+
+    let snapshot = TitleSnapshot::capture(context);
     let mut new_template = template.to_owned();
 
-    let re = regex::Regex::new(r"\{\{(.*?)\}\}").unwrap();
     for (to_replace_str, [variable]) in re.captures_iter(template).map(|c| c.extract()) {
         let mut variables = variable.split("||").peekable();
         while let Some(variable) = variables.next() {
-            let Some(value) = variable_value(variable, context) else {
+            let Some(value) = variable_value(variable, &snapshot) else {
                 continue;
             };
             if value.is_empty() && variables.peek().is_some() {
@@ -149,15 +171,13 @@ pub fn update_title<T: rio_backend::event::EventListener>(
 pub mod test {
     use super::*;
     use crate::context::create_mock_context;
-    use crate::context::ContextDimension;
     use rio_backend::config::layout::Margin;
     use rio_backend::event::VoidListener;
     use rio_backend::event::WindowId;
     use rio_backend::sugarloaf::layout::TextDimensions;
 
-    #[test]
-    fn test_update_title() {
-        let context_dimension = ContextDimension::build(
+    fn test_dimension() -> ContextDimension {
+        ContextDimension::build(
             1200.0,
             800.0,
             TextDimensions {
@@ -176,7 +196,12 @@ pub mod test {
             1.0,
             14.0,
             Margin::default(),
-        );
+        )
+    }
+
+    #[test]
+    fn test_update_title() {
+        let context_dimension = test_dimension();
 
         assert_eq!(context_dimension.columns, 64);
         assert_eq!(context_dimension.lines, 84);
@@ -232,26 +257,7 @@ pub mod test {
 
     #[test]
     fn test_update_title_with_logical_or() {
-        let context_dimension = ContextDimension::build(
-            1200.0,
-            800.0,
-            TextDimensions {
-                scale: 2.,
-                width: 18.,
-                height: 9.,
-            },
-            rio_backend::sugarloaf::layout::CellMetrics {
-                cell_width: 18,
-                cell_height: 9,
-                cell_baseline: 0,
-                face_width: 18.0,
-                face_height: 9.0,
-                face_y: 0.0,
-            },
-            1.0,
-            14.0,
-            Margin::default(),
-        );
+        let context_dimension = test_dimension();
 
         assert_eq!(context_dimension.columns, 64);
         assert_eq!(context_dimension.lines, 84);
@@ -319,49 +325,44 @@ pub mod test {
     }
 
     #[test]
-    fn test_update_title_without_cwd_does_not_deadlock() {
-        // Fresh tabs have no CWD yet; resolving a path variable must not
-        // re-lock the terminal while the first guard is still held
-        // (parking_lot mutexes are not reentrant, so the event loop would
-        // park forever and freeze the whole window).
-        let context_dimension = ContextDimension::build(
-            1200.0,
-            800.0,
-            TextDimensions {
-                scale: 2.,
-                width: 18.,
-                height: 9.,
-            },
-            rio_backend::sugarloaf::layout::CellMetrics {
-                cell_width: 18,
-                cell_height: 9,
-                cell_baseline: 0,
-                face_width: 18.0,
-                face_height: 9.0,
-                face_y: 0.0,
-            },
-            1.0,
-            14.0,
-            Margin::default(),
-        );
+    fn test_update_title_without_cwd_resolves_to_empty() {
+        // Fresh tabs have no CWD yet; resolving a path variable against the
+        // default template must return promptly instead of re-locking the
+        // terminal (which used to park the event loop forever and freeze
+        // the whole window).
         let context =
-            create_mock_context(VoidListener {}, WindowId::from(0), 0, context_dimension);
+            create_mock_context(VoidListener {}, WindowId::from(0), 0, test_dimension());
         assert!(context.terminal.lock().current_directory.is_none());
+        assert_eq!(
+            update_title("{{ TITLE || RELATIVE_PATH }}", &context),
+            String::from("")
+        );
+    }
 
-        // `Context` is not `Send`, so the update runs on this thread while a
-        // watchdog fails the test run instead of hanging CI forever.
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watchdog_done = std::sync::Arc::clone(&done);
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            if !watchdog_done.load(std::sync::atomic::Ordering::SeqCst) {
-                eprintln!("title update deadlocked with unset CWD");
-                std::process::exit(42);
-            }
-        });
-        let title = update_title("{{ TITLE || RELATIVE_PATH }}", &context);
-        done.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(title, String::from(""));
+    #[test]
+    fn test_current_path_without_directory() {
+        assert_eq!(current_path(None), None);
+    }
+
+    #[test]
+    fn test_current_path_prefers_valid_unicode() {
+        let directory = PathBuf::from("/tmp/rio-title-test");
+        assert_eq!(
+            current_path(Some(&directory)),
+            Some(String::from("/tmp/rio-title-test"))
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_current_path_falls_back_to_lossy() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let directory = PathBuf::from(OsStr::from_bytes(b"/tmp/rio-\xff"));
+        assert_eq!(
+            current_path(Some(&directory)),
+            Some(String::from("/tmp/rio-\u{fffd}"))
+        );
     }
 
     #[test]
