@@ -29,6 +29,7 @@ mod unix {
     };
     use rio_vt::crosswords::pos::{Column as PosColumn, Direction, Line, Pos};
     use rio_vt::crosswords::vi_mode::ViMotion as RioViMotion;
+    use rio_vt::error::RioErrorType;
     use std::collections::VecDeque;
     #[cfg(test)]
     use std::fs;
@@ -670,8 +671,11 @@ mod unix {
                 fallback,
             } => {
                 eprintln!(
-                    "rio-session-worker: working directory \"{requested}\" is not available; started in \"{}\" instead",
-                    fallback.as_deref().unwrap_or("the default directory"),
+                    "rio-session-worker: {}",
+                    RioErrorType::WorkingDirectoryFallback {
+                        requested,
+                        fallback: fallback.clone(),
+                    }
                 );
                 fallback
             }
@@ -4206,9 +4210,14 @@ mod unix {
     mod tests {
         use super::*;
 
+        static TEST_DIR_NEXT: AtomicU64 = AtomicU64::new(0);
+
         fn scoped_test_dir(name: &str) -> PathBuf {
+            // Unique per call: tests run in parallel in one process, so a
+            // bare name would share one directory across tests.
+            let unique = TEST_DIR_NEXT.fetch_add(1, Ordering::Relaxed);
             let directory = std::env::temp_dir().join(format!(
-                "rio-worker-fallback-test-{name}-{}",
+                "rio-worker-fallback-test-{name}-{}-{unique}",
                 std::process::id()
             ));
             let _ = fs::remove_dir_all(&directory);
