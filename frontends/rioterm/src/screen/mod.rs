@@ -2207,18 +2207,13 @@ impl Screen<'_> {
         }
     }
 
-    pub fn copy_selection(
-        &mut self,
-        ty: ClipboardType,
-        clipboard: &mut Clipboard,
-    ) -> bool {
+    pub fn copy_selection(&mut self, ty: ClipboardType, clipboard: &mut Clipboard) {
         let _ = clipboard;
         self.context_manager
             .current_mut()
             .terminal
             .lock()
             .request_selection_text(ty);
-        false
     }
 
     fn yank_selection(&mut self, clipboard: &mut Clipboard) {
@@ -2277,6 +2272,9 @@ impl Screen<'_> {
 
     #[inline]
     pub fn clear_selection(&mut self) {
+        // A clear also forgets any drag from the current press, so a
+        // later release can't mistake it for a selection.
+        self.mouse.selection_dragged = false;
         // Clear the selection on the terminal.
         self.context_manager
             .current_mut()
@@ -2330,14 +2328,19 @@ impl Screen<'_> {
             let current = self.context_manager.current_mut();
             let mut terminal = current.terminal.lock();
             pos.row = std::cmp::min(pos.row, terminal.bottommost_line());
-            if terminal.selection_range.is_none() {
-                return;
-            }
+            // Selection commands run asynchronously in the session
+            // worker, so the cached `selection_range` still reflects
+            // the previous frame here and cannot gate drag updates:
+            // gating dropped every update until the worker's frame
+            // round-tripped (flaky drags, broken quick-select).
+            // Forward unconditionally; the worker no-ops updates with
+            // no active selection.
             if terminal.mode().contains(Mode::VI) && !is_search_active {
                 terminal.vi_goto_pos(pos);
             }
             terminal.selection_update(pos, side);
         }
+        self.mouse.selection_dragged = true;
 
         // Request render to ensure it shows immediately
         self.context_manager.request_render();
@@ -2714,7 +2717,11 @@ impl Screen<'_> {
     /// Reads mouse.raw_y to compute scroll direction.
     /// Scrolls 1 line per tick.
     pub fn selection_scroll_tick(&mut self) {
-        if self.mouse.left_button_state != rio_window::event::ElementState::Pressed {
+        // Either drag button keeps the tick alive; the worker no-ops
+        // without an active selection.
+        if !self.mouse.left_button_state.is_pressed()
+            && !self.mouse.right_button_state.is_pressed()
+        {
             return;
         }
 
@@ -2771,9 +2778,18 @@ impl Screen<'_> {
     pub fn selection_is_empty(&self) -> bool {
         self.context_manager
             .current()
-            .renderable_content
-            .selection_range
+            .terminal
+            .lock()
+            .passive_selection_range()
             .is_none()
+    }
+
+    /// Whether pointer gestures should treat a selection as active:
+    /// either the last confirmed frame shows one, or a drag started
+    /// this press whose commands the worker hasn't echoed yet.
+    #[inline]
+    pub fn has_pointer_selection(&self) -> bool {
+        !self.selection_is_empty() || self.mouse.selection_dragged
     }
 
     pub(crate) fn execute_palette_selection(&mut self, clipboard: &mut Clipboard) {
@@ -3545,11 +3561,15 @@ impl Screen<'_> {
     #[inline]
     pub fn on_left_click(&mut self, point: Pos, clipboard: &mut Clipboard) {
         let side = self.mouse.square_side;
+        // New press gesture: forget any drag from the previous one so
+        // the release handler can tell a plain click from a drag while
+        // the selection cache is still catching up with the worker.
+        self.mouse.selection_dragged = false;
 
         match self.mouse.click_state {
             ClickState::Click => {
                 // If Shift is pressed and there's an existing selection, expand it
-                if self.modifiers.state().shift_key() && !self.selection_is_empty() {
+                if self.modifiers.state().shift_key() && self.has_pointer_selection() {
                     self.update_selection(point, side);
                 } else {
                     self.clear_selection();
