@@ -50,6 +50,12 @@ pub struct Mouse {
     /// its release) and follows the link only when the release lands
     /// on the same hint.
     pub hint_click_latched: Option<crate::hints::HintMatch>,
+    /// A selection update was forwarded since the last left press.
+    /// Selection commands run asynchronously in the session worker,
+    /// so the cached selection range still shows the previous frame
+    /// right after a drag starts; the release handler uses this latch
+    /// (instead of the stale cache) to tell a drag from a plain click.
+    pub selection_dragged: bool,
 }
 
 impl Default for Mouse {
@@ -72,6 +78,7 @@ impl Default for Mouse {
             raw_y: 0.0,
             last_cell: None,
             hint_click_latched: None,
+            selection_dragged: false,
         }
     }
 }
