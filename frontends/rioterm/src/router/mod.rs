@@ -9,7 +9,6 @@ use crate::router::window::{
 use crate::screen::{
     Screen, ScreenTransfer, ScreenTransferFailure, ScreenWindowProperties,
 };
-use assistant::Assistant;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use rio_backend::clipboard::Clipboard;
 use rio_backend::config::Config as RioConfig;
@@ -25,7 +24,7 @@ use rio_window::platform::startup_notify::{
     self, EventLoopExtStartupNotify, WindowAttributesExtStartupNotify,
 };
 use rio_window::window::Window;
-use routes::{assistant, RoutePath};
+use routes::RoutePath;
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
 
@@ -54,7 +53,6 @@ pub enum Modal {
 }
 
 pub struct Route<'a> {
-    pub assistant: assistant::Assistant,
     pub path: RoutePath,
     pub window: RouteWindow<'a>,
     /// Set by `quit`; the application polls it in `about_to_wait` and
@@ -66,17 +64,8 @@ pub struct Route<'a> {
 impl Route<'_> {
     /// Create a performer.
     #[inline]
-    pub fn new(
-        assistant: assistant::Assistant,
-        path: RoutePath,
-        window: RouteWindow,
-    ) -> Route {
-        Route {
-            assistant,
-            path,
-            window,
-            quit_requested: false,
-        }
+    pub fn new(path: RoutePath, window: RouteWindow) -> Route {
+        Route { path, window }
     }
 }
 
@@ -150,19 +139,29 @@ impl Route<'_> {
             return;
         }
 
-        self.assistant.set(error.to_owned());
         self.window
             .screen
             .renderer
             .assistant
-            .set_error(error.to_owned());
+            .set_error(error.clone());
     }
 
     #[inline]
     pub fn clear_errors(&mut self) {
-        self.assistant.clear();
         self.window.screen.renderer.assistant.clear();
+        self.window.screen.mark_dirty();
         self.path = RoutePath::Terminal;
+    }
+
+    /// Dismiss the toast if visible. Callers add their own redraw.
+    #[inline]
+    pub fn dismiss_assistant(&mut self) -> bool {
+        if self.window.screen.renderer.assistant.is_active() {
+            self.clear_errors();
+            true
+        } else {
+            false
+        }
     }
 
     #[inline]
@@ -410,37 +409,26 @@ impl Route<'_> {
                 true
             }
 
-            // Path-independent, so a `report_error` toast raised at
-            // `RoutePath::Terminal` blocks keys symmetrically with the
-            // IME gate and Enter can dismiss it (previously only a mouse
-            // click could, while plain keys leaked to the shell). Only
-            // the press dismisses: acting on the release would let a
-            // toast appearing mid-keystroke vanish unseen, and would
-            // send the orphaned release to the PTY under kitty's
-            // report-event-types mode.
-            Modal::Assistant => {
-                if key_event.state == ElementState::Pressed
-                    && key_event.logical_key == Key::Named(NamedKey::Enter)
-                {
-                    self.assistant.clear();
-                    self.window.screen.renderer.assistant.clear();
-                    self.request_overlay_redraw();
-                }
-                true
+        // Typing dismisses the toast but still reaches the terminal.
+        if self.window.screen.renderer.assistant.is_active()
+            && key_event.state == rio_window::event::ElementState::Pressed
+        {
+            self.clear_errors();
+            self.request_redraw();
+            if matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
+                return true;
             }
+        }
 
-            Modal::Route => {
-                let is_enter = key_event.state == ElementState::Pressed
-                    && key_event.logical_key == Key::Named(NamedKey::Enter);
-                if self.path == RoutePath::Welcome && is_enter {
-                    rio_backend::config::create_config_file(None);
-                    self.path = RoutePath::Terminal;
-                }
-                // Block everything else: the PTY behind the welcome
-                // screen is live, and keys reaching it would execute
-                // invisibly once the terminal appears.
-                true
-            }
+        if self.path == RoutePath::Terminal {
+            return false;
+        }
+
+        let is_enter = key_event.logical_key == Key::Named(NamedKey::Enter);
+
+        if self.path == RoutePath::Welcome && is_enter {
+            rio_backend::config::create_config_file(None);
+            self.path = RoutePath::Terminal;
         }
     }
 }
@@ -576,7 +564,7 @@ impl<'router> Router<'router> {
             false,
         );
         let id: WindowId = window.winit_window.id().into();
-        let route = Route::new(Assistant::new(), RoutePath::Terminal, window);
+        let route = Route::new(RoutePath::Terminal, window);
         self.routes.insert(id, route);
         self.config_route = Some(id);
     }
@@ -644,8 +632,6 @@ impl<'router> Router<'router> {
         let mut route = Route {
             window,
             path: RoutePath::Terminal,
-            assistant: Assistant::new(),
-            quit_requested: false,
         };
 
         if let Some(err) = &self.propagated_report {
@@ -682,8 +668,6 @@ impl<'router> Router<'router> {
             Route {
                 window,
                 path: RoutePath::Terminal,
-                assistant: Assistant::new(),
-                quit_requested: false,
             },
         );
         self.quake_window_id = Some(id);
@@ -715,8 +699,6 @@ impl<'router> Router<'router> {
             Route {
                 window,
                 path: RoutePath::Terminal,
-                assistant: Assistant::new(),
-                quit_requested: false,
             },
         );
     }
