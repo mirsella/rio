@@ -5766,7 +5766,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         // copy-on-select) and must not activate a hint
                         // sitting under the release point; hints fire on
                         // plain clicks only, when no selection exists.
-                        if route.window.screen.selection_is_empty() {
+                        if !route.window.screen.has_pointer_selection() {
                             if button == MouseButton::Left {
                                 // Only a latched press opens a link, and only
                                 // when the release lands on the same span the
@@ -6051,8 +6051,16 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 let rmb_pressed =
                     route.window.screen.mouse.right_button_state == ElementState::Pressed;
 
-                let has_selection = !route.window.screen.selection_is_empty();
-                if has_selection && (lmb_pressed || rmb_pressed) {
+                // Motions extend the terminal selection while a button is
+                // held outside mouse-reporting mode (shift forces
+                // selection). The confirmed range lags the worker, so
+                // this derives from press state, not the cache; ticks
+                // and updates no-op without a worker-side selection.
+                let is_selecting = (lmb_pressed || rmb_pressed)
+                    && (route.window.screen.modifiers.state().shift_key()
+                        || !route.window.screen.mouse_mode());
+
+                if is_selecting {
                     // Only start the timer when the mouse enters the scroll
                     // zone. Once running, the tick reads mouse.raw_y each
                     // iteration so it keeps scrolling after CursorMoved
@@ -6101,12 +6109,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 {
                     return;
                 }
-
-                // Skip hint/hyperlink highlighting during active selection
-                // drag to avoid unnecessary terminal locks and regex matching.
-                let is_selecting = (lmb_pressed || rmb_pressed)
-                    && (route.window.screen.modifiers.state().shift_key()
-                        || !route.window.screen.mouse_mode());
 
                 if !is_selecting {
                     let hint_changed = route.window.screen.update_highlighted_hints();
