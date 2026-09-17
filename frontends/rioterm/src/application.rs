@@ -809,11 +809,7 @@ impl<'a> Application<'a> {
             &self.router.font_library,
             transfer,
         )?;
-        Ok(crate::router::Route::new(
-            crate::router::routes::assistant::Assistant::new(),
-            RoutePath::Terminal,
-            window,
-        ))
+        Ok(crate::router::Route::new(RoutePath::Terminal, window))
     }
 
     fn track_outgoing_offer(
@@ -5527,6 +5523,11 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
 
                         let chrome_press = route.window.screen.take_chrome_press();
 
+                        if route.dismiss_assistant() {
+                            route.request_redraw();
+                            return;
+                        }
+
                         if let MouseButton::Left = button {
                             // Check if clicking on a panel border to start resize
                             {
@@ -5556,11 +5557,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                                         });
                                     return;
                                 }
-                            }
-
-                            if route.window.screen.handle_assistant_click() {
-                                route.request_redraw();
-                                return;
                             }
 
                             if route
@@ -5893,37 +5889,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     || route.window.screen.renderer.confirm_quit.is_active()
                 {
                     route.window.winit_window.set_cursor(CursorIcon::Default);
-                    return;
-                }
-
-                // Handle assistant overlay hover
-                if route.window.screen.renderer.assistant.is_active() {
-                    let scale = route.window.screen.sugarloaf.scale_factor();
-                    let win_w = route.window.screen.sugarloaf.window_size().width;
-                    let mx = x as f32 / scale;
-                    let my = y as f32 / scale;
-                    if route
-                        .window
-                        .screen
-                        .renderer
-                        .assistant
-                        .hover(mx, my, win_w, scale)
-                    {
-                        route.request_overlay_redraw();
-                    }
-
-                    if route
-                        .window
-                        .screen
-                        .renderer
-                        .assistant
-                        .hovered_button()
-                        .is_some()
-                    {
-                        route.window.winit_window.set_cursor(CursorIcon::Pointer);
-                    } else {
-                        route.window.winit_window.set_cursor(CursorIcon::Default);
-                    }
                     return;
                 }
 
@@ -6287,8 +6252,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
 
             WindowEvent::Ime(ime) => {
-                if route.window.screen.renderer.assistant.is_active() {
-                    return;
+                if route.dismiss_assistant() {
+                    route.request_redraw();
                 }
 
                 match ime {
@@ -6417,8 +6382,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
 
             WindowEvent::DroppedFile(path) => {
-                if route.window.screen.renderer.assistant.is_active() {
-                    return;
+                if route.dismiss_assistant() {
+                    route.request_redraw();
                 }
 
                 let path = crate::platform::shell_escape(&path.to_string_lossy());
