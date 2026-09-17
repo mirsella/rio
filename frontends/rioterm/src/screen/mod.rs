@@ -34,7 +34,7 @@ use rio_backend::clipboard::ClipboardType;
 use rio_backend::config::layout::Margin;
 use rio_backend::config::renderer::Backend;
 use rio_backend::crosswords::pos::{Boundary, Direction, Line};
-use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
+use rio_backend::error::RioErrorType;
 use rio_backend::event::{ClickState, EventProxy, SearchState};
 #[cfg(wgpu_backend)]
 use rio_backend::sugarloaf::wgpu;
@@ -622,10 +622,9 @@ impl Screen<'_> {
 
         if let Some(image) = &config.window.background_image {
             if let Err(message) = sugarloaf.set_background_image(image) {
-                renderer.assistant.set_error(RioError {
-                    level: RioErrorLevel::Warning,
-                    report: RioErrorType::BackgroundImageLoadFailure(message),
-                });
+                renderer
+                    .assistant
+                    .set_warning(RioErrorType::BackgroundImageLoadFailure(message));
             }
         } else {
             sugarloaf.clear_background_image();
@@ -1097,10 +1096,9 @@ impl Screen<'_> {
 
         if let Some(image) = &config.window.background_image {
             if let Err(message) = self.sugarloaf.set_background_image(image) {
-                self.renderer.assistant.set_error(RioError {
-                    level: RioErrorLevel::Warning,
-                    report: RioErrorType::BackgroundImageLoadFailure(message),
-                });
+                self.renderer
+                    .assistant
+                    .set_warning(RioErrorType::BackgroundImageLoadFailure(message));
             }
         } else {
             self.sugarloaf.clear_background_image();
@@ -2886,63 +2884,6 @@ impl Screen<'_> {
                 false
             }
         }
-    }
-
-    #[inline]
-    pub fn handle_assistant_click(&mut self) -> bool {
-        if !self.renderer.assistant.is_active() {
-            return false;
-        }
-
-        let scale_factor = self.sugarloaf.scale_factor();
-        let window_width = self.sugarloaf.window_size().width;
-        let mouse_x = self.mouse.x as f32 / scale_factor;
-        let mouse_y = self.mouse.y as f32 / scale_factor;
-
-        match self.renderer.assistant.hit_test(
-            mouse_x,
-            mouse_y,
-            window_width,
-            scale_factor,
-        ) {
-            Ok(Some(action)) => {
-                use crate::renderer::assistant::AssistantOverlayAction;
-                match action {
-                    AssistantOverlayAction::Close => {
-                        self.renderer.assistant.clear();
-                    }
-                    AssistantOverlayAction::OpenDocs => {
-                        Self::open_docs_url();
-                    }
-                }
-                self.mark_dirty();
-                true
-            }
-            Ok(None) => {
-                // Clicked inside overlay but not on a button
-                true
-            }
-            Err(()) => {
-                // Clicked outside — close the assistant overlay
-                self.renderer.assistant.clear();
-                self.mark_dirty();
-                true
-            }
-        }
-    }
-
-    fn open_docs_url() {
-        let url = "https://rioterm.com/docs/config";
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("open").arg(url).spawn();
-        }
-        #[cfg(not(any(target_os = "macos", windows)))]
-        {
-            let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-        }
-        #[cfg(windows)]
-        shell_execute_open(url);
     }
 
     pub fn handle_scrollbar_click(&mut self) -> bool {
