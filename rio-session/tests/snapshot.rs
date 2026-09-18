@@ -6,7 +6,9 @@
     target_os = "netbsd"
 ))]
 
-use rio_session::protocol::{EnvVar, MAX_PENDING_INPUT_BYTES};
+use rio_session::protocol::{
+    AtlasPlacementFrame, EnvVar, GraphicFrame, GraphicsFrame, MAX_PENDING_INPUT_BYTES,
+};
 use rio_session::{FrameDelta, FrameUpdate, FullFrame, SessionClient, SessionSpec};
 use std::path::PathBuf;
 use std::thread;
@@ -47,18 +49,71 @@ fn session_spec() -> SessionSpec {
     }
 }
 
+/// One-line summary of the graphics state, for timeout diagnostics.
+fn describe_graphics(graphics: &GraphicsFrame) -> String {
+    let images: Vec<String> = graphics
+        .images
+        .iter()
+        .map(|image| {
+            format!(
+                "key={} kind={} px={}",
+                image.key,
+                image.kind,
+                image.pixels.len()
+            )
+        })
+        .collect();
+    let placements: Vec<String> = graphics
+        .atlas_placements
+        .iter()
+        .map(|placement| placement.key.to_string())
+        .collect();
+    format!(
+        "images=[{}] placements=[{}] removed={}",
+        images.join(","),
+        placements.join(","),
+        graphics.removed_keys.len()
+    )
+}
+
+fn describe_frame(frame: &FullFrame) -> String {
+    format!(
+        "seq={} {}x{} alt={} title={:?} selection={} {}",
+        frame.sequence,
+        frame.columns,
+        frame.lines,
+        frame.alternate_screen,
+        frame.title,
+        frame.selection.is_some(),
+        describe_graphics(&frame.graphics)
+    )
+}
+
 fn snapshot_until(
+    label: &str,
     client: &SessionClient,
     predicate: impl Fn(&FullFrame) -> bool,
 ) -> FullFrame {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let timeout = Duration::from_secs(30);
+    let deadline = Instant::now() + timeout;
+    let mut polls = 0u32;
+    let mut first_sequence = None;
+    let mut last_sequence;
+    let mut last_summary;
     loop {
         let frame = client.snapshot().unwrap();
+        polls += 1;
+        first_sequence.get_or_insert(frame.sequence);
+        last_sequence = frame.sequence;
         if predicate(&frame) {
             return frame;
         }
+        last_summary = describe_frame(&frame);
         if Instant::now() >= deadline {
-            panic!("snapshot condition timed out");
+            panic!(
+                "{label} snapshot condition timed out after {timeout:?} ({polls} polls, \
+                 first seq={first_sequence:?}, last seq={last_sequence}); last frame: {last_summary}"
+            );
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -116,10 +171,11 @@ fn hyperlink_identity_survives_delta_and_takeover() {
     let mut spec = session_spec();
     spec.args[1] = "stty raw -echo; printf '\\033]0;ready\\007'; cat".into();
     let client = SessionClient::spawn_with_worker_path(spec, worker_path()).unwrap();
-    snapshot_until(&client, |frame| frame.title == "ready");
+    snapshot_until("shell ready", &client, |frame| frame.title == "ready");
     client.write(b"\x1b]8;id=first;https://example.com\x1b\\aa\x1b]8;;\x1b\\\x1b]8;id=second;https://example.com\x1b\\bb\x1b]8;;\x1b\\\x1b]8;;https://example.com\x1b\\cc\x1b]8;;\x1b\\".to_vec()).unwrap();
-    let mut cached =
-        snapshot_until(&client, |frame| frame.rows[0].text.starts_with("aabbcc"));
+    let mut cached = snapshot_until("hyperlink echo", &client, |frame| {
+        frame.rows[0].text.starts_with("aabbcc")
+    });
     let links: Vec<_> = cached.rows[0].extras[..6]
         .iter()
         .map(|extra| extra.as_ref().unwrap().hyperlink.clone().unwrap())
@@ -197,7 +253,7 @@ fn clear_until_removed(client: &SessionClient, key: u64) {
         erase.extend_from_slice(format!("\x1b[{row};1H\x1b[2K").as_bytes());
     }
     client.write(erase).unwrap();
-    snapshot_until(client, |frame| {
+    snapshot_until("graphics removal", client, |frame| {
         frame.graphics.atlas_placements.is_empty()
             && frame.graphics.removed_keys.contains(&key)
     });
@@ -237,7 +293,7 @@ fn sixel_and_iterm2_assets_survive_snapshot_reattach_and_delete() {
         SessionClient::spawn_with_worker_path(session_spec(), worker_path()).unwrap();
     let sixel = include_bytes!("../../rio-vt/tests/sixel/testimage_im6.sixel");
     client.write(sixel.to_vec()).unwrap();
-    let frame = snapshot_until(&client, |frame| {
+    let frame = snapshot_until("sixel upload", &client, |frame| {
         frame
             .graphics
             .images
@@ -249,21 +305,27 @@ fn sixel_and_iterm2_assets_survive_snapshot_reattach_and_delete() {
     assert!(sixel_bytes > 0);
 
     client.write(b"\x1b[?1049h".to_vec()).unwrap();
-    snapshot_until(&client, |frame| frame.alternate_screen);
-    client.write(b"\x1b[?1049l".to_vec()).unwrap();
-    snapshot_until(&client, |frame| {
-        !frame.alternate_screen
-            && frame
-                .graphics
-                .atlas_placements
-                .iter()
-                .any(|placement| placement.key == sixel_key)
+    snapshot_until("alternate screen enter", &client, |frame| {
+        frame.alternate_screen
     });
+    client.write(b"\x1b[?1049l".to_vec()).unwrap();
+    snapshot_until(
+        "alternate screen exit with sixel placement",
+        &client,
+        |frame| {
+            !frame.alternate_screen
+                && frame
+                    .graphics
+                    .atlas_placements
+                    .iter()
+                    .any(|placement| placement.key == sixel_key)
+        },
+    );
 
     let descriptor = client.descriptor().clone();
     drop(client);
     let attached = SessionClient::attach(descriptor).unwrap();
-    let reattached = snapshot_until(&attached, |frame| {
+    let reattached = snapshot_until("sixel reattach", &attached, |frame| {
         frame
             .graphics
             .images
@@ -284,7 +346,7 @@ fn sixel_and_iterm2_assets_survive_snapshot_reattach_and_delete() {
     iterm.extend_from_slice(base64(png).as_bytes());
     iterm.push(0x07);
     attached.write(iterm).unwrap();
-    let frame = snapshot_until(&attached, |frame| {
+    let frame = snapshot_until("iterm upload", &attached, |frame| {
         frame
             .graphics
             .images
@@ -298,7 +360,7 @@ fn sixel_and_iterm2_assets_survive_snapshot_reattach_and_delete() {
     let descriptor = attached.descriptor().clone();
     drop(attached);
     let attached = SessionClient::attach(descriptor).unwrap();
-    let reattached = snapshot_until(&attached, |frame| {
+    let reattached = snapshot_until("iterm reattach", &attached, |frame| {
         frame
             .graphics
             .images
@@ -349,8 +411,9 @@ fn atlas_removal_overflow_resynchronizes_without_restarting_shell() {
     assert!(empty.graphics.images.is_empty());
     assert!(empty.graphics.atlas_placements.is_empty());
     client.write(sixel.to_vec()).unwrap();
-    let frame =
-        snapshot_until(&client, |frame| !frame.graphics.atlas_placements.is_empty());
+    let frame = snapshot_until("atlas placement", &client, |frame| {
+        !frame.graphics.atlas_placements.is_empty()
+    });
     let (key, _) = atlas_asset(&frame);
     let descriptor = client.descriptor().clone();
     let owner = client;
@@ -370,8 +433,9 @@ fn atlas_removal_overflow_resynchronizes_without_restarting_shell() {
     client
         .write(format!("\x1b]1337;File=inline=1:{}\x07", base64(png)).into_bytes())
         .unwrap();
-    let frame =
-        snapshot_until(&client, |frame| !frame.graphics.atlas_placements.is_empty());
+    let frame = snapshot_until("iterm atlas placement", &client, |frame| {
+        !frame.graphics.atlas_placements.is_empty()
+    });
     let (key, _) = atlas_asset(&frame);
     clear_until_removed(&client, key);
     assert_eq!(client.child_pid().unwrap(), pid);
@@ -407,7 +471,7 @@ fn blocked_input_is_bounded_and_does_not_affect_another_worker() {
     assert!(error.to_string().contains("pending PTY input"));
     assert!(MAX_PENDING_INPUT_BYTES >= chunk.len());
 
-    let sibling_frame = snapshot_until(&sibling, |frame| {
+    let sibling_frame = snapshot_until("sibling shell output", &sibling, |frame| {
         frame.rows.iter().any(|row| row.text.contains("sibling"))
     });
     assert!(sibling_frame
@@ -548,7 +612,7 @@ fn snapshot_since_no_change_preserves_metadata_and_rendered_rows() {
     client
         .write(b"quiet row\r\n\x1b]2;quiet-title\x07\x1b[3;7H".to_vec())
         .unwrap();
-    let baseline = snapshot_until(&client, |frame| {
+    let baseline = snapshot_until("quiet baseline", &client, |frame| {
         frame.title == "quiet-title"
             && frame.rows.iter().any(|row| row.text.contains("quiet row"))
     });
@@ -588,7 +652,7 @@ fn snapshot_since_cursor_only_preserves_rendered_rows() {
     client
         .write(b"cursor row\r\n\x1b]2;cursor-title\x07".to_vec())
         .unwrap();
-    let baseline = snapshot_until(&client, |frame| {
+    let baseline = snapshot_until("cursor baseline", &client, |frame| {
         frame.title == "cursor-title"
             && frame.rows.iter().any(|row| row.text.contains("cursor row"))
     });
@@ -627,4 +691,56 @@ fn snapshot_since_cursor_only_preserves_rendered_rows() {
         .iter()
         .any(|row| row.text.contains("cursor row")));
     client.close().unwrap();
+}
+
+#[test]
+fn graphics_summary_reports_images_placements_and_removals() {
+    let graphics = GraphicsFrame {
+        images: vec![
+            GraphicFrame {
+                kind: 1,
+                key: 7,
+                width: 64,
+                height: 64,
+                color_type: 0,
+                pixels: vec![0; 16],
+                opacity: false,
+                display_width: None,
+                display_height: None,
+            },
+            GraphicFrame {
+                kind: 0,
+                key: 8,
+                width: 0,
+                height: 0,
+                color_type: 0,
+                pixels: Vec::new(),
+                opacity: false,
+                display_width: None,
+                display_height: None,
+            },
+        ],
+        atlas_placements: vec![AtlasPlacementFrame {
+            key: 7,
+            row: 0,
+            column: 0,
+            columns: 8,
+            rows: 4,
+            source: [0; 4],
+            image_width: 64,
+            image_height: 64,
+            cell_width: 8,
+            cell_height: 16,
+        }],
+        removed_keys: vec![9, 10],
+        ..Default::default()
+    };
+    assert_eq!(
+        describe_graphics(&graphics),
+        "images=[key=7 kind=1 px=16,key=8 kind=0 px=0] placements=[7] removed=2"
+    );
+    assert_eq!(
+        describe_graphics(&GraphicsFrame::default()),
+        "images=[] placements=[] removed=0"
+    );
 }
