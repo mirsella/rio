@@ -1714,7 +1714,7 @@ mod unix {
     }
 
     fn key_event(input: KeyInput) -> librio::KeyEvent {
-        let key = input.key.map(key_code);
+        let key = input.key.map(KeyCode::to_librio_key);
         librio::KeyEvent {
             action: match input.action {
                 WireKeyAction::Press => librio::KeyAction::Press,
@@ -1726,36 +1726,6 @@ mod unix {
             consumed_mods: librio::Modifiers::from_bits_retain(input.consumed_modifiers),
             text: input.text,
             composing: input.composing,
-        }
-    }
-
-    fn key_code(code: KeyCode) -> librio::Key {
-        match code {
-            KeyCode::Char(value) => librio::Key::Char(value),
-            KeyCode::Enter => librio::Key::Enter,
-            KeyCode::Tab => librio::Key::Tab,
-            KeyCode::Backspace => librio::Key::Backspace,
-            KeyCode::Escape => librio::Key::Escape,
-            KeyCode::Up => librio::Key::Up,
-            KeyCode::Down => librio::Key::Down,
-            KeyCode::Left => librio::Key::Left,
-            KeyCode::Right => librio::Key::Right,
-            KeyCode::Home => librio::Key::Home,
-            KeyCode::End => librio::Key::End,
-            KeyCode::PageUp => librio::Key::PageUp,
-            KeyCode::PageDown => librio::Key::PageDown,
-            KeyCode::Insert => librio::Key::Insert,
-            KeyCode::Delete => librio::Key::Delete,
-            KeyCode::Function(number) => librio::Key::F(number),
-            KeyCode::CapsLock => librio::Key::CapsLock,
-            KeyCode::ShiftLeft => librio::Key::ShiftLeft,
-            KeyCode::ShiftRight => librio::Key::ShiftRight,
-            KeyCode::ControlLeft => librio::Key::ControlLeft,
-            KeyCode::ControlRight => librio::Key::ControlRight,
-            KeyCode::AltLeft => librio::Key::AltLeft,
-            KeyCode::AltRight => librio::Key::AltRight,
-            KeyCode::SuperLeft => librio::Key::SuperLeft,
-            KeyCode::SuperRight => librio::Key::SuperRight,
         }
     }
 

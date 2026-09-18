@@ -80,10 +80,13 @@ fn wire_mouse_modifiers(modifiers: ModifiersState) -> u8 {
     bits
 }
 
+/// Build the wire input for a key event, or `None` when the event encodes
+/// to nothing and must not disturb the terminal.
 fn session_key_input(
     key: &rio_window::event::KeyEvent,
     modifiers: ModifiersState,
     alt_is_meta: bool,
+    kitty_report_all: bool,
 ) -> Option<KeyInput> {
     let action = match key.state {
         ElementState::Pressed if key.repeat => SessionKeyAction::Repeat,
@@ -120,6 +123,13 @@ fn session_key_input(
         Key::Dead(None) | Key::Unidentified(_) => None,
     };
 
+    // Bare modifiers encode to nothing outside kitty's report-all mode.
+    // Dropping them here keeps the Ctrl/Shift presses leading combos like
+    // Ctrl+Shift+C from scrolling or eating the selection before C arrives.
+    if !kitty_report_all && wire_key.is_some_and(SessionKeyCode::is_modifier) {
+        return None;
+    }
+
     let text = key
         .text_with_all_modifiers()
         .or(key.text.as_deref())
@@ -130,6 +140,16 @@ fn session_key_input(
     } else {
         0
     };
+
+    // Keyless events only reach the program as text on press; on any other
+    // action, or with no text at all, they encode to nothing in every mode
+    // (see `librio::key::encode`). Same as above, these must not scroll or
+    // clear the selection.
+    if wire_key.is_none()
+        && !(matches!(action, SessionKeyAction::Press) && text.is_some())
+    {
+        return None;
+    }
 
     Some(KeyInput {
         action,
@@ -1314,7 +1334,10 @@ impl Screen<'_> {
             }
             let text = key.text_with_all_modifiers().unwrap_or_default();
             let alt_is_meta = self.alt_send_esc(key, text);
-            if let Some(input) = session_key_input(key, mods, alt_is_meta) {
+            let kitty_report_all = mode.contains(Mode::REPORT_ALL_KEYS_AS_ESC);
+            if let Some(input) =
+                session_key_input(key, mods, alt_is_meta, kitty_report_all)
+            {
                 let _ = self
                     .ctx_mut()
                     .current_mut()
@@ -1404,7 +1427,8 @@ impl Screen<'_> {
         }
 
         let alt_is_meta = self.alt_send_esc(key, text);
-        if let Some(input) = session_key_input(key, mods, alt_is_meta) {
+        let kitty_report_all = mode.contains(Mode::REPORT_ALL_KEYS_AS_ESC);
+        if let Some(input) = session_key_input(key, mods, alt_is_meta, kitty_report_all) {
             self.scroll_bottom_when_cursor_not_visible();
             self.clear_selection();
             let _ = self
@@ -5436,6 +5460,24 @@ mod tests {
     fn transfer_graphics_reject_unrelated_routes_transactionally() {
         assert!(route_ids_belong_to([4, 7, 4], &[4, 7]));
         assert!(!route_ids_belong_to([4, 8], &[4, 7]));
+    }
+
+    #[test]
+    fn modifier_keys_map_to_modifier_codes() {
+        for named in [
+            NamedKey::Shift,
+            NamedKey::Control,
+            NamedKey::Alt,
+            NamedKey::AltGraph,
+            NamedKey::CapsLock,
+            NamedKey::Super,
+            NamedKey::Meta,
+        ] {
+            let code = named_key_code(named).expect("modifier maps to a code");
+            assert!(code.is_modifier(), "{named:?}");
+        }
+
+        assert!(!named_key_code(NamedKey::Enter).unwrap().is_modifier());
     }
 
     #[test]

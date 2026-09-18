@@ -525,6 +525,47 @@ pub enum KeyCode {
     SuperRight,
 }
 
+impl KeyCode {
+    /// Whether the code is a bare modifier key.
+    ///
+    /// Outside kitty's report-all mode these encode to nothing, so the
+    /// frontend drops them before they can disturb the terminal.
+    pub fn is_modifier(self) -> bool {
+        self.to_librio_key().is_modifier()
+    }
+
+    /// Map a wire code to the terminal key it denotes.
+    pub fn to_librio_key(self) -> librio::Key {
+        match self {
+            KeyCode::Char(value) => librio::Key::Char(value),
+            KeyCode::Enter => librio::Key::Enter,
+            KeyCode::Tab => librio::Key::Tab,
+            KeyCode::Backspace => librio::Key::Backspace,
+            KeyCode::Escape => librio::Key::Escape,
+            KeyCode::Up => librio::Key::Up,
+            KeyCode::Down => librio::Key::Down,
+            KeyCode::Left => librio::Key::Left,
+            KeyCode::Right => librio::Key::Right,
+            KeyCode::Home => librio::Key::Home,
+            KeyCode::End => librio::Key::End,
+            KeyCode::PageUp => librio::Key::PageUp,
+            KeyCode::PageDown => librio::Key::PageDown,
+            KeyCode::Insert => librio::Key::Insert,
+            KeyCode::Delete => librio::Key::Delete,
+            KeyCode::Function(number) => librio::Key::F(number),
+            KeyCode::CapsLock => librio::Key::CapsLock,
+            KeyCode::ShiftLeft => librio::Key::ShiftLeft,
+            KeyCode::ShiftRight => librio::Key::ShiftRight,
+            KeyCode::ControlLeft => librio::Key::ControlLeft,
+            KeyCode::ControlRight => librio::Key::ControlRight,
+            KeyCode::AltLeft => librio::Key::AltLeft,
+            KeyCode::AltRight => librio::Key::AltRight,
+            KeyCode::SuperLeft => librio::Key::SuperLeft,
+            KeyCode::SuperRight => librio::Key::SuperRight,
+        }
+    }
+}
+
 /// A terminal vi-mode motion.  This is deliberately a semantic wire type;
 /// the worker maps it to rio-vt's authoritative motion implementation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, bincode::Encode, bincode::Decode)]
@@ -2446,5 +2487,26 @@ mod tests {
             sanitize_session_dimensions(usize::MAX, usize::MAX),
             (1024, 256)
         );
+    }
+
+    #[test]
+    fn key_code_modifier_classification() {
+        for code in [
+            KeyCode::CapsLock,
+            KeyCode::ShiftLeft,
+            KeyCode::ShiftRight,
+            KeyCode::ControlLeft,
+            KeyCode::ControlRight,
+            KeyCode::AltLeft,
+            KeyCode::AltRight,
+            KeyCode::SuperLeft,
+            KeyCode::SuperRight,
+        ] {
+            assert!(code.is_modifier(), "{code:?}");
+        }
+
+        assert!(!KeyCode::Enter.is_modifier());
+        assert!(!KeyCode::Char('c').is_modifier());
+        assert!(!KeyCode::Function(1).is_modifier());
     }
 }
