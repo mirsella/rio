@@ -1537,7 +1537,7 @@ impl Screen<'_> {
                         self.paste(&content, true);
                     }
                     Act::Copy => {
-                        self.yank_selection(clipboard);
+                        self.yank_selection();
                     }
                     Act::SelectAll => {
                         self.select_all();
@@ -1554,16 +1554,16 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::Search(SearchAction::SearchConfirm) => {
-                        self.confirm_search(clipboard);
+                        self.confirm_search();
                         self.mark_dirty();
                     }
                     Act::Search(SearchAction::SearchCancel) => {
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         self.mark_dirty();
                     }
                     Act::Search(SearchAction::SearchClear) => {
                         let direction = self.search_state.direction;
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         self.start_search(direction);
                         self.mark_dirty();
                     }
@@ -1618,11 +1618,7 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::Vi(ViAction::ToggleNormalSelection) => {
-                        self.toggle_selection(
-                            SelectionType::Simple,
-                            Side::Left,
-                            clipboard,
-                        );
+                        self.toggle_selection(SelectionType::Simple, Side::Left);
                         self.context_manager
                             .current_mut()
                             .renderable_content
@@ -1633,11 +1629,7 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::Vi(ViAction::ToggleLineSelection) => {
-                        self.toggle_selection(
-                            SelectionType::Lines,
-                            Side::Left,
-                            clipboard,
-                        );
+                        self.toggle_selection(SelectionType::Lines, Side::Left);
                         self.context_manager
                             .current_mut()
                             .renderable_content
@@ -1648,11 +1640,7 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::Vi(ViAction::ToggleBlockSelection) => {
-                        self.toggle_selection(
-                            SelectionType::Block,
-                            Side::Left,
-                            clipboard,
-                        );
+                        self.toggle_selection(SelectionType::Block, Side::Left);
                         self.context_manager
                             .current_mut()
                             .renderable_content
@@ -1663,11 +1651,7 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::Vi(ViAction::ToggleSemanticSelection) => {
-                        self.toggle_selection(
-                            SelectionType::Semantic,
-                            Side::Left,
-                            clipboard,
-                        );
+                        self.toggle_selection(SelectionType::Semantic, Side::Left);
                         self.context_manager
                             .current_mut()
                             .renderable_content
@@ -1713,17 +1697,17 @@ impl Screen<'_> {
                         self.context_manager.toggle_quake();
                     }
                     Act::CloseCurrentSplitOrTab => {
-                        self.close_split_or_tab(clipboard);
+                        self.close_split_or_tab();
                     }
                     Act::TabCreateNew => {
-                        self.create_tab(clipboard);
+                        self.create_tab();
                     }
                     Act::TabCloseCurrent => {
-                        self.close_tab(clipboard);
+                        self.close_tab();
                     }
                     Act::TabCloseUnfocused => {
                         self.clear_selection();
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         if self.ctx().len() <= 1 {
                             return true;
                         }
@@ -1863,17 +1847,17 @@ impl Screen<'_> {
                         self.context_manager.hide_other_apps();
                     }
                     Act::SelectNextSplit => {
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         self.context_manager.select_next_split();
                         self.mark_dirty();
                     }
                     Act::SelectPrevSplit => {
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         self.context_manager.select_prev_split();
                         self.mark_dirty();
                     }
                     Act::SelectNextSplitOrTab => {
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         self.clear_selection();
                         let old_index = self.context_manager.current_index();
                         self.context_manager.switch_to_next_split_or_tab();
@@ -1882,7 +1866,7 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::SelectPrevSplitOrTab => {
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         self.clear_selection();
                         let old_index = self.context_manager.current_index();
                         self.context_manager.switch_to_prev_split_or_tab();
@@ -1895,11 +1879,11 @@ impl Screen<'_> {
                         self.context_manager.select_tab(*tab_index);
                         self.context_manager
                             .clear_context_overlays(&mut self.sugarloaf, old_index);
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         self.mark_dirty();
                     }
                     Act::SelectLastTab => {
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         let old_index = self.context_manager.current_index();
                         self.context_manager.select_last_tab();
                         self.context_manager
@@ -1907,7 +1891,7 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::SelectNextTab => {
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         self.clear_selection();
                         let old_index = self.context_manager.current_index();
                         self.context_manager.switch_to_next();
@@ -1916,7 +1900,7 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::MoveCurrentTabToPrev => {
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         self.clear_selection();
                         let old_index = self.context_manager.current_index();
                         self.context_manager.move_current_to_prev();
@@ -1931,7 +1915,7 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::MoveCurrentTabToNext => {
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         self.clear_selection();
                         let old_index = self.context_manager.current_index();
                         self.context_manager.move_current_to_next();
@@ -1946,7 +1930,7 @@ impl Screen<'_> {
                         self.mark_dirty();
                     }
                     Act::SelectPrevTab => {
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                         self.clear_selection();
                         let old_index = self.context_manager.current_index();
                         self.context_manager.switch_to_prev();
@@ -2025,7 +2009,7 @@ impl Screen<'_> {
         }
     }
 
-    pub fn create_tab(&mut self, clipboard: &mut Clipboard) {
+    pub fn create_tab(&mut self) {
         let redirect = true;
 
         let old_index = self.context_manager.current_index();
@@ -2035,11 +2019,11 @@ impl Screen<'_> {
         self.context_manager
             .clear_context_overlays(&mut self.sugarloaf, old_index);
 
-        self.cancel_search(clipboard);
+        self.cancel_search();
         self.refresh_current_layout();
     }
 
-    pub fn close_split_or_tab(&mut self, clipboard: &mut Clipboard) {
+    pub fn close_split_or_tab(&mut self) {
         if self.context_manager.current_grid().len() > 1 {
             self.clear_selection();
             self.discard_routes([self.context_manager.current().route_id]);
@@ -2048,11 +2032,11 @@ impl Screen<'_> {
             self.refresh_titles();
             self.mark_dirty();
         } else {
-            self.close_tab(clipboard);
+            self.close_tab();
         }
     }
 
-    pub fn close_tab(&mut self, clipboard: &mut Clipboard) {
+    pub fn close_tab(&mut self) {
         self.clear_selection();
         let had_multiple_tabs = self.context_manager.len() > 1;
         if had_multiple_tabs {
@@ -2065,7 +2049,7 @@ impl Screen<'_> {
             island.dismiss_color_picker();
         }
 
-        self.cancel_search(clipboard);
+        self.cancel_search();
         if had_multiple_tabs {
             self.refresh_current_layout();
         } else {
@@ -2231,8 +2215,7 @@ impl Screen<'_> {
         }
     }
 
-    pub fn copy_selection(&mut self, ty: ClipboardType, clipboard: &mut Clipboard) {
-        let _ = clipboard;
+    pub fn copy_selection(&mut self, ty: ClipboardType) {
         self.context_manager
             .current_mut()
             .terminal
@@ -2240,9 +2223,9 @@ impl Screen<'_> {
             .request_selection_text(ty);
     }
 
-    fn yank_selection(&mut self, clipboard: &mut Clipboard) {
+    fn yank_selection(&mut self) {
         let vi_mode = self.get_mode().contains(Mode::VI);
-        self.copy_selection(ClipboardType::Clipboard, clipboard);
+        self.copy_selection(ClipboardType::Clipboard);
         if vi_mode {
             self.set_vi_mode(false);
         }
@@ -2308,14 +2291,8 @@ impl Screen<'_> {
     }
 
     #[inline]
-    fn start_selection(
-        &mut self,
-        ty: SelectionType,
-        point: Pos,
-        side: Side,
-        clipboard: &mut Clipboard,
-    ) {
-        self.copy_selection(ClipboardType::Selection, clipboard);
+    fn start_selection(&mut self, ty: SelectionType, point: Pos, side: Side) {
+        self.copy_selection(ClipboardType::Selection);
         {
             let current = self.context_manager.current_mut();
             current.terminal.lock().selection_begin(ty, point, side);
@@ -2326,13 +2303,7 @@ impl Screen<'_> {
     }
 
     #[inline]
-    fn toggle_selection(
-        &mut self,
-        ty: SelectionType,
-        side: Side,
-        clipboard: &mut Clipboard,
-    ) {
-        let _ = clipboard;
+    fn toggle_selection(&mut self, ty: SelectionType, side: Side) {
         let current = self.context_manager.current_mut();
         let terminal = current.terminal.lock();
         if terminal.selection_range.is_some() {
@@ -2341,7 +2312,7 @@ impl Screen<'_> {
         } else {
             let point = terminal.vi_cursor_position();
             drop(terminal);
-            self.start_selection(ty, point, side, clipboard);
+            self.start_selection(ty, point, side);
         }
     }
 
@@ -2883,7 +2854,7 @@ impl Screen<'_> {
     }
 
     #[inline]
-    pub fn handle_search_click(&mut self, clipboard: &mut Clipboard) -> bool {
+    pub fn handle_search_click(&mut self) -> bool {
         if !self.renderer.search.is_active() {
             return false;
         }
@@ -2909,7 +2880,7 @@ impl Screen<'_> {
                         self.advance_search_origin(direction);
                     }
                     SearchOverlayAction::Close => {
-                        self.cancel_search(clipboard);
+                        self.cancel_search();
                     }
                 }
                 self.mark_dirty();
@@ -3262,7 +3233,6 @@ impl Screen<'_> {
     pub fn handle_island_click(
         &mut self,
         window: &rio_window::window::Window,
-        clipboard: &mut Clipboard,
         is_right_click: bool,
         chrome_press: Option<ChromePress>,
     ) -> bool {
@@ -3469,13 +3439,13 @@ impl Screen<'_> {
         {
             self.stop_hint_mode_if_active();
             self.last_close_press = Some((std::time::Instant::now(), mouse_x_unscaled));
-            self.close_tab(clipboard);
+            self.close_tab();
             return true;
         }
 
         if clicked_tab != self.context_manager.current_index() {
             self.stop_hint_mode_if_active();
-            self.cancel_search(clipboard);
+            self.cancel_search();
             self.clear_selection();
             let old_index = self.context_manager.current_index();
             self.context_manager.set_current(clicked_tab);
@@ -3583,7 +3553,7 @@ impl Screen<'_> {
     }
 
     #[inline]
-    pub fn on_left_click(&mut self, point: Pos, clipboard: &mut Clipboard) {
+    pub fn on_left_click(&mut self, point: Pos) {
         let side = self.mouse.square_side;
         // New press gesture: forget any drag from the previous one so
         // the release handler can tell a plain click from a drag while
@@ -3600,27 +3570,17 @@ impl Screen<'_> {
 
                     // Start new empty selection.
                     if self.modifiers.state().control_key() {
-                        self.start_selection(
-                            SelectionType::Block,
-                            point,
-                            side,
-                            clipboard,
-                        );
+                        self.start_selection(SelectionType::Block, point, side);
                     } else {
-                        self.start_selection(
-                            SelectionType::Simple,
-                            point,
-                            side,
-                            clipboard,
-                        );
+                        self.start_selection(SelectionType::Simple, point, side);
                     }
                 }
             }
             ClickState::DoubleClick => {
-                self.start_selection(SelectionType::Semantic, point, side, clipboard);
+                self.start_selection(SelectionType::Semantic, point, side);
             }
             ClickState::TripleClick => {
-                self.start_selection(SelectionType::Lines, point, side, clipboard);
+                self.start_selection(SelectionType::Lines, point, side);
             }
             ClickState::None => (),
         };
@@ -3680,10 +3640,10 @@ impl Screen<'_> {
     }
 
     #[inline]
-    fn confirm_search(&mut self, clipboard: &mut Clipboard) {
+    fn confirm_search(&mut self) {
         // Just cancel search when not in vi mode.
         if !self.get_mode().contains(Mode::VI) {
-            self.cancel_search(clipboard);
+            self.cancel_search();
             return;
         }
 
@@ -3697,7 +3657,7 @@ impl Screen<'_> {
     }
 
     #[inline]
-    fn cancel_search(&mut self, clipboard: &mut Clipboard) {
+    fn cancel_search(&mut self) {
         let vi_mode = self.get_mode().contains(Mode::VI);
         let had_match = self.search_state.focused_match.is_some();
         self.context_manager
@@ -3708,7 +3668,7 @@ impl Screen<'_> {
         if !vi_mode && had_match {
             // The worker selects the focused match while cancelling. Request the
             // resulting text after that command in the same bounded queue.
-            self.copy_selection(ClipboardType::Selection, clipboard);
+            self.copy_selection(ClipboardType::Selection);
         }
 
         self.search_state.dfas = None;
@@ -3990,8 +3950,8 @@ impl Screen<'_> {
     ) {
         use crate::renderer::command_palette::PaletteAction;
         match action {
-            PaletteAction::TabCreate => self.create_tab(clipboard),
-            PaletteAction::TabClose => self.close_tab(clipboard),
+            PaletteAction::TabCreate => self.create_tab(),
+            PaletteAction::TabClose => self.close_tab(),
             PaletteAction::TabCloseUnfocused => {
                 if self.ctx().len() > 1 {
                     let removed = self
@@ -4026,7 +3986,7 @@ impl Screen<'_> {
             PaletteAction::SelectPrevSplit => {
                 self.context_manager.select_prev_split();
             }
-            PaletteAction::CloseCurrentSplitOrTab => self.close_split_or_tab(clipboard),
+            PaletteAction::CloseCurrentSplitOrTab => self.close_split_or_tab(),
             PaletteAction::ConfigEditor => {
                 self.context_manager.switch_to_settings();
             }
@@ -4062,7 +4022,7 @@ impl Screen<'_> {
                 self.context_manager.toggle_appearance_theme();
             }
             PaletteAction::Copy => {
-                self.yank_selection(clipboard);
+                self.yank_selection();
             }
             PaletteAction::Paste => {
                 let content = clipboard.get(ClipboardType::Clipboard);
@@ -4860,7 +4820,6 @@ impl Screen<'_> {
                         SelectionType::Simple,
                         hint_match.start,
                         Side::Left,
-                        clipboard,
                     );
                     self.update_selection(hint_match.end, Side::Right);
                     self.mark_dirty();
