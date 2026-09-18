@@ -863,4 +863,17 @@ mod tests {
         let shifted = with_mods(Key::F(1), Modifiers::SHIFT);
         assert_eq!(encode(&shifted, &legacy()), Some(b"\x1b[1;2P".to_vec()));
     }
+
+    #[test]
+    fn keyless_textless_events_encode_to_nothing() {
+        // The frontend drops these before they can scroll or clear the
+        // selection (unidentified keys, character-less dead keys).
+        let event = KeyEvent {
+            key: None,
+            text: None,
+            ..Default::default()
+        };
+        assert_eq!(encode(&event, &legacy()), None);
+        assert_eq!(encode(&event, &kitty(KittyFlags::REPORT_ALL_AS_ESC)), None);
+    }
 }
