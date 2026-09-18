@@ -14,8 +14,7 @@ mod unix {
         KeyAction as WireKeyAction, KeyCode, KeyInput, RequestKind, RequestRefusalReason,
         ResolvedWorkingDir, SearchDirection, SearchMatch, SelectionKind, SelectionSide,
         ServerMessage, SessionCommand, SessionEvent, SessionId, SessionReply,
-        SessionSpec, MAX_PENDING_INPUT_BYTES, MAX_PENDING_REQUESTS, MAX_SELECTION_LINES,
-        PROTOCOL_VERSION,
+        SessionSpec, MAX_PENDING_INPUT_BYTES, MAX_PENDING_REQUESTS, PROTOCOL_VERSION,
     };
     use crate::readiness;
     use crate::{
@@ -763,24 +762,22 @@ mod unix {
                 | SessionCommand::MouseButton { column, line, .. }
                 | SessionCommand::MouseMotion { column, line, .. } => {
                     self.validate_pointer(*column, *line)?;
+                    Ok(None)
                 }
                 SessionCommand::SelectionBegin { line, column, .. } => {
-                    return self.validate_selection(*line, *column).map(Some);
+                    self.validate_selection(*line, *column).map(Some)
                 }
                 SessionCommand::SelectionUpdate { line, column, .. } => {
                     let line = self.validate_selection(*line, *column)?;
-                    if let Some(anchor) = self.selection_anchor {
-                        if anchor.abs_diff(line) > MAX_SELECTION_LINES as u32 {
-                            return Err(SessionError::invalid(
-                                "selection range exceeds the session limit",
-                            ));
+                    Ok(Some(match self.selection_anchor {
+                        Some(anchor) => {
+                            crate::protocol::clamp_selection_span(line, anchor)
                         }
-                    }
-                    return Ok(Some(line));
+                        None => line,
+                    }))
                 }
-                _ => return Ok(None),
+                _ => Ok(None),
             }
-            Ok(None)
         }
 
         fn pending_request(
@@ -1145,13 +1142,12 @@ mod unix {
                     if let (Some(anchor), Some(endpoint)) =
                         (self.selection_anchor, self.selection_endpoint)
                     {
+                        // Bounds only: an oversized span copies up to
+                        // `MAX_STRING_BYTES` instead of failing, so huge
+                        // selections (and select-all over scrollback) still
+                        // copy.
                         self.validate_internal_selection(anchor, 0)?;
                         self.validate_internal_selection(endpoint, 0)?;
-                        if anchor.abs_diff(endpoint) > MAX_SELECTION_LINES as u32 {
-                            return Err(SessionError::invalid(
-                                "selection range exceeds the session limit",
-                            ));
-                        }
                     }
                     let text = self
                         .surface
