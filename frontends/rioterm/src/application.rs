@@ -5722,11 +5722,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                                 return;
                             }
 
-                            if route
-                                .window
-                                .screen
-                                .handle_search_click(&mut self.router.clipboard)
-                            {
+                            if route.window.screen.handle_search_click() {
                                 route.request_redraw();
                                 return;
                             }
@@ -5734,7 +5730,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             let handled_by_island =
                                 route.window.screen.handle_island_click(
                                     &route.window.winit_window,
-                                    &mut self.router.clipboard,
                                     false,
                                     chrome_press,
                                 );
@@ -5766,7 +5761,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             let handled_by_island =
                                 route.window.screen.handle_island_click(
                                     &route.window.winit_window,
-                                    &mut self.router.clipboard,
                                     true,
                                     chrome_press,
                                 );
@@ -5834,10 +5828,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             if let MouseButton::Left = button {
                                 let pos =
                                     route.window.screen.mouse_position(display_offset);
-                                route
-                                    .window
-                                    .screen
-                                    .on_left_click(pos, &mut self.router.clipboard);
+                                route.window.screen.on_left_click(pos);
                             }
 
                             route.request_redraw();
@@ -6476,7 +6467,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
             }
             WindowEvent::Touch(touch) => {
-                on_touch(route, touch, &mut self.router.clipboard);
+                on_touch(route, touch);
             }
 
             WindowEvent::Focused(focused) => {
