@@ -19,7 +19,22 @@ pub const MAX_GRAPHICS_ITEMS: usize = 4096;
 pub const MAX_FRAME_GRAPHICS_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_GRAPHIC_DIMENSION: u32 = 10_000;
 pub const MAX_WHEEL_LINES: i32 = 1024;
-pub const MAX_SELECTION_LINES: i32 = 1024;
+// Span guard for live selections: drags and select-all can legitimately cover
+// the whole scrollback, so this only needs to stop absurd ranges, not normal
+// use. Copied text is bounded separately by `MAX_STRING_BYTES`, which is what
+// actually caps worker and transport cost.
+pub const MAX_SELECTION_LINES: i32 = 65536;
+
+/// Clamp a tracked selection endpoint to `MAX_SELECTION_LINES` around its
+/// anchor, so oversized gestures degrade to a capped span instead of a
+/// rejected command (frozen drags, copies that silently do nothing).
+/// Extraction itself is bounded separately by `MAX_STRING_BYTES`.
+pub fn clamp_selection_span(line: i32, anchor: i32) -> i32 {
+    line.clamp(
+        anchor.saturating_sub(MAX_SELECTION_LINES),
+        anchor.saturating_add(MAX_SELECTION_LINES),
+    )
+}
 pub const MAX_PENDING_INPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SCROLLBACK: usize = 10_000_000;
 
@@ -2508,5 +2523,25 @@ mod tests {
         assert!(!KeyCode::Enter.is_modifier());
         assert!(!KeyCode::Char('c').is_modifier());
         assert!(!KeyCode::Function(1).is_modifier());
+    }
+
+    #[test]
+    fn selection_span_clamps_around_anchor() {
+        assert_eq!(clamp_selection_span(10, 0), 10);
+        assert_eq!(clamp_selection_span(-10, 0), -10);
+        assert_eq!(
+            clamp_selection_span(MAX_SELECTION_LINES + 1, 0),
+            MAX_SELECTION_LINES
+        );
+        assert_eq!(
+            clamp_selection_span(-MAX_SELECTION_LINES - 1, 0),
+            -MAX_SELECTION_LINES
+        );
+        // The window follows a scrolled anchor instead of collapsing.
+        assert_eq!(clamp_selection_span(-5000, -9000), -5000, "in range stays",);
+        assert_eq!(
+            clamp_selection_span(100_000, -9000),
+            -9000 + MAX_SELECTION_LINES
+        );
     }
 }
