@@ -678,17 +678,8 @@ impl WindowControl {
         thread::Builder::new()
             .name("rio-window-launch".into())
             .spawn(move || {
-                let (result, child) =
+                let result =
                     Self::blocking_launch_and_offer(&scope, &offer, app_id.as_deref());
-                if result.is_err() {
-                    // An empty bootstrap window has no session to preserve.
-                    if let Some(mut child) = child {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
-                } else if let Some(mut child) = child {
-                    let _ = child.wait();
-                }
                 let _ = sender.try_send(WindowControlEvent::OfferResult {
                     transfer_id: offer.transfer_id,
                     result,
@@ -699,23 +690,46 @@ impl WindowControl {
         Ok(())
     }
 
+    /// Reap a detached window without holding up the commit result: the
+    /// commit is already known, and the source tab must be removed as soon
+    /// as the target takes ownership. Waiting here instead would leave a
+    /// frozen ghost tab in the source window until the new window exits.
+    fn reap_detached_window(child: std::process::Child) {
+        if let Err(error) =
+            thread::Builder::new()
+                .name("rio-window-reap".into())
+                .spawn(move || {
+                    let mut child = child;
+                    let _ = child.wait();
+                })
+        {
+            tracing::warn!(%error, "detached Rio window reaper failed to start");
+        }
+    }
+
     #[cfg(unix)]
     fn blocking_launch_and_offer(
         scope: &str,
         offer: &TransferOffer,
         app_id: Option<&str>,
-    ) -> (Result<Vec<u64>, String>, Option<std::process::Child>) {
-        let mut child = match Self::spawn_bootstrap_child(app_id) {
-            Ok(child) => child,
-            Err(error) => return (Err(error), None),
-        };
+    ) -> Result<Vec<u64>, String> {
+        let mut child = Self::spawn_bootstrap_child(app_id)?;
         let process_id = child.id();
         if let Err(error) = Self::write_bootstrap_identity(&mut child, &offer.transfer_id)
         {
-            return (Err(error), Some(child));
+            // An empty bootstrap window has no session to preserve.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
         }
         let result = Self::await_bootstrap_commit(scope, process_id, offer);
-        (result, Some(child))
+        if result.is_ok() {
+            Self::reap_detached_window(child);
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        result
     }
 
     #[cfg(unix)]
