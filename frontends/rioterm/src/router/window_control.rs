@@ -166,6 +166,78 @@ pub fn new_transfer_id() -> Result<[u8; 16], String> {
     Err("cross-window control is unsupported on this platform".into())
 }
 
+/// Flag marking a detached-window bootstrap child. The transfer identity
+/// itself travels over inherited stdin, never via argv.
+pub const WINDOW_BOOTSTRAP_FLAG: &str = "--window-bootstrap";
+
+/// Maximum app id length forwarded to a bootstrap child (Wayland app_id /
+/// X11 WM_CLASS). Keeps a malformed source value from becoming an invalid
+/// child argv entry.
+pub const MAX_APP_ID_LEN: usize = 256;
+
+/// Removes every bootstrap flag from process argv. Returns whether the
+/// current process is a detached-window bootstrap child.
+pub fn take_window_bootstrap_flag(arguments: &mut Vec<std::ffi::OsString>) -> bool {
+    let mut found = false;
+    let mut is_argv0 = true;
+    arguments.retain(|arg| {
+        // Never strip argv[0]: it is the executable path, not a flag.
+        if is_argv0 {
+            is_argv0 = false;
+            return true;
+        }
+        if arg == WINDOW_BOOTSTRAP_FLAG {
+            found = true;
+            false
+        } else {
+            true
+        }
+    });
+    found
+}
+
+/// Reads the 16-byte transfer identity a bootstrap child receives over stdin.
+pub fn read_bootstrap_identity<R: std::io::Read>(
+    mut source: R,
+) -> Result<[u8; 16], std::io::Error> {
+    let mut transfer = [0; 16];
+    source.read_exact(&mut transfer)?;
+    if transfer == [0; 16] {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid window bootstrap identity",
+        ));
+    }
+    Ok(transfer)
+}
+
+pub fn validate_bootstrap_app_id(app_id: &str) -> Result<(), String> {
+    if app_id.is_empty()
+        || app_id.len() > MAX_APP_ID_LEN
+        || app_id.as_bytes().contains(&0)
+    {
+        return Err("window bootstrap app id is invalid".into());
+    }
+    Ok(())
+}
+
+/// Builds the bootstrap child command. The flag stays first; the source
+/// window's app id is forwarded so the child reports the same Wayland app_id
+/// / X11 WM_CLASS as a manually launched second Rio window and groups with
+/// it in the taskbar.
+pub fn bootstrap_command(
+    executable: &Path,
+    app_id: Option<&str>,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(executable);
+    command.arg(WINDOW_BOOTSTRAP_FLAG);
+    if let Some(app_id) = app_id.filter(|id| !id.is_empty()) {
+        command.arg("--app-id").arg(app_id);
+    }
+    command.stdin(std::process::Stdio::piped());
+    command
+}
+
 impl TransferOffer {
     pub fn pane_route_ids(&self) -> Vec<u64> {
         self.panes.iter().map(|pane| pane.route_id).collect()
@@ -593,8 +665,12 @@ impl WindowControl {
         offer: TransferOffer,
         event_proxy: T,
         window_id: WindowId,
+        app_id: Option<String>,
     ) -> Result<(), String> {
         offer.validate()?;
+        if let Some(app_id) = app_id.as_deref() {
+            validate_bootstrap_app_id(app_id)?;
+        }
         let sender = self.event_sender.clone();
         let listener = event_proxy
             .with_window_target(rio_backend::event::WindowTarget::dynamic(window_id));
@@ -602,59 +678,91 @@ impl WindowControl {
         thread::Builder::new()
             .name("rio-window-launch".into())
             .spawn(move || {
-                let mut child = None;
-                let result: Result<Vec<u64>, String> = (|| {
-                    let executable = std::env::current_exe()
-                        .map_err(|error| format!("find Rio executable: {error}"))?;
-                    let mut launched = std::process::Command::new(executable)
-                        .arg("--window-bootstrap")
-                        .stdin(std::process::Stdio::piped())
-                        .spawn()
-                        .map_err(|error| format!("launch Rio window: {error}"))?;
-                    let process_id = launched.id();
-                    use std::io::Write;
-                    let bootstrap = launched.stdin.take().expect("piped bootstrap stdin");
-                    child = Some(launched);
-                    {
-                        let mut bootstrap = bootstrap;
-                        bootstrap
-                            .write_all(&offer.transfer_id)
-                            .map_err(|error| format!("bootstrap window: {error}"))?;
-                    }
-                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                    loop {
-                        if let Some(target) = Self::discover(&scope)
-                            .into_iter()
-                            .find(|target| target.process_id == process_id)
-                        {
-                            return send_offer(&target, &offer, None);
-                        }
-                        if std::time::Instant::now() >= deadline {
-                            return Err(
-                                "new Rio window did not publish a control endpoint"
-                                    .into(),
-                            );
-                        }
-                        thread::sleep(Duration::from_millis(50));
-                    }
-                })();
+                let (result, child) =
+                    Self::blocking_launch_and_offer(&scope, &offer, app_id.as_deref());
                 if result.is_err() {
                     // An empty bootstrap window has no session to preserve.
-                    if let Some(child) = child.as_mut() {
+                    if let Some(mut child) = child {
                         let _ = child.kill();
+                        let _ = child.wait();
                     }
+                } else if let Some(mut child) = child {
+                    let _ = child.wait();
                 }
                 let _ = sender.try_send(WindowControlEvent::OfferResult {
                     transfer_id: offer.transfer_id,
                     result,
                 });
                 listener.send_event(RioEvent::Render, window_id);
-                if let Some(mut child) = child {
-                    let _ = child.wait();
-                }
             })
             .map_err(|error| format!("start Rio window launch: {error}"))?;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn blocking_launch_and_offer(
+        scope: &str,
+        offer: &TransferOffer,
+        app_id: Option<&str>,
+    ) -> (Result<Vec<u64>, String>, Option<std::process::Child>) {
+        let mut child = match Self::spawn_bootstrap_child(app_id) {
+            Ok(child) => child,
+            Err(error) => return (Err(error), None),
+        };
+        let process_id = child.id();
+        if let Err(error) = Self::write_bootstrap_identity(&mut child, &offer.transfer_id)
+        {
+            return (Err(error), Some(child));
+        }
+        let result = Self::await_bootstrap_commit(scope, process_id, offer);
+        (result, Some(child))
+    }
+
+    #[cfg(unix)]
+    fn spawn_bootstrap_child(
+        app_id: Option<&str>,
+    ) -> Result<std::process::Child, String> {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("find Rio executable: {error}"))?;
+        bootstrap_command(&executable, app_id)
+            .spawn()
+            .map_err(|error| format!("launch Rio window: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn write_bootstrap_identity(
+        child: &mut std::process::Child,
+        transfer_id: &[u8; 16],
+    ) -> Result<(), String> {
+        use std::io::Write;
+        let mut bootstrap = child
+            .stdin
+            .take()
+            .ok_or_else(|| "bootstrap window stdin is unavailable".to_owned())?;
+        bootstrap
+            .write_all(transfer_id)
+            .map_err(|error| format!("bootstrap window: {error}"))
+    }
+
+    #[cfg(unix)]
+    fn await_bootstrap_commit(
+        scope: &str,
+        process_id: u32,
+        offer: &TransferOffer,
+    ) -> Result<Vec<u64>, String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(target) = WindowControl::discover(scope)
+                .into_iter()
+                .find(|target| target.process_id == process_id)
+            {
+                return send_offer(&target, offer, None);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("new Rio window did not publish a control endpoint".into());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     pub fn discover_peers_async<T: EventListener + Clone + Send + 'static>(
@@ -1195,6 +1303,55 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_child_shares_source_window_identity() {
+        use std::ffi::OsString;
+        use std::io::Cursor;
+
+        let exe = Path::new("/usr/bin/rio");
+        let plain: Vec<OsString> = bootstrap_command(exe, None)
+            .get_args()
+            .map(ToOwned::to_owned)
+            .collect();
+        assert_eq!(plain, vec![OsString::from(WINDOW_BOOTSTRAP_FLAG)]);
+
+        let grouped: Vec<OsString> = bootstrap_command(exe, Some("Rio"))
+            .get_args()
+            .map(ToOwned::to_owned)
+            .collect();
+        assert_eq!(
+            grouped,
+            vec![
+                OsString::from(WINDOW_BOOTSTRAP_FLAG),
+                OsString::from("--app-id"),
+                OsString::from("Rio"),
+            ]
+        );
+
+        let mut argv = vec![
+            OsString::from("rio"),
+            OsString::from(WINDOW_BOOTSTRAP_FLAG),
+            OsString::from("--app-id"),
+            OsString::from("Rio"),
+        ];
+        assert!(super::take_window_bootstrap_flag(&mut argv));
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("rio"),
+                OsString::from("--app-id"),
+                OsString::from("Rio")
+            ]
+        );
+
+        assert!(super::validate_bootstrap_app_id("Rio").is_ok());
+        assert!(super::validate_bootstrap_app_id("").is_err());
+
+        let identity = super::read_bootstrap_identity(Cursor::new([7; 16])).unwrap();
+        assert_eq!(identity, [7; 16]);
+        assert!(super::read_bootstrap_identity(Cursor::new([0; 16])).is_err());
+    }
+
+    #[test]
     fn endpoint_debug_redacts_capability() {
         let endpoint_path =
             test_artifact_dir("rio-window-control-debug").join("control.sock");
@@ -1267,6 +1424,7 @@ impl WindowControl {
         _offer: TransferOffer,
         _event_proxy: T,
         _window_id: WindowId,
+        _app_id: Option<String>,
     ) -> Result<(), String> {
         Err("cross-window control is unsupported on this platform".into())
     }
