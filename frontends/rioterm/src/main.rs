@@ -163,18 +163,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load command line options.
     let mut arguments: Vec<_> = std::env::args_os().collect();
-    if arguments
-        .get(1)
-        .is_some_and(|arg| arg == "--window-bootstrap")
-    {
-        use std::io::Read;
-        let mut transfer = [0; 16];
-        std::io::stdin().read_exact(&mut transfer)?;
-        if transfer == [0; 16] {
-            return Err("invalid window bootstrap identity".into());
-        }
+    if crate::router::window_control::take_window_bootstrap_flag(&mut arguments) {
+        let transfer =
+            crate::router::window_control::read_bootstrap_identity(std::io::stdin())?;
         *WINDOW_BOOTSTRAP.lock().unwrap() = Some(transfer);
-        arguments.remove(1);
     }
     let args = cli::Cli::parse_from(arguments);
 

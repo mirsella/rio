@@ -869,9 +869,12 @@ impl<'a> Application<'a> {
                 }
             };
             let source_routes = offer.pane_route_ids();
-            if let Err(error) =
-                control.launch_and_offer_async(offer, self.event_proxy.clone(), source_id)
-            {
+            if let Err(error) = control.launch_and_offer_async(
+                offer,
+                self.event_proxy.clone(),
+                source_id,
+                self.app_id.clone(),
+            ) {
                 tracing::warn!(%error, "could not launch target Rio window");
                 return None;
             }
