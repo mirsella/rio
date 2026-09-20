@@ -16,6 +16,7 @@ use rio_backend::crosswords::pos::{Column, CursorState, Line, Pos};
 use rio_backend::crosswords::square::{CellFlags, Extras, Hyperlink, Square, Wide};
 use rio_backend::crosswords::style::{Style, StyleFlags};
 use rio_backend::crosswords::Mode;
+use rio_backend::error::{RioError, RioErrorLevel, RioErrorType};
 use rio_backend::event::{EventListener, RioEvent, WindowId, WindowTarget};
 use rio_backend::selection::SelectionRange;
 use rio_session::protocol::{
@@ -173,6 +174,7 @@ struct SessionState {
     search_matches: Mutex<Option<Vec<SearchMatch>>>,
     pump_done: AtomicBool,
     frame_resync_logged: AtomicBool,
+    had_frame: AtomicBool,
 }
 
 impl SessionState {
@@ -187,6 +189,7 @@ impl SessionState {
             search_matches: Mutex::new(None),
             pump_done: AtomicBool::new(false),
             frame_resync_logged: AtomicBool::new(false),
+            had_frame: AtomicBool::new(false),
         }
     }
 
@@ -207,6 +210,14 @@ impl SessionState {
         match &*self.status.lock().expect("session status lock poisoned") {
             SessionStatus::Running(error) | SessionStatus::Closed(error) => error.clone(),
         }
+    }
+
+    fn had_frame(&self) -> bool {
+        self.had_frame.load(Ordering::Acquire)
+    }
+
+    fn mark_had_frame(&self) {
+        self.had_frame.store(true, Ordering::Release);
     }
 
     fn publish_frame(&self, frame: FullFrame) {
@@ -232,6 +243,7 @@ impl SessionState {
         }
         drop(mailbox);
         // Both full snapshots and deltas confirm recovery; rejected updates do not.
+        self.mark_had_frame();
         if let SessionStatus::Running(error) =
             &mut *self.status.lock().expect("session status lock poisoned")
         {
@@ -387,28 +399,18 @@ impl SessionHandle {
         thread::Builder::new()
             .name(format!("rio-session-{route_id}"))
             .spawn(move || {
-                let worker = match std::env::current_exe() {
-                    Ok(worker) => worker,
-                    Err(error) => {
-                        state_for_thread.fail(SessionError::from(error));
-                        state_for_thread.pump_done.store(true, Ordering::Release);
-                        let window_id = window_for_thread_clone
-                            .lock()
-                            .map(|window_id| *window_id)
-                            .unwrap_or_else(|_| WindowId::from(0));
-                        listener.send_event(RioEvent::RenderRoute(route_id), window_id);
-                        return;
-                    }
-                };
-                let client = match SessionClient::spawn_with_worker_path(spec, worker) {
+                let client = std::env::current_exe()
+                    .map_err(SessionError::from)
+                    .and_then(|worker| {
+                        SessionClient::spawn_with_worker_path(spec, worker)
+                    });
+                let client = match client {
                     Ok(client) => client,
                     Err(error) => {
+                        let window_id = load_window_id(&window_for_thread_clone);
+                        report_startup_failure(&listener, window_id, route_id, &error);
                         state_for_thread.fail(error);
                         state_for_thread.pump_done.store(true, Ordering::Release);
-                        let window_id = window_for_thread_clone
-                            .lock()
-                            .map(|window_id| *window_id)
-                            .unwrap_or_else(|_| WindowId::from(0));
                         listener.send_event(RioEvent::RenderRoute(route_id), window_id);
                         return;
                     }
@@ -699,7 +701,12 @@ impl<T: EventListener + Clone + Send + 'static> SessionPump<T> {
                 self.state.publish_frame(*frame);
                 sequence
             }
-            PumpStartup::Sequence(sequence) => sequence,
+            PumpStartup::Sequence(sequence) => {
+                // Transfer targets build their view from a prepared frame,
+                // so a later pump failure must not look like a stillborn tab.
+                self.state.mark_had_frame();
+                sequence
+            }
             PumpStartup::Snapshot => match self.client.snapshot() {
                 Ok(frame) => {
                     let sequence = frame.sequence;
@@ -788,16 +795,14 @@ impl<T: EventListener + Clone + Send + 'static> SessionPump<T> {
                     if let Err(error) =
                         self.client.wait_for_activity(&self.command_wakeup)
                     {
-                        self.state.fail(error);
-                        self.notify();
+                        self.fail(error);
                         return;
                     }
                     #[cfg(not(unix))]
                     unreachable!("session workers are unsupported on non-Unix");
                 }
                 Err(error) => {
-                    self.state.fail(error);
-                    self.notify();
+                    self.fail(error);
                     return;
                 }
             }
@@ -897,20 +902,37 @@ impl<T: EventListener + Clone + Send + 'static> SessionPump<T> {
     fn handle_error(&self, error: SessionError) -> bool {
         let fatal = !recoverable_command_rejection(&error, self.client.is_poisoned());
         if fatal {
-            self.state.fail(error);
+            self.fail(error);
         } else {
             self.state.record_error(error);
+            self.notify();
         }
-        self.notify();
         fatal
     }
 
+    /// End the pump on a fatal error: name a stillborn tab, record the
+    /// failure, and wake the window for a final render.
+    fn fail(&self, error: SessionError) {
+        self.report_if_stillborn(&error);
+        self.state.fail(error);
+        self.notify();
+    }
+
+    /// A session that died before its first frame would leave a blank tab
+    /// with dead input: report the reason instead of failing silently.
+    fn report_if_stillborn(&self, error: &SessionError) {
+        if self.state.had_frame() {
+            return;
+        }
+        report_startup_failure(&self.event_proxy, self.window_id(), self.route_id, error);
+    }
+
+    fn window_id(&self) -> WindowId {
+        load_window_id(&self.window_id)
+    }
+
     fn notify(&self) {
-        let window_id = self
-            .window_id
-            .lock()
-            .map(|window_id| *window_id)
-            .unwrap_or_else(|_| WindowId::from(0));
+        let window_id = self.window_id();
         self.event_proxy
             .send_event(RioEvent::RenderRoute(self.route_id), window_id);
     }
@@ -926,6 +948,34 @@ impl<T: EventListener + Clone + Send + 'static> Drop for SessionPump<T> {
         #[cfg(unix)]
         let _ = self.client.reap_worker();
     }
+}
+
+/// Read the current window id, falling back to window zero when the slot
+/// lock is poisoned.
+fn load_window_id(slot: &Mutex<WindowId>) -> WindowId {
+    slot.lock()
+        .map(|window_id| *window_id)
+        .unwrap_or_else(|_| WindowId::from(0))
+}
+
+/// Report an async session-startup failure the same way synchronous
+/// context creation does: a tab that cannot open must say why.
+fn report_startup_failure<T: EventListener>(
+    event_proxy: &T,
+    window_id: WindowId,
+    route_id: usize,
+    error: &SessionError,
+) {
+    tracing::error!(route_id, "could not open a new tab: {error}");
+    event_proxy.send_event(
+        RioEvent::ReportToAssistant(RioError {
+            report: RioErrorType::InitializationError(format!(
+                "could not open a new tab: {error}"
+            )),
+            level: RioErrorLevel::Error,
+        }),
+        window_id,
+    );
 }
 
 fn recoverable_command_rejection(error: &SessionError, poisoned: bool) -> bool {
@@ -3337,5 +3387,56 @@ mod tests {
             ))));
             assert_eq!(state.error(), diagnostic);
         }
+    }
+
+    #[test]
+    fn first_published_frame_marks_session_as_started() {
+        let state = SessionState::new();
+        assert!(!state.had_frame());
+        state.publish_frame(frame(1, 1, Vec::new()));
+        assert!(state.had_frame());
+        // A later fatal error must not clear the marker: the stillborn
+        // report gate only cares whether anything was ever displayed.
+        state.fail(SessionError::Protocol("worker disconnected".into()));
+        assert!(state.had_frame());
+    }
+
+    #[test]
+    fn startup_failure_report_names_the_tab_failure() {
+        #[derive(Clone, Default)]
+        struct RecordingListener {
+            events: Arc<Mutex<Vec<RioEvent>>>,
+        }
+
+        impl EventListener for RecordingListener {
+            fn send_event(&self, event: RioEvent, _window_id: WindowId) {
+                self.events.lock().unwrap().push(event);
+            }
+        }
+
+        let listener = RecordingListener::default();
+        report_startup_failure(
+            &listener,
+            WindowId::from(3),
+            7,
+            &SessionError::Invalid("socket closed".into()),
+        );
+        let events = listener.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let RioEvent::ReportToAssistant(error) = &events[0] else {
+            panic!("startup failure must report to the assistant");
+        };
+        assert!(matches!(error.level, RioErrorLevel::Error));
+        let RioErrorType::InitializationError(message) = &error.report else {
+            panic!("startup failure must be an initialization error");
+        };
+        assert!(
+            message.contains("could not open a new tab"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("socket closed"),
+            "unexpected message: {message}"
+        );
     }
 }
