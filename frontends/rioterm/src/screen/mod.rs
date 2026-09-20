@@ -1518,23 +1518,32 @@ impl Screen<'_> {
             };
 
             if binding.is_triggered_by(binding_mode.to_owned(), mods, &key_match) {
-                *ignore_chars.get_or_insert(true) &= action != Act::ReceiveChar;
+                // A paste with no text to offer (e.g. the clipboard holds an
+                // image) declines the binding instead of swallowing the key:
+                // the key is forwarded to the application so app-level paste
+                // handling (like opencode attaching the clipboard image) runs.
+                let mut consumes_key = action != Act::ReceiveChar;
 
                 match &action {
                     Act::Run(program) => self.exec(program.program(), program.args()),
                     Act::Esc(s) => {
                         self.paste(s, false);
                     }
-                    Act::Paste => {
-                        let content = clipboard.get(ClipboardType::Clipboard);
-                        self.paste(&content, true);
+                    Act::Paste | Act::PasteSelection => {
+                        let ty = if matches!(&action, Act::Paste) {
+                            ClipboardType::Clipboard
+                        } else {
+                            ClipboardType::Selection
+                        };
+                        let content = clipboard.get(ty);
+                        if content.is_empty() {
+                            consumes_key = false;
+                        } else {
+                            self.paste(&content, true);
+                        }
                     }
                     Act::ClearSelection => {
                         self.clear_selection();
-                    }
-                    Act::PasteSelection => {
-                        let content = clipboard.get(ClipboardType::Selection);
-                        self.paste(&content, true);
                     }
                     Act::Copy => {
                         self.yank_selection();
@@ -1941,6 +1950,8 @@ impl Screen<'_> {
                     Act::ReceiveChar | Act::None => (),
                     _ => (),
                 }
+
+                *ignore_chars.get_or_insert(true) &= consumes_key;
             }
         }
 
@@ -3917,6 +3928,12 @@ impl Screen<'_> {
 
     #[inline]
     pub fn paste(&mut self, text: &str, bracketed: bool) {
+        // Nothing to offer (e.g. an image-only clipboard): stay a no-op
+        // instead of clearing the selection and sending an empty paste.
+        if text.is_empty() {
+            return;
+        }
+
         if self.search_active() {
             for c in text.chars() {
                 self.search_input(c);
