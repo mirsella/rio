@@ -1152,8 +1152,6 @@ impl Surface {
             let main_fd = *pty.child.id;
             #[cfg(not(target_os = "windows"))]
             let child_terminator = pty.child.terminator();
-            #[cfg(target_os = "windows")]
-            let child_terminator = teletypewriter::ChildTerminator::retired();
 
             let machine = Machine::new(
                 Arc::clone(&terminal),
@@ -1180,6 +1178,7 @@ impl Surface {
                 inline_images,
                 channel,
                 shell_pid,
+                #[cfg(not(target_os = "windows"))]
                 child_terminator,
                 #[cfg(not(target_os = "windows"))]
                 main_fd,
