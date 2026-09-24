@@ -837,6 +837,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             scaled_margin,
             custom_title: None,
             custom_color: None,
+            bell: false,
             scale,
             inner,
             root,

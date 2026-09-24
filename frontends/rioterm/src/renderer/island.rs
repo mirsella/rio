@@ -38,7 +38,6 @@ const TITLE_ELLIPSIS: char = '…';
 /// are submitted at order 0 AFTER the title pass, so a same-order dot
 /// would be painted over and invisible in every multi-tab strip.
 const BELL_DOT_SIZE: f32 = 6.0;
-const BELL_DOT_ORDER: u8 = 1;
 const BELL_GAP: f32 = 4.0;
 const DRAG_THRESHOLD: f32 = 4.0;
 const DRAG_ANIMATION_LENGTH: f32 = 0.15;
@@ -1211,32 +1210,9 @@ impl Island {
                     tab_x + (tab_width - text_width) / 2.0
                 };
                 let text_y = (navigation.tab_bar_height - navigation.tab_font_size) / 2.0;
-                if bell {
-                    // Centered on the title's lowercase body, not the strip:
-                    // the em box hangs from `text_y` with its optical middle
-                    // about two thirds down, so a strip-centered dot rides
-                    // visibly high next to lowercase titles.
-                    let dot_y =
-                        text_y + 
-                navigation.tab_font_size * (2.0 / 3.0) - BELL_DOT_SIZE / 2.0;
-                    sugarloaf.rounded_rect(
-                        None,
-                        text_x,
-                        dot_y,
-                        BELL_DOT_SIZE,
-                        BELL_DOT_SIZE,
-                        text_color,
-                        0.0,
-                        BELL_DOT_SIZE / 2.0,
-                        BELL_DOT_ORDER,
-                    );
-                }
-                sugarloaf.text_mut().draw(
-                    text_x + bell_width,
-                    text_y,
-                    &title,
-                    &title_opts,
-                );
+                sugarloaf
+                    .text_mut()
+                    .draw(text_x, text_y, &title, &title_opts);
             }
 
             // Nothing is drawn behind a lone title.
