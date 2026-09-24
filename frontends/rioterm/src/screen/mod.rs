@@ -242,7 +242,6 @@ pub struct Screen<'screen> {
     /// Screen row the preedit rendered on last frame, so the row can
     /// be rebuilt when the composition moves or ends even when
     /// terminal damage reports nothing.
-    last_preedit_row: Option<usize>,
     last_ime_cursor_pos: Option<(f32, f32, f32)>,
     hints_config: Vec<std::rc::Rc<rio_backend::config::hints::Hint>>,
     /// Hint regexes compiled on first use, keyed by pattern. Hover
@@ -665,7 +664,6 @@ impl Screen<'_> {
             modifiers: Modifiers::default(),
             context_manager,
             ime: crate::ime::Ime::new(),
-            last_preedit_row: None,
             sugarloaf,
             mouse: Mouse::new(config.scroll.multiplier, config.scroll.divider),
             touchpurpose: TouchPurpose::default(),
@@ -919,7 +917,11 @@ impl Screen<'_> {
         }
 
         if changed {
-            self.mark_dirty();
+            self.ctx_mut()
+                .current_mut()
+                .renderable_content
+                .pending_update
+                .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
         }
         needs_render
     }
@@ -1131,12 +1133,9 @@ impl Screen<'_> {
     #[inline]
     /// Re-render titles after a grid reflow (window resize, font-size
     /// or scale change, split open/close): `{{columns}}`/`{{lines}}`
-    /// have no PTY event, so the reflow itself is their trigger. Panes
-    /// the walk skips are marked dirty and re-render on surfacing.
+    /// have no PTY event, so the reflow itself is their trigger.
     pub fn refresh_titles(&mut self) -> bool {
-        let only_current = self.renderer.island.is_none();
-        self.context_manager.mark_all_titles_dirty();
-        self.context_manager.update_titles(only_current)
+        self.context_manager.update_titles()
     }
 
     pub fn change_font_size(&mut self, action: FontSizeAction) {
@@ -4137,7 +4136,7 @@ impl Screen<'_> {
             cursor_shape: rio_backend::ansi::CursorShape,
             cursor_blinking: bool,
             cursor_blink_visible: bool,
-            cursor_preedit: bool,
+            preedit: Option<rio_grid::preedit::PreeditLine>,
             cursor_color: rio_backend::config::colors::ColorArray,
             is_active: bool,
             selection: Option<rio_backend::selection::SelectionRange>,
@@ -4193,7 +4192,23 @@ impl Screen<'_> {
                 cursor_blinking: content.has_blinking_enabled,
                 cursor_blink_visible: !content.has_blinking_enabled
                     || content.is_blinking_cursor_visible,
-                cursor_preedit: context.ime.preedit().is_some(),
+                preedit: if context.route_id == active_route
+                    && content.display_offset == 0
+                    && content.screen_lines > 0
+                {
+                    self.ime.preedit().and_then(|preedit| {
+                        rio_grid::preedit::PreeditLine::new(
+                            &preedit.text,
+                            preedit.cursor,
+                            (content.cursor.state.pos.row.0.max(0) as usize)
+                                .min(content.screen_lines - 1),
+                            content.cursor.state.pos.col.0,
+                            content.columns,
+                        )
+                    })
+                } else {
+                    None
+                },
                 cursor_color: content.term_colors
                     [rio_backend::config::colors::NamedColor::Cursor as usize]
                     .unwrap_or(self.renderer.named_colors.cursor),
@@ -4285,6 +4300,12 @@ impl Screen<'_> {
             let mut bg = Vec::with_capacity(cols);
             let mut fg = Vec::with_capacity(cols);
             let mut hints = Vec::new();
+            let cursor_color = [
+                (panel.cursor_color[0].clamp(0.0, 1.0) * 255.0) as u8,
+                (panel.cursor_color[1].clamp(0.0, 1.0) * 255.0) as u8,
+                (panel.cursor_color[2].clamp(0.0, 1.0) * 255.0) as u8,
+                255,
+            ];
             for row_index in 0..panel.rows as usize {
                 let rebuild_row = rebuild_all
                     || panel
@@ -4340,6 +4361,14 @@ impl Screen<'_> {
                     cols,
                     panel.display_offset,
                 );
+                let preedit = panel
+                    .preedit
+                    .as_ref()
+                    .filter(|line| line.row == row_index)
+                    .map(|line| rio_grid::PreeditRow {
+                        line,
+                        block_bg: cursor_color,
+                    });
                 rio_grid::build_row_bg(
                     row,
                     cols,
@@ -4348,6 +4377,7 @@ impl Screen<'_> {
                     &panel.term_colors,
                     selection,
                     &hints,
+                    preedit.as_ref(),
                     &mut bg,
                 );
                 rio_grid::build_row_fg(
@@ -4365,6 +4395,7 @@ impl Screen<'_> {
                     panel.cell_h,
                     selection,
                     &hints,
+                    preedit.as_ref(),
                     &font_library,
                     panel.route_id,
                     if panel.cursor_visible && panel.cursor_row == row_index as u16 {
@@ -4389,7 +4420,7 @@ impl Screen<'_> {
                     focused: panel.is_active && self.renderer.is_window_focused,
                     blink_visible: panel.cursor_blink_visible,
                     blinking: panel.cursor_blinking,
-                    preedit: panel.cursor_preedit,
+                    preedit: panel.preedit.is_some(),
                     shape: panel.cursor_shape,
                 });
             let mut block_cursor = None;
@@ -4397,18 +4428,12 @@ impl Screen<'_> {
             if let Some(style) = render_style {
                 let cell_w = panel.cell_w.round().max(1.0) as u32;
                 let cell_h = panel.cell_h.round().max(1.0) as u32;
-                let color = [
-                    (panel.cursor_color[0].clamp(0.0, 1.0) * 255.0) as u8,
-                    (panel.cursor_color[1].clamp(0.0, 1.0) * 255.0) as u8,
-                    (panel.cursor_color[2].clamp(0.0, 1.0) * 255.0) as u8,
-                    255,
-                ];
                 if let Some((is_block, cell)) = rio_grid::cursor_sprite_cell(
                     grid,
                     style,
                     panel.cursor_col,
                     panel.cursor_row,
-                    color,
+                    cursor_color,
                     cell_w,
                     cell_h,
                 ) {
@@ -4514,6 +4539,9 @@ impl Screen<'_> {
     }
 
     pub(crate) fn render(&mut self) -> Option<crate::context::renderable::WindowUpdate> {
+        if self.renderer.is_window_focused && self.context_manager.clear_current_bell() {
+            self.mark_dirty();
+        }
         self.update_close_button_hover(self.mouse.x, self.mouse.y);
 
         let is_search_active = self.search_active();

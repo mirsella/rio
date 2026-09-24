@@ -31,7 +31,6 @@ const TITLE_ELLIPSIS: char = '…';
 /// are submitted at order 0 AFTER the title pass, so a same-order dot
 /// would be painted over and invisible in every multi-tab strip.
 const BELL_DOT_SIZE: f32 = 6.0;
-const BELL_DOT_ORDER: u8 = 1;
 const BELL_GAP: f32 = 4.0;
 const DRAG_THRESHOLD: f32 = 4.0;
 const DRAG_ANIMATION_LENGTH: f32 = 0.15;
@@ -1064,18 +1063,6 @@ impl Island {
             // fill to carry a custom colour, which moves to the text.
             let single = num_tabs == 1;
 
-            let max_text_width = if single {
-                single_title_budget(window_width, scale_factor, left_margin)
-            } else {
-                (tab_width - TAB_PADDING_X * 2.0).max(0.0)
-            };
-            let title = fit_title_to_width(
-                sugarloaf,
-                &raw_title,
-                max_text_width,
-                navigation.tab_font_size,
-            );
-
             let mut text_color = if single {
                 match context_manager.custom_color(tab_index) {
                     Some(mut custom) => {
@@ -1111,7 +1098,12 @@ impl Island {
                 tab_width - TAB_PADDING_X * 2.0 - bell_width
             }
             .max(0.0);
-            let title = fit_title_to_width(sugarloaf, &raw_title, max_text_width);
+            let title = fit_title_to_width(
+                sugarloaf,
+                &raw_title,
+                max_text_width,
+                navigation.tab_font_size,
+            );
 
             // UI text always paints in a final pass above every rect,
             // so the floating tab's opaque background can't occlude
@@ -1135,7 +1127,9 @@ impl Island {
                     tab_x + (tab_width - text_width) / 2.0
                 };
                 let text_y = (navigation.tab_bar_height - navigation.tab_font_size) / 2.0;
-                ui.draw(text_x, text_y, &title, &title_opts);
+                sugarloaf
+                    .text_mut()
+                    .draw(text_x, text_y, &title, &title_opts);
             }
 
             // Nothing is drawn behind a lone title.
