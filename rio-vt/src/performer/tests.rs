@@ -7,6 +7,21 @@ use std::sync::mpsc;
 use std::time::Duration;
 use teletypewriter::{ChildEvent, EventedPty, ProcessReadWrite, WinsizeBuilder};
 
+#[test]
+fn state_drops_empty_writes() {
+    let mut state = State::default();
+    state.push(std::borrow::Cow::Borrowed(&[]), None);
+    assert!(!state.needs_write());
+
+    state.push(std::borrow::Cow::Borrowed(b"input"), None);
+    assert!(state.needs_write());
+    assert_eq!(
+        state.write_list.pop_front().unwrap().remaining_bytes(),
+        b"input"
+    );
+    assert!(!state.needs_write());
+}
+
 struct TestPty {
     bytes: io::Cursor<Vec<u8>>,
     ending: Option<ErrorKind>,

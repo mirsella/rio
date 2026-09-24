@@ -707,6 +707,7 @@ impl<'router> Router<'router> {
             Route {
                 window,
                 path: RoutePath::Terminal,
+                quit_requested: false,
             },
         );
     }
