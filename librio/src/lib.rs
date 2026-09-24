@@ -578,7 +578,7 @@ impl Listener {
                     },
                 );
             }
-            RioEvent::Bell => {
+            RioEvent::Bell(_) => {
                 self.delegate.action(self.surface_id, Action::RingBell);
             }
             RioEvent::CursorBlinkingChange | RioEvent::CursorBlinkingChangeOnRoute(_) => {
@@ -812,89 +812,6 @@ fn trailing_url_punctuation(text: &str) -> usize {
     trimmed
 }
 
-/// Append one foreground or background SGR color component.
-fn serialize_color(out: &mut String, foreground: bool, color: &AnsiColor) {
-    use std::fmt::Write as _;
-
-    match color {
-        AnsiColor::Named(n) => {
-            let n = *n as u16;
-            let code = match (n, foreground) {
-                (0..=7, true) => 30 + n,
-                (0..=7, false) => 40 + n,
-                (8..=15, true) => 90 + (n - 8),
-                (8..=15, false) => 100 + (n - 8),
-                (_, true) => 39,
-                (_, false) => 49,
-            };
-            let _ = write!(out, ";{code}");
-        }
-        AnsiColor::Indexed(i) => {
-            let prefix = if foreground { 38 } else { 48 };
-            let _ = write!(out, ";{prefix};5;{i}");
-        }
-        AnsiColor::Spec(rgb) => {
-            let prefix = if foreground { 38 } else { 48 };
-            let _ = write!(out, ";{prefix};2;{};{};{}", rgb.r, rgb.g, rgb.b);
-        }
-    }
-}
-
-/// Emit `\x1b[0m` plus the minimal SGR codes reproducing `style`.
-fn serialize_style(out: &mut String, style: &Style) {
-    use std::fmt::Write as _;
-
-    out.push_str("\x1b[0");
-    serialize_color(out, true, &style.fg);
-    serialize_color(out, false, &style.bg);
-
-    let flags = style.flags;
-    if flags.contains(StyleFlags::BOLD) {
-        out.push_str(";1");
-    }
-    if flags.contains(StyleFlags::DIM) {
-        out.push_str(";2");
-    }
-    if flags.contains(StyleFlags::ITALIC) {
-        out.push_str(";3");
-    }
-    if flags.contains(StyleFlags::UNDERLINE) {
-        out.push_str(";4");
-    } else if flags.contains(StyleFlags::DOUBLE_UNDERLINE) {
-        out.push_str(";4:2");
-    } else if flags.contains(StyleFlags::UNDERCURL) {
-        out.push_str(";4:3");
-    } else if flags.contains(StyleFlags::DOTTED_UNDERLINE) {
-        out.push_str(";4:4");
-    } else if flags.contains(StyleFlags::DASHED_UNDERLINE) {
-        out.push_str(";4:5");
-    }
-    if flags.contains(StyleFlags::INVERSE) {
-        out.push_str(";7");
-    }
-    if flags.contains(StyleFlags::HIDDEN) {
-        out.push_str(";8");
-    }
-    if flags.contains(StyleFlags::STRIKEOUT) {
-        out.push_str(";9");
-    }
-    out.push('m');
-
-    if let Some(underline) = &style.underline_color {
-        match underline {
-            AnsiColor::Indexed(i) => {
-                let _ = write!(out, "\x1b[58;5;{i}m");
-            }
-            AnsiColor::Spec(rgb) => {
-                let _ = write!(out, "\x1b[58;2;{};{};{}m", rgb.r, rgb.g, rgb.b);
-            }
-            AnsiColor::Named(n) => {
-                let _ = write!(out, "\x1b[58;5;{}m", *n as u16);
-            }
-        }
-    }
-}
-
 pub struct Surface {
     id: SurfaceId,
     alt_is_meta: std::sync::atomic::AtomicBool,
@@ -1114,11 +1031,15 @@ impl Surface {
             let input_budget = listener.input_budget.clone();
             let input_error = Arc::clone(&listener.input_error);
             #[cfg(not(target_os = "windows"))]
-            let shell_pid = pty.child.pid as u32;
+            let shell_pid = *pty.child.pid as u32;
             #[cfg(target_os = "windows")]
             let shell_pid = pty.child_watcher().pid().map(|pid| pid.get()).unwrap_or(0);
             #[cfg(not(target_os = "windows"))]
-            let main_fd = pty.child.id;
+            let main_fd = *pty.child.id;
+            #[cfg(not(target_os = "windows"))]
+            let child_terminator = pty.child.terminator();
+            #[cfg(target_os = "windows")]
+            let child_terminator = teletypewriter::ChildTerminator::retired();
 
             let machine = Machine::new(
                 Arc::clone(&terminal),
@@ -1144,6 +1065,7 @@ impl Surface {
                 processor: std::sync::Mutex::new(None),
                 channel,
                 shell_pid,
+                child_terminator,
                 #[cfg(not(target_os = "windows"))]
                 main_fd,
                 reap_child_on_drop: desc.clear_environment,

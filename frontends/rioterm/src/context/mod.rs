@@ -2,12 +2,9 @@ pub mod renderable;
 pub mod session;
 pub mod title;
 
-use crate::context::title::{
-    create_title_extra_from_context, update_title, ContextTitle,
-};
+use crate::context::title::{update_title, ContextTitle};
 use crate::event::sync::FairMutex;
 use crate::event::RioEvent;
-use crate::ime::Ime;
 pub use crate::layout::{ContextDimension, ContextGrid, TabId};
 use renderable::Cursor;
 use renderable::RenderableContent;
@@ -26,7 +23,7 @@ use std::error::Error;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // Global atomic counter for generating unique route IDs
 static ROUTE_ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -52,7 +49,6 @@ pub struct Context<T: EventListener> {
     pub rich_text_id: usize,
     pub dimension: ContextDimension,
     pub title: ContextTitle,
-    pub ime: Ime,
     _listener: PhantomData<fn() -> T>,
 }
 
@@ -173,7 +169,6 @@ pub struct ContextManager<T: EventListener> {
     event_proxy: T,
     window_id: WindowId,
     pub config: ContextManagerConfig,
-    last_title_update: Option<Instant>,
     pub bootstrap_transfer: Option<([u8; 16], usize)>,
 }
 
@@ -225,7 +220,6 @@ where
         rich_text_id,
         dimension,
         title: ContextTitle::default(),
-        ime: Ime::new(),
         _listener: PhantomData,
     }
 }
@@ -262,7 +256,6 @@ where
         renderable_content: RenderableContent::new(Cursor::default()),
         dimension,
         title: ContextTitle::default(),
-        ime: Ime::new(),
         _listener: PhantomData,
     }
 }
@@ -310,7 +303,6 @@ where
         rich_text_id,
         dimension,
         title: ContextTitle::default(),
-        ime: Ime::new(),
         _listener: PhantomData,
     }
 }
@@ -562,7 +554,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             renderable_content: RenderableContent::new(cursor),
             dimension,
             title: ContextTitle::default(),
-            ime: Ime::new(),
             _listener: PhantomData,
         })
     }
@@ -643,7 +634,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             }
         }
 
-        let mut manager = ContextManager {
+        Ok(ContextManager {
             current_index: 0,
             contexts: smallvec![ContextGrid::new(
                 initial_context,
@@ -655,7 +646,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             event_proxy,
             window_id,
             config: ctx_config,
-            last_title_update: None,
             bootstrap_transfer,
         })
     }
@@ -691,7 +681,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             event_proxy,
             window_id,
             config,
-            last_title_update: None,
             bootstrap_transfer: None,
         })
     }
@@ -713,7 +702,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             event_proxy,
             window_id,
             config,
-            last_title_update: None,
             bootstrap_transfer: None,
         }
     }
@@ -844,16 +832,19 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn select_next_split(&mut self) {
         self.contexts[self.current_index].select_next_split();
+        self.sync_current_route();
     }
 
     #[inline]
     pub fn select_prev_split(&mut self) {
         self.contexts[self.current_index].select_prev_split();
+        self.sync_current_route();
     }
 
     #[inline]
     pub fn switch_to_next_split_or_tab(&mut self) {
         if self.contexts[self.current_index].select_next_split_no_loop() {
+            self.sync_current_route();
             return;
         }
         self.switch_to_next();
@@ -862,11 +853,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if let Some(root) = current_tab.root {
             current_tab.current = root;
         }
+        self.sync_current_route();
     }
 
     #[inline]
     pub fn switch_to_prev_split_or_tab(&mut self) {
         if self.contexts[self.current_index].select_prev_split_no_loop() {
+            self.sync_current_route();
             return;
         }
         self.switch_to_prev();
@@ -876,6 +869,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         if let Some(&last_key) = ordered_keys.last() {
             current_tab.current = last_key;
         }
+        self.sync_current_route();
     }
 
     #[inline]
@@ -1017,6 +1011,27 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
+    pub fn ring_bell(&mut self, route_id: usize, window_focused: bool) -> bool {
+        let Some(index) = self.grid_index_for_route(route_id) else {
+            return false;
+        };
+        let grid = &mut self.contexts[index];
+        if (window_focused && index == self.current_index) || grid.bell {
+            return false;
+        }
+        grid.bell = true;
+        true
+    }
+
+    pub fn bell(&self, index: usize) -> bool {
+        self.contexts.get(index).is_some_and(|grid| grid.bell)
+    }
+
+    pub fn clear_current_bell(&mut self) -> bool {
+        let bell = &mut self.contexts[self.current_index].bell;
+        std::mem::take(bell)
+    }
+
     #[inline]
     pub fn custom_color(&self, index: usize) -> Option<[f32; 4]> {
         self.contexts.get(index).and_then(|grid| grid.custom_color)
@@ -1029,29 +1044,45 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
-    pub fn update_titles(&mut self) {
-        if self.is_empty() {
-            return;
+    pub fn update_titles(&mut self) -> bool {
+        let mut changed = false;
+        for grid in self.contexts.iter_mut() {
+            for item in grid.contexts_mut().values_mut() {
+                let context = &mut item.val;
+                let content = update_title(&self.config.title.content, context, None);
+                if context.title.content != content {
+                    context.title.content = content;
+                    changed = true;
+                }
+            }
         }
+        if changed {
+            self.sync_window_title();
+        }
+        changed
+    }
 
-        let interval_time = Duration::from_secs(2);
-        if self
-            .last_title_update
-            .map(|i| i.elapsed() > interval_time)
-            .unwrap_or(true)
-        {
-            self.last_title_update = Some(Instant::now());
-            for grid in self.contexts.iter_mut() {
-                let content = update_title(&self.config.title.content, grid.current());
-
-                let extra = if self.config.should_update_title_extra {
-                    create_title_extra_from_context(grid.current())
-                } else {
-                    None
-                };
+    pub fn on_title_change(&mut self, route_id: usize, raw_title: Option<&str>) -> bool {
+        let Some(context) = self
+            .contexts
+            .iter_mut()
+            .find_map(|grid| grid.get_by_route_id(route_id).map(|item| &mut item.val))
+        else {
+            return false;
+        };
+        let content = update_title(&self.config.title.content, context, raw_title);
+        if context.title.content == content {
+            return false;
+        }
+        context.title.content = content;
+        if self.current().route_id == route_id {
+            self.sync_window_title();
+        }
+        true
+    }
 
     /// The title the strip displays for `index`'s tab: the user rename,
-    /// else the rendered content, else the foreground program, else
+    /// else the rendered content, else the configured shell, else
     /// "~". The native titlebar reads the same chain, so the two can
     /// never disagree.
     pub fn displayed_title_for_tab(&self, index: usize) -> String {
@@ -1063,16 +1094,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             if !context.title.content.is_empty() {
                 return context.title.content.clone();
             }
-            if !context.spawned_program.is_empty() {
-                return context.spawned_program.clone();
+            if let Some(program) = &self.config.shell.program {
+                return program.clone();
             }
-            self.event_proxy.send_event(
-                RioEvent::Title(
-                    self.current().route_id,
-                    self.current().title.content.clone(),
-                ),
-                self.window_id,
-            );
         }
         String::from("~")
     }
@@ -1091,18 +1115,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             .send_event(RioEvent::SyncWindowTitle, self.window_id);
     }
 
-    /// Point `current_route` at the pane the user now sees and poke the
-    /// titlebar. Every displayed-pane change (tab switch, split
-    /// selection, split death, new splits) funnels here so the titlebar
-    /// can never be left showing a pane that is not on screen.
+    /// Refresh the titlebar after changing the displayed pane.
     fn sync_current_route(&mut self) {
-        self.current_route = self.current().route_id;
-        if self.current().title_dirty {
-            let template = self.config.title.content.clone();
-            let context = self.contexts[self.current_index].current_mut();
-            context.title_dirty = false;
-            Self::refresh_item_title(&template, context, None);
-        }
         self.sync_window_title();
     }
 
@@ -1514,11 +1528,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     pub fn set_current(&mut self, context_id: usize) {
         if context_id < self.contexts.len() {
             self.current_index = context_id;
-            let current = self.current();
-            self.event_proxy.send_event(
-                RioEvent::Title(current.route_id, current.title.content.clone()),
-                self.window_id,
-            );
+            self.sync_current_route();
         }
     }
 
@@ -1875,12 +1885,12 @@ pub mod test {
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
-    struct TitleListener(Arc<Mutex<Vec<(usize, String)>>>);
+    struct TitleListener(Arc<Mutex<usize>>);
 
     impl EventListener for TitleListener {
         fn send_event(&self, event: RioEvent, _id: WindowId) {
-            if let RioEvent::Title(route_id, title) = event {
-                self.0.lock().unwrap().push((route_id, title));
+            if let RioEvent::SyncWindowTitle = event {
+                *self.0.lock().unwrap() += 1;
             }
         }
     }
@@ -1961,7 +1971,7 @@ pub mod test {
     }
 
     #[test]
-    fn update_titles_emits_only_the_current_tab() {
+    fn update_titles_syncs_the_current_tab() {
         let listener = TitleListener::default();
         let events = Arc::clone(&listener.0);
         let mut manager =
@@ -1970,21 +1980,14 @@ pub mod test {
         manager.config.title.content = "{{columns}}".into();
         manager.contexts[0].current_mut().dimension.columns = 80;
         manager.contexts[1].current_mut().dimension.columns = 120;
-        manager.update_titles();
+        assert!(manager.update_titles());
 
         assert_eq!(manager.title(0).unwrap().content, "80");
         assert_eq!(manager.title(1).unwrap().content, "120");
-        assert_eq!(
-            *events.lock().unwrap(),
-            [(manager.current().route_id, "120".into())]
-        );
+        assert_eq!(*events.lock().unwrap(), 1);
 
-        events.lock().unwrap().clear();
         manager.set_current(0);
-        assert_eq!(
-            *events.lock().unwrap(),
-            [(manager.current().route_id, "80".into())]
-        );
+        assert_eq!(*events.lock().unwrap(), 2);
     }
 
     #[test]
@@ -2107,30 +2110,56 @@ pub mod test {
     }
 
     #[test]
-    fn update_titles_only_current_leaves_other_tabs_dirty() {
+    fn update_titles_refreshes_all_tabs_without_stale_title_state() {
         let mut cm =
             ContextManager::start_with_capacity(5, VoidListener {}, WindowId::from(0))
                 .unwrap();
         cm.add_context(false, 0);
         cm.config.title.content = "{{ columns }}".to_string();
 
-        cm.mark_all_titles_dirty();
-        assert!(cm.contexts[0].current().title_dirty);
-        assert!(cm.contexts[1].current().title_dirty);
-
-        // A current-only walk (tab strip absent) must not silently
-        // clear panes it never re-rendered.
-        assert!(cm.update_titles(true));
-        assert!(!cm.contexts[0].current().title_dirty);
-        assert!(cm.contexts[1].current().title_dirty);
+        assert!(cm.update_titles());
         let columns = cm.contexts[0].current().dimension.columns.to_string();
         assert_eq!(cm.contexts[0].current().title.content, columns);
-
-        // Surfacing the stale tab re-renders it via sync_current_route.
-        cm.set_current(1);
-        assert!(!cm.contexts[1].current().title_dirty);
         let columns = cm.contexts[1].current().dimension.columns.to_string();
         assert_eq!(cm.contexts[1].current().title.content, columns);
+        assert!(!cm.update_titles());
+        cm.set_current(1);
+        assert_eq!(cm.displayed_title_for_current_tab(), columns);
+    }
+
+    #[test]
+    fn update_titles_refreshes_hidden_splits_after_resize() {
+        let window_id = WindowId::from(0);
+        let mut cm =
+            ContextManager::start_with_capacity(2, VoidListener {}, window_id).unwrap();
+        let first_route = cm.current_route();
+        let second_route = 1_000_003;
+        cm.current_grid_mut()
+            .add_split_for_test(create_dead_context(
+                VoidListener {},
+                window_id,
+                second_route,
+                3,
+                ContextDimension::default(),
+                Cursor::default(),
+            ));
+        cm.config.title.content = "{{ columns }}".into();
+        cm.get_by_route_id(first_route).unwrap().dimension.columns = 80;
+        cm.get_by_route_id(second_route).unwrap().dimension.columns = 120;
+
+        assert!(cm.update_titles());
+        assert_eq!(cm.get_by_route_id(first_route).unwrap().title.content, "80");
+        assert_eq!(
+            cm.get_by_route_id(second_route).unwrap().title.content,
+            "120"
+        );
+        assert!(!cm.update_titles());
+
+        cm.get_by_route_id(first_route).unwrap().dimension.columns = 60;
+        assert!(cm.update_titles());
+        cm.select_prev_split();
+        assert_eq!(cm.current_route(), first_route);
+        assert_eq!(cm.displayed_title_for_current_tab(), "60");
     }
 
     #[test]
@@ -2142,10 +2171,8 @@ pub mod test {
         cm.config.title.content = "{{ title }}".to_string();
 
         let background_route = cm.contexts[1].current().route_id;
-        cm.contexts[1].current_mut().title_dirty = true;
         assert!(cm.on_title_change(background_route, Some("hello")));
         assert_eq!(cm.contexts[1].current().title.content, "hello");
-        assert!(!cm.contexts[1].current().title_dirty);
 
         // The same title again changes nothing: no repaint requested.
         assert!(!cm.on_title_change(background_route, Some("hello")));
@@ -2416,7 +2443,6 @@ pub mod test {
         let cursor = &manager.current().renderable_content.cursor;
         assert_eq!(cursor.state.content, rio_backend::ansi::CursorShape::Beam);
         assert!(cursor.state.is_visible());
-        assert_eq!(cursor.content_ref, '|');
     }
 
     #[test]

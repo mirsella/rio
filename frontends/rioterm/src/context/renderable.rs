@@ -16,15 +16,9 @@ pub enum WindowUpdate {
     Background(BackgroundState),
 }
 
-/// `content` is the configured cursor shape as a char, read once to
-/// seed the terminal's cursor shape. The glyph actually drawn each
-/// frame comes from `state`; the old `content`/`content_ref` pair
-/// (drawn vs configured) collapsed when the IME preview stopped
-/// swapping the drawn char.
 #[derive(Default, Clone, Debug)]
 pub struct Cursor {
     pub state: CursorState,
-    pub content: char,
 }
 
 impl Cursor {
@@ -35,9 +29,6 @@ impl Cursor {
         let content: char = shape.into();
         Cursor {
             state: CursorState::new(content),
-            content,
-            content_ref: content,
-            is_ime_enabled: false,
         }
     }
 }

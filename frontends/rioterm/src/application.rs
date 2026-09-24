@@ -36,6 +36,11 @@ use std::error::Error;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
+fn title_tracks_size(config: &rio_backend::config::Config) -> bool {
+    let template = config.title.content.to_ascii_lowercase();
+    template.contains("columns") || template.contains("lines")
+}
+
 #[cfg(all(feature = "wayland", target_os = "linux"))]
 use crate::tab_drag::{
     Command as TabDragCommand, Event as TabDragEvent, Lifecycle as TabDragLifecycle,
@@ -101,10 +106,6 @@ fn is_valid_tab_drag_target<D, O>(drag: &TabDrag<D, O>, window_id: WindowId) -> 
 
 pub struct Application<'a> {
     config: rio_backend::config::Config,
-    /// The title template shows `{{columns}}`/`{{lines}}`, so a resize
-    /// must re-render titles (the only title data with no PTY event;
-    /// everything else arrives via OSC 0/2 and OSC 7).
-    title_tracks_size: bool,
     event_proxy: EventProxy,
     router: Router<'a>,
     window_control: Option<crate::router::window_control::WindowControl>,
@@ -489,7 +490,6 @@ impl<'a> Application<'a> {
         rio_notifier::request_authorization();
 
         Application {
-            title_tracks_size: title_tracks_size(&config),
             config,
             event_proxy,
             router,
@@ -4757,7 +4757,6 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 };
 
                 self.config = config;
-                self.title_tracks_size = title_tracks_size(&self.config);
 
                 // Dropping the old manager unregisters its hotkeys, so
                 // ToggleQuake binding edits apply without restarting.
@@ -4970,11 +4969,23 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
             }
             RioEventType::Rio(RioEvent::Title(route_id, title)) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
-                    if route.window.screen.context_manager.current().route_id == route_id
+                    if route
+                        .window
+                        .screen
+                        .context_manager
+                        .on_title_change(route_id, Some(&title))
                     {
-                        route.set_window_title(&title);
+                        route.request_overlay_redraw();
                     }
                 }
+            }
+            RioEventType::Rio(RioEvent::SyncWindowTitle) => {
+                if let Some(route) = self.router.routes.get_mut(&window_id) {
+                    route.sync_window_title();
+                }
+            }
+            RioEventType::Rio(RioEvent::UpdateTitles) => {
+                self.router.update_titles();
             }
             RioEventType::Rio(RioEvent::MouseCursorDirty) => {
                 if let Some(route) = self.router.routes.get_mut(&window_id) {
@@ -6321,24 +6332,10 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                         route.window.screen.ime.set_enabled(true);
                     }
                     Ime::Disabled => {
-                        let had_preedit = route
-                            .window
-                            .screen
-                            .context_manager
-                            .current()
-                            .ime
-                            .preedit()
-                            .is_some();
-                        route
-                            .window
-                            .screen
-                            .context_manager
-                            .current_mut()
-                            .ime
-                            .set_enabled(false);
-                        if had_preedit {
+                        if route.window.screen.set_ime_preedit(None) {
                             route.request_redraw();
                         }
+                        route.window.screen.ime.set_enabled(false);
                     }
                 }
             }
@@ -6424,7 +6421,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                 }
 
                 route.window.screen.resize(new_size);
-                if self.title_tracks_size {
+                if title_tracks_size(&self.config) {
                     route.window.screen.refresh_titles();
                 }
                 route.request_redraw();

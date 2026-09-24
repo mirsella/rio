@@ -1283,6 +1283,7 @@ const RUN_BUCKET_SIZE: usize = 8;
 struct ShapedGlyph {
     id: u16,
     cluster: u32,
+    advance: f32,
 }
 
 struct RunCacheEntry {
@@ -1704,6 +1705,7 @@ fn shape_run_ct(
         .map(|g| ShapedGlyph {
             id: g.id,
             cluster: g.cluster,
+            advance: g.advance,
         })
         .collect();
     Some((glyphs, ascent_px))
@@ -1765,6 +1767,7 @@ fn shape_run_swash(
             glyphs.push(ShapedGlyph {
                 id: g.id,
                 cluster: byte_offset,
+                advance: g.advance,
             });
         }
     });

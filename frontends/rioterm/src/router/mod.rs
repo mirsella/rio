@@ -65,7 +65,11 @@ impl Route<'_> {
     /// Create a performer.
     #[inline]
     pub fn new(path: RoutePath, window: RouteWindow) -> Route {
-        Route { path, window }
+        Route {
+            path,
+            window,
+            quit_requested: false,
+        }
     }
 }
 
@@ -282,98 +286,78 @@ impl Route<'_> {
                 true
             }
 
-        // Handle command palette input first (works in all routes)
-        if self.window.screen.renderer.command_palette.is_enabled() {
-            if key_event.state == ElementState::Pressed {
-                let control_text = key_event.text_with_all_modifiers();
-                if control_text == Some("\u{15}") {
-                    self.window
-                        .screen
-                        .renderer
-                        .command_palette
-                        .set_query(String::new());
-                    self.request_overlay_redraw();
-                } else if (control_text == Some("\u{7f}")
-                    && !matches!(key_event.logical_key, Key::Named(NamedKey::Delete)))
-                    || (control_text == Some("\u{08}")
-                        && !matches!(
-                            key_event.logical_key,
-                            Key::Named(NamedKey::Backspace)
-                        ))
-                {
-                    self.window
-                        .screen
-                        .renderer
-                        .command_palette
-                        .delete_previous_word();
-                    self.request_overlay_redraw();
-                } else {
-                    match &key_event.logical_key {
-                        Key::Named(NamedKey::Escape) => {
-                            self.window
-                                .screen
-                                .renderer
-                                .command_palette
-                                .set_enabled(false);
-                            self.request_overlay_redraw();
-                        }
-                        Key::Named(NamedKey::ArrowUp) => {
-                            self.window
-                                .screen
-                                .renderer
-                                .command_palette
-                                .move_selection_up();
-                            self.request_overlay_redraw();
-                        }
-                        Key::Named(NamedKey::ArrowDown) => {
-                            self.window
-                                .screen
-                                .renderer
-                                .command_palette
-                                .move_selection_down();
-                            self.request_overlay_redraw();
-                        }
-                        Key::Named(NamedKey::Tab) => {
-                            self.window
-                                .screen
-                                .renderer
-                                .command_palette
-                                .move_selection_down();
-                            self.request_overlay_redraw();
-                        }
-                        Key::Named(NamedKey::Enter) => {
-                            self.window.screen.execute_palette_selection(clipboard);
-                            self.request_overlay_redraw();
-                        }
-                        Key::Named(NamedKey::Backspace) => {
-                            let query =
-                                &mut self.window.screen.renderer.command_palette.query;
-                            if !query.is_empty() {
-                                let mut query = std::mem::take(query);
-                                query.pop();
+            Modal::CommandPalette => {
+                if key_event.state == ElementState::Pressed {
+                    let control_text = key_event.text_with_all_modifiers();
+                    if control_text == Some("\u{15}") {
+                        self.window
+                            .screen
+                            .renderer
+                            .command_palette
+                            .set_query(String::new());
+                        self.request_overlay_redraw();
+                    } else if (control_text == Some("\u{7f}")
+                        && !matches!(key_event.logical_key, Key::Named(NamedKey::Delete)))
+                        || (control_text == Some("\u{08}")
+                            && !matches!(
+                                key_event.logical_key,
+                                Key::Named(NamedKey::Backspace)
+                            ))
+                    {
+                        self.window
+                            .screen
+                            .renderer
+                            .command_palette
+                            .delete_previous_word();
+                        self.request_overlay_redraw();
+                    } else {
+                        match &key_event.logical_key {
+                            Key::Named(NamedKey::Escape) => {
                                 self.window
                                     .screen
                                     .renderer
                                     .command_palette
-                                    .set_query(query);
+                                    .set_enabled(false);
                                 self.request_overlay_redraw();
                             }
-                        }
-                        _ => {
-                            if let Some(text) = key_event.text.as_ref() {
-                                // Filter out control characters
-                                let text_str = text.as_str();
-                                if !text_str.is_empty()
-                                    && text_str.chars().all(|c| !c.is_control())
-                                {
-                                    let query = &mut self
-                                        .window
-                                        .screen
-                                        .renderer
-                                        .command_palette
-                                        .query;
+                            Key::Named(NamedKey::ArrowUp) => {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .command_palette
+                                    .move_selection_up();
+                                self.request_overlay_redraw();
+                            }
+                            Key::Named(NamedKey::ArrowDown) => {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .command_palette
+                                    .move_selection_down();
+                                self.request_overlay_redraw();
+                            }
+                            Key::Named(NamedKey::Tab) => {
+                                self.window
+                                    .screen
+                                    .renderer
+                                    .command_palette
+                                    .move_selection_down();
+                                self.request_overlay_redraw();
+                            }
+                            Key::Named(NamedKey::Enter) => {
+                                self.window.screen.execute_palette_selection(clipboard);
+                                self.request_overlay_redraw();
+                            }
+                            Key::Named(NamedKey::Backspace) => {
+                                let query = &mut self
+                                    .window
+                                    .screen
+                                    .renderer
+                                    .command_palette
+                                    .query;
+                                if !query.is_empty() {
                                     let mut query = std::mem::take(query);
-                                    query.push_str(text_str);
+                                    query.pop();
                                     self.window
                                         .screen
                                         .renderer
@@ -382,10 +366,34 @@ impl Route<'_> {
                                     self.request_overlay_redraw();
                                 }
                             }
+                            _ => {
+                                if let Some(text) = key_event.text.as_ref() {
+                                    // Filter out control characters
+                                    let text_str = text.as_str();
+                                    if !text_str.is_empty()
+                                        && text_str.chars().all(|c| !c.is_control())
+                                    {
+                                        let query = &mut self
+                                            .window
+                                            .screen
+                                            .renderer
+                                            .command_palette
+                                            .query;
+                                        let mut query = std::mem::take(query);
+                                        query.push_str(text_str);
+                                        self.window
+                                            .screen
+                                            .renderer
+                                            .command_palette
+                                            .set_query(query);
+                                        self.request_overlay_redraw();
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-                true // Block all input when command palette is active
+                true
             }
 
             Modal::ConfirmQuit => {
@@ -409,26 +417,24 @@ impl Route<'_> {
                 true
             }
 
-        // Typing dismisses the toast but still reaches the terminal.
-        if self.window.screen.renderer.assistant.is_active()
-            && key_event.state == rio_window::event::ElementState::Pressed
-        {
-            self.clear_errors();
-            self.request_redraw();
-            if matches!(key_event.logical_key, Key::Named(NamedKey::Escape)) {
-                return true;
+            Modal::Assistant => {
+                if key_event.state == ElementState::Pressed {
+                    self.clear_errors();
+                    self.request_redraw();
+                    matches!(key_event.logical_key, Key::Named(NamedKey::Escape))
+                } else {
+                    false
+                }
             }
-        }
-
-        if self.path == RoutePath::Terminal {
-            return false;
-        }
-
-        let is_enter = key_event.logical_key == Key::Named(NamedKey::Enter);
-
-        if self.path == RoutePath::Welcome && is_enter {
-            rio_backend::config::create_config_file(None);
-            self.path = RoutePath::Terminal;
+            Modal::Route => {
+                if self.path == RoutePath::Welcome
+                    && key_event.logical_key == Key::Named(NamedKey::Enter)
+                {
+                    rio_backend::config::create_config_file(None);
+                    self.path = RoutePath::Terminal;
+                }
+                true
+            }
         }
     }
 }
@@ -632,6 +638,7 @@ impl<'router> Router<'router> {
         let mut route = Route {
             window,
             path: RoutePath::Terminal,
+            quit_requested: false,
         };
 
         if let Some(err) = &self.propagated_report {
@@ -668,6 +675,7 @@ impl<'router> Router<'router> {
             Route {
                 window,
                 path: RoutePath::Terminal,
+                quit_requested: false,
             },
         );
         self.quake_window_id = Some(id);
@@ -869,6 +877,8 @@ impl<'a> RouteWindow<'a> {
             vblank_interval: monitor_vblank_interval(&window),
             render_timestamp: Instant::now(),
             is_focused: true,
+            focus_seen: false,
+            last_window_title: String::new(),
             is_occluded: false,
             needs_render_after_occlusion: false,
             #[cfg(target_os = "windows")]
