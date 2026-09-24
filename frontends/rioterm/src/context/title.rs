@@ -139,10 +139,8 @@ pub fn update_title<T: rio_backend::event::EventListener>(
     let re = VARIABLE.get_or_init(|| regex::Regex::new(r"\{\{(.*?)\}\}").unwrap());
 
     let snapshot = TitleSnapshot::capture(context, prefetched_title);
-    let mut new_template = template.to_owned();
-
-    for (to_replace_str, [variable]) in re.captures_iter(template).map(|c| c.extract()) {
-        let mut variables = variable.split("||").peekable();
+    re.replace_all(template, |captures: &regex::Captures<'_>| {
+        let mut variables = captures[1].split("||").peekable();
         while let Some(variable) = variables.next() {
             let Some(value) = variable_value(variable, &snapshot) else {
                 continue;
@@ -151,12 +149,12 @@ pub fn update_title<T: rio_backend::event::EventListener>(
                 continue;
             }
 
-            new_template = new_template.replace(to_replace_str, &value);
-            break;
+            return value;
         }
-    }
 
-    new_template
+        captures[0].to_owned()
+    })
+    .into_owned()
 }
 
 #[cfg(test)]
@@ -233,6 +231,14 @@ pub mod test {
         assert_eq!(
             update_title("{{ columns }}x{{lines}}", &context, None),
             String::from("64x84")
+        );
+        assert_eq!(
+            update_title("{{ columns }}x{{columns}}", &context, None),
+            String::from("64x64")
+        );
+        assert_eq!(
+            update_title("{{ unknown }}", &context, None),
+            String::from("{{ unknown }}")
         );
 
         assert_eq!(
