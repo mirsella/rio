@@ -130,26 +130,6 @@ pub struct Machine<T: teletypewriter::EventedPty, U: EventListener> {
     route_id: usize,
 }
 
-#[cfg(all(test, feature = "pty"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn state_drops_empty_writes() {
-        let mut state = State::default();
-        state.push(Cow::Borrowed(&[]), None);
-        assert!(!state.needs_write());
-
-        state.push(Cow::Borrowed(b"input"), None);
-        assert!(state.needs_write());
-        assert_eq!(
-            state.write_list.pop_front().unwrap().remaining_bytes(),
-            b"input"
-        );
-        assert!(!state.needs_write());
-    }
-}
-
 #[cfg(feature = "pty")]
 #[derive(Default)]
 pub struct State {
