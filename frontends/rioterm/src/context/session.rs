@@ -1513,7 +1513,8 @@ impl RemoteView {
         self.current_directory =
             frame.working_dir.as_deref().map(std::path::PathBuf::from);
         self.colors = decode_colors(&frame.colors);
-        self.selection_range = selection_range(frame.selection.as_ref());
+        self.selection_range =
+            selection_range(frame.selection.as_ref(), frame.display_offset);
         self.grid.history = frame.history_size as usize;
         self.grid.display_offset = frame.display_offset as usize;
     }
@@ -2005,14 +2006,19 @@ fn cursor_shape(value: u8) -> CursorShape {
     }
 }
 
-fn selection_range(selection: Option<&SelectionFrame>) -> Option<SelectionRange> {
+fn selection_range(
+    selection: Option<&SelectionFrame>,
+    display_offset: u32,
+) -> Option<SelectionRange> {
+    // Session snapshots clip selection to the viewport. The grid renderer
+    // compares selection rows with terminal coordinates (visible row - offset).
     selection.map(|selection| SelectionRange {
         start: Pos::new(
-            Line(selection.start_line as i32),
+            Line(i32::from(selection.start_line) - display_offset as i32),
             Column(selection.start_column as usize),
         ),
         end: Pos::new(
-            Line(selection.end_line as i32),
+            Line(i32::from(selection.end_line) - display_offset as i32),
             Column(selection.end_column as usize),
         ),
         is_block: selection.block,
@@ -2453,6 +2459,65 @@ mod tests {
             rio_backend::event::TerminalDamage::Partial
         );
         assert!(view.grid.rows.iter().all(|row| row.dirty));
+    }
+
+    #[test]
+    fn scrolled_selection_highlights_viewport_rows_in_full_and_delta_frames() {
+        let rows = (0..3)
+            .map(|_| RowFrame {
+                cells: vec![
+                    CellFrame {
+                        content: CellContentFrame::Codepoint('a' as u32),
+                        wide: 0,
+                        flags: 0,
+                    };
+                    4
+                ],
+                styles: vec![default_style(); 4],
+                extras: vec![None; 4],
+                kitty_virtual_placeholder: false,
+                text: "a".into(),
+            })
+            .collect();
+        let mut snapshot = frame(4, 3, rows);
+        snapshot.display_offset = 20;
+        snapshot.history_size = 20;
+        snapshot.selection = Some(SelectionFrame {
+            start_line: 0,
+            start_column: 1,
+            end_line: 1,
+            end_column: 2,
+            block: false,
+        });
+        let mut view = RemoteView::from_frame(snapshot, WindowId::from(0));
+        assert_eq!(view.decoder_error(), None);
+        let selected_row = |view: &RemoteView, y| {
+            rio_grid::row_selection_for(
+                view.selection_range,
+                y,
+                4,
+                view.grid.display_offset as i32,
+            )
+            .map(|interval| (interval.lo, interval.hi))
+        };
+        assert_eq!(selected_row(&view, 0), Some((1, 3)));
+        assert_eq!(selected_row(&view, 1), Some((0, 2)));
+        assert_eq!(selected_row(&view, 2), None);
+
+        let mut update = delta(4, 3, 2, Vec::new());
+        update.display_offset = 25;
+        update.history_size = 25;
+        update.selection = Some(SelectionFrame {
+            start_line: 1,
+            start_column: 0,
+            end_line: 2,
+            end_column: 2,
+            block: false,
+        });
+        assert!(view.apply_frame_update(FrameUpdate::Delta(update)).is_ok());
+        assert_eq!(selected_row(&view, 0), None);
+        assert_eq!(selected_row(&view, 1), Some((0, 3)));
+        assert_eq!(selected_row(&view, 2), Some((0, 2)));
     }
 
     #[test]
