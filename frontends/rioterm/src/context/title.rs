@@ -17,13 +17,6 @@ impl Default for ContextTitle {
     }
 }
 
-pub fn create_title_extra_from_context<T: rio_backend::event::EventListener>(
-    context: &Context<T>,
-) -> Option<ContextTitleExtra> {
-    let program = context.foreground_process_name()?;
-    Some(ContextTitleExtra { program })
-}
-
 // Possible options:
 
 // - `TITLE`: terminal title via OSC sequences for setting terminal title
@@ -86,11 +79,14 @@ struct TitleSnapshot {
 }
 
 impl TitleSnapshot {
-    fn capture<T: rio_backend::event::EventListener>(context: &Context<T>) -> Self {
+    fn capture<T: rio_backend::event::EventListener>(
+        context: &Context<T>,
+        prefetched_title: Option<&str>,
+    ) -> Self {
         let terminal = context.terminal.lock();
         TitleSnapshot {
             dimension: context.dimension,
-            title: terminal.title.clone(),
+            title: prefetched_title.unwrap_or(&terminal.title).to_owned(),
             program: context.foreground_process_name(),
             current_directory: terminal.current_directory.clone(),
         }
@@ -129,8 +125,7 @@ fn variable_value(variable: &str, snapshot: &TitleSnapshot) -> Option<String> {
 /// spawned, and columns/lines are the pane's own dimensions.
 /// `prefetched_title` reuses the OSC title string the caller already
 /// holds (a `Title` event carries it), so a `{{ title }}` render off
-/// an event never locks the terminal; otherwise one lock fetches
-/// title and cwd together.
+/// an event can use the latest title even before a frame updates the cache.
 pub fn update_title<T: rio_backend::event::EventListener>(
     template: &str,
     context: &Context<T>,
@@ -143,7 +138,7 @@ pub fn update_title<T: rio_backend::event::EventListener>(
     static VARIABLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = VARIABLE.get_or_init(|| regex::Regex::new(r"\{\{(.*?)\}\}").unwrap());
 
-    let snapshot = TitleSnapshot::capture(context);
+    let snapshot = TitleSnapshot::capture(context, prefetched_title);
     let mut new_template = template.to_owned();
 
     for (to_replace_str, [variable]) in re.captures_iter(template).map(|c| c.extract()) {
@@ -240,7 +235,10 @@ pub mod test {
             String::from("64x84")
         );
 
-        assert_eq!(update_title("{{ title }}", &context), String::from(""));
+        assert_eq!(
+            update_title("{{ title }}", &context, None),
+            String::from("")
+        );
     }
 
     #[test]
@@ -267,12 +265,12 @@ pub mod test {
         );
 
         assert_eq!(
-            update_title("{{ program || columns }}", &context),
+            update_title("{{ program || columns }}", &context, None),
             String::from("64")
         );
 
         assert_eq!(
-            update_title("{{ title || title }}", &context),
+            update_title("{{ title || title }}", &context, None),
             String::from("")
         );
 
@@ -322,7 +320,7 @@ pub mod test {
             create_mock_context(VoidListener {}, WindowId::from(0), 0, test_dimension());
         assert!(context.terminal.lock().current_directory.is_none());
         assert_eq!(
-            update_title("{{ TITLE || RELATIVE_PATH }}", &context),
+            update_title("{{ TITLE || RELATIVE_PATH }}", &context, None),
             String::from("")
         );
     }

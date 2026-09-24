@@ -362,8 +362,14 @@ pub enum RioEvent {
     /// Window title change from a terminal route.
     Title(usize, String),
 
+    /// Synchronize the native titlebar with the currently displayed tab.
+    SyncWindowTitle,
+
     /// Reset to the default window title.
     ResetTitle,
+
+    /// Re-render titles after the periodic title refresh.
+    UpdateTitles,
 
     /// Request to store a text string in the clipboard.
     ClipboardStore(ClipboardType, String),
@@ -484,6 +490,8 @@ impl Debug for RioEvent {
             }
             RioEvent::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             RioEvent::ResetTitle => write!(f, "ResetTitle"),
+            RioEvent::UpdateTitles => write!(f, "UpdateTitles"),
+            RioEvent::SyncWindowTitle => write!(f, "SyncWindowTitle"),
             RioEvent::PrepareUpdateConfig => write!(f, "PrepareUpdateConfig"),
             RioEvent::PrepareRender(millis) => write!(f, "PrepareRender({millis})"),
             RioEvent::PrepareRenderOnRoute(millis, route) => {

@@ -3886,7 +3886,7 @@ dependencies = [
 
 [[package]]
 name = "rio-session"
-version = "0.5.27"
+version = "0.5.28"
 dependencies = [
  "bincode",
  "getrandom 0.3.4",
@@ -3997,6 +3997,7 @@ name = "rioterm"
 version = "0.5.28"
 dependencies = [
  "ahash",
+ "base64",
  "bincode",
  "bitflags 2.13.1",
  "cfg_aliases",

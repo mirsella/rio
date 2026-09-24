@@ -529,6 +529,15 @@ impl ShellUser {
     }
 }
 
+pub fn default_shell_program() -> String {
+    ShellUser::from_env()
+        .map(|user| user.shell)
+        .unwrap_or_else(|error| {
+            tracing::warn!("could not resolve default shell for integration: {error}");
+            String::new()
+        })
+}
+
 ///
 /// Build the argv passed to login(1) on macOS.
 ///
@@ -835,7 +844,12 @@ fn create_pty_with_spawn_inner(
     match builder.spawn() {
         Ok(child_process) => {
             // Establish lifecycle ownership before any fallible parent-side setup.
-            let child = Child::new(main, child_process.id() as libc::pid_t);
+            let child = Child::new(
+                main,
+                child_process.id() as libc::pid_t,
+                String::new(),
+                Some(child_process),
+            );
             set_nonblocking(main)?;
 
             Ok(Pty {
@@ -844,6 +858,7 @@ fn create_pty_with_spawn_inner(
                 token: corcovado::Token::from(0),
                 signals,
                 signals_token: corcovado::Token::from(0),
+                child_event_emitted: false,
             })
         }
         Err(err) => Err(Error::new(
@@ -904,8 +919,6 @@ pub fn create_pty_with_fork(
     let command = ShellCommand::new(shell_program, args)?;
     let signals = Signals::new([sigconsts::SIGCHLD])?;
 
-    let signals = Signals::new([sigconsts::SIGCHLD])?;
-
     match unsafe {
         forkpty(
             &mut main as *mut _,
@@ -925,7 +938,7 @@ pub fn create_pty_with_fork(
         id if id > 0 => {
             let file = unsafe { File::from_raw_fd(main) };
             // Establish lifecycle ownership before any fallible parent-side setup.
-            let child = Child::new(main, id);
+            let child = Child::new(main, id, String::new(), None);
             set_cloexec(main)?;
             set_nonblocking(main)?;
             Ok(Pty {
@@ -981,41 +994,6 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-pub struct Child {
-    pub id: libc::c_int,
-    pub pid: libc::pid_t,
-    exited: bool,
-}
-
-impl Child {
-    fn new(id: RawFd, pid: libc::pid_t) -> Self {
-        Self {
-            id,
-            pid,
-            exited: false,
-        }
-    }
-
-    fn set_winsize(&self, winsize_builder: WinsizeBuilder) -> io::Result<()> {
-        let winsize: Winsize = winsize_builder.build();
-        match unsafe { libc::ioctl(self.id, TIOCSWINSZ, &winsize as *const _) } {
-            -1 => Err(io::Error::last_os_error()),
-            _ => Ok(()),
-        }
-    }
-
-    fn try_wait(&mut self) -> io::Result<Option<i32>> {
-        let result = wait_for_child_status(self.pid, libc::WNOHANG);
-        if matches!(&result, Ok(Some(_)))
-            || matches!(&result, Err(error) if error.raw_os_error() == Some(libc::ECHILD))
-        {
-            self.exited = true;
-        }
-        result
-    }
-}
-
 fn wait_for_child_status(
     pid: libc::pid_t,
     options: libc::c_int,
@@ -1051,49 +1029,6 @@ pub fn reap_child(pid: libc::pid_t) -> io::Result<()> {
     }
 }
 
-fn terminate_and_reap_child(pid: libc::pid_t) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    loop {
-        match wait_for_child_status(pid, libc::WNOHANG) {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) if std::time::Instant::now() >= deadline => break,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-        }
-    }
-
-    unsafe { libc::kill(pid, libc::SIGKILL) };
-    let _ = reap_child(pid);
-}
-
-impl Drop for Child {
-    fn drop(&mut self) {
-        if self.exited {
-            return;
-        }
-
-        match self.try_wait() {
-            Ok(Some(_)) => return,
-            Err(_) if self.exited => return,
-            Err(error) => {
-                tracing::warn!("failed to inspect PTY child before shutdown: {error}");
-                return;
-            }
-            Ok(None) => {}
-        }
-
-        let pid = self.pid;
-        unsafe { libc::kill(pid, libc::SIGHUP) };
-        if let Err(error) = std::thread::Builder::new()
-            .name("pty-reaper".into())
-            .spawn(move || terminate_and_reap_child(pid))
-        {
-            tracing::error!("failed to start PTY child reaper: {error}");
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            let _ = reap_child(pid);
-        }
-    }
-}
-
 impl EventedPty for Pty {
     fn shutdown(&mut self) -> io::Result<()> {
         self.child.terminate()
@@ -1104,21 +1039,20 @@ impl EventedPty for Pty {
         if self.child_event_emitted {
             return None;
         }
-        self.signals.pending().next().and_then(|signal| {
+        let event = self.signals.pending().next().and_then(|signal| {
             if signal != sigconsts::SIGCHLD {
                 return None;
             }
-
-            match self.child.try_wait() {
-                Err(_) if self.child.exited => Some(ChildEvent::Exited(None)),
+            match self.child.poll_exit() {
+                Ok(event) => event,
                 Err(error) => {
                     tracing::warn!("failed to collect PTY child status: {error}");
                     None
                 }
-                Ok(None) => None,
-                Ok(Some(status)) => Some(ChildEvent::Exited(Some(status))),
             }
-        })
+        });
+        self.child_event_emitted |= event.is_some();
+        event
     }
 
     #[inline]
@@ -1314,142 +1248,6 @@ mod resolve_working_dir_tests {
         ] {
             assert_eq!(resolve_working_dir(input).unwrap(), expected);
         }
-    }
-}
-
-#[cfg(test)]
-mod child_wait_tests {
-    use super::Child;
-
-    fn exited_child(code: libc::c_int) -> libc::pid_t {
-        match unsafe { libc::fork() } {
-            0 => unsafe { libc::_exit(code) },
-            pid if pid > 0 => pid,
-            _ => panic!("fork failed: {}", std::io::Error::last_os_error()),
-        }
-    }
-
-    fn live_child(ignore_hangup: bool) -> libc::pid_t {
-        let mut ready = [0; 2];
-        if unsafe { libc::pipe(ready.as_mut_ptr()) } == -1 {
-            panic!("pipe failed: {}", std::io::Error::last_os_error());
-        }
-
-        match unsafe { libc::fork() } {
-            0 => unsafe {
-                libc::close(ready[0]);
-                libc::signal(
-                    libc::SIGHUP,
-                    if ignore_hangup {
-                        libc::SIG_IGN
-                    } else {
-                        libc::SIG_DFL
-                    },
-                );
-                let ready_byte = 1_u8;
-                if libc::write(ready[1], &ready_byte as *const u8 as *const _, 1) != 1 {
-                    libc::_exit(127);
-                }
-                libc::close(ready[1]);
-                loop {
-                    libc::pause();
-                }
-            },
-            pid if pid > 0 => {
-                unsafe {
-                    libc::close(ready[1]);
-                }
-                let mut ready_byte = 0_u8;
-                loop {
-                    match unsafe {
-                        libc::read(ready[0], &mut ready_byte as *mut u8 as *mut _, 1)
-                    } {
-                        1 => break,
-                        -1 if std::io::Error::last_os_error().kind()
-                            == std::io::ErrorKind::Interrupted => {}
-                        result => panic!("child readiness failed: read={result}"),
-                    }
-                }
-                unsafe {
-                    libc::close(ready[0]);
-                }
-                pid
-            }
-            _ => {
-                unsafe {
-                    libc::close(ready[0]);
-                    libc::close(ready[1]);
-                }
-                panic!("fork failed: {}", std::io::Error::last_os_error());
-            }
-        }
-    }
-
-    fn assert_drop_reaps_child(pid: libc::pid_t, timeout: std::time::Duration) {
-        drop(Child::new(-1, pid));
-
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let mut status = 0;
-            match unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } {
-                child if child == pid => break,
-                -1 if std::io::Error::last_os_error().raw_os_error()
-                    == Some(libc::ECHILD) =>
-                {
-                    break;
-                }
-                0 if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                result => panic!("child was not reaped before timeout: waitpid={result}"),
-            }
-        }
-    }
-
-    #[test]
-    fn waitpid_reports_normal_exit() {
-        let pid = exited_child(7);
-        let mut child = Child::new(-1, pid);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            assert!(std::time::Instant::now() < deadline, "child did not exit");
-            std::thread::yield_now();
-        };
-
-        assert!(libc::WIFEXITED(status));
-        assert_eq!(libc::WEXITSTATUS(status), 7);
-    }
-
-    #[test]
-    fn waitpid_marks_externally_reaped_child_exited() {
-        let pid = exited_child(0);
-        let mut status = 0;
-        while unsafe { libc::waitpid(pid, &mut status, 0) } == -1 {
-            assert_eq!(
-                std::io::Error::last_os_error().kind(),
-                std::io::ErrorKind::Interrupted
-            );
-        }
-
-        let mut child = Child::new(-1, pid);
-        let error = child.try_wait().unwrap_err();
-
-        assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
-        assert!(child.exited);
-    }
-
-    #[test]
-    fn dropping_live_child_terminates_and_reaps_it() {
-        assert_drop_reaps_child(live_child(false), std::time::Duration::from_secs(2));
-    }
-
-    #[test]
-    fn dropping_child_that_ignores_hangup_escalates_and_reaps_it() {
-        assert_drop_reaps_child(live_child(true), std::time::Duration::from_secs(3));
     }
 }
 
