@@ -932,48 +932,44 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn select_next_split(&mut self) {
         self.contexts[self.current_index].select_next_split();
-        self.sync_current_route();
+        self.sync_window_title();
     }
 
     #[inline]
     pub fn select_prev_split(&mut self) {
         self.contexts[self.current_index].select_prev_split();
-        self.sync_current_route();
+        self.sync_window_title();
     }
 
     #[inline]
     pub fn switch_to_next_split_or_tab(&mut self) {
-        if self.contexts[self.current_index].select_next_split_no_loop() {
-            self.sync_current_route();
-            return;
+        if !self.contexts[self.current_index].select_next_split_no_loop() {
+            if !self.step_tab(true) {
+                return;
+            }
+            // Make sure first split is selected - get the root key
+            let current_tab = &mut self.contexts[self.current_index];
+            if let Some(root) = current_tab.root {
+                current_tab.current = root;
+            }
         }
-        if !self.step_tab(true) {
-            return;
-        }
-        // Make sure first split is selected - get the root key
-        let current_tab = &mut self.contexts[self.current_index];
-        if let Some(root) = current_tab.root {
-            current_tab.current = root;
-        }
-        self.sync_current_route();
+        self.sync_window_title();
     }
 
     #[inline]
     pub fn switch_to_prev_split_or_tab(&mut self) {
-        if self.contexts[self.current_index].select_prev_split_no_loop() {
-            self.sync_current_route();
-            return;
+        if !self.contexts[self.current_index].select_prev_split_no_loop() {
+            if !self.step_tab(false) {
+                return;
+            }
+            // Make sure last split is selected - get the last key in order
+            let current_tab = &mut self.contexts[self.current_index];
+            let ordered_keys = current_tab.get_ordered_keys();
+            if let Some(&last_key) = ordered_keys.last() {
+                current_tab.current = last_key;
+            }
         }
-        if !self.step_tab(false) {
-            return;
-        }
-        // Make sure last split is selected - get the last key in order
-        let current_tab = &mut self.contexts[self.current_index];
-        let ordered_keys = current_tab.get_ordered_keys();
-        if let Some(&last_key) = ordered_keys.last() {
-            current_tab.current = last_key;
-        }
-        self.sync_current_route();
+        self.sync_window_title();
     }
 
     #[inline]
@@ -1751,7 +1747,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     pub fn set_current(&mut self, context_id: usize) {
         if context_id < self.contexts.len() {
             self.current_index = context_id;
-            self.sync_current_route();
+            self.sync_window_title();
         }
     }
 
