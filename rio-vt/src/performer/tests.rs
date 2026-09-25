@@ -25,7 +25,7 @@ fn state_drops_empty_writes() {
 struct TestPty {
     bytes: io::Cursor<Vec<u8>>,
     ending: Option<ErrorKind>,
-    exhausted: Option<mpsc::Sender<()>>,
+    read_started: Option<mpsc::Sender<()>>,
     writer: Vec<u8>,
     child: Option<corcovado::Registration>,
     registration_error: bool,
@@ -39,10 +39,10 @@ impl Read for TestPty {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let got = self.bytes.read(buf)?;
         if got != 0 {
+            if let Some(sender) = self.read_started.take() {
+                sender.send(()).unwrap();
+            }
             return Ok(got);
-        }
-        if let Some(sender) = self.exhausted.take() {
-            sender.send(()).unwrap();
         }
         if let Some(code) = self.raw_error {
             return Err(io::Error::from_raw_os_error(code));
@@ -141,7 +141,7 @@ fn machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> Machine<TestPty, VoidLi
         TestPty {
             bytes: io::Cursor::new(bytes),
             ending,
-            exhausted: None,
+            read_started: None,
             writer: Vec::new(),
             child: None,
             registration_error: false,
@@ -164,24 +164,24 @@ fn first_line(machine: &Machine<TestPty, VoidListener>, len: usize) -> String {
         .collect()
 }
 
-// Holding the terminal until the confirming read guarantees the first batch
-// cannot be parsed before EOF/error. No timing assumptions or sleeps are needed.
+// Holding the terminal until data has been read ensures the output is buffered
+// before parsing. Releasing it lets the worker parse the data before EOF/error.
 fn read_with_contended_terminal(ending: Option<ErrorKind>, raw_error: Option<i32>) {
     let mut machine = machine(b"final output".to_vec(), ending);
     machine.pty.raw_error = raw_error;
     let terminal = Arc::clone(&machine.terminal);
     let guard = terminal.lock();
     let (sender, receiver) = mpsc::channel();
-    machine.pty.exhausted = Some(sender);
+    machine.pty.read_started = Some(sender);
     let worker = std::thread::spawn(move || {
         let result =
             machine.pty_read(&mut State::default(), &mut vec![0; READ_BUFFER_SIZE]);
         (machine, result)
     });
-    let exhausted = receiver.recv_timeout(Duration::from_secs(5));
+    let read_started = receiver.recv_timeout(Duration::from_secs(5));
     drop(guard);
     let (machine, result) = worker.join().unwrap();
-    exhausted.unwrap();
+    read_started.unwrap();
     if let Some(code) = raw_error {
         assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
     } else {
