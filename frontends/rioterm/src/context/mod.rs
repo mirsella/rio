@@ -844,11 +844,17 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn switch_to_next_split_or_tab(&mut self) {
         if !self.contexts[self.current_index].select_next_split_no_loop() {
-            self.switch_to_next();
-            // Make sure first split is selected - get the root key
-            let current_tab = &mut self.contexts[self.current_index];
-            if let Some(root) = current_tab.root {
-                current_tab.current = root;
+            if self.config.is_native {
+                self.switch_to_next();
+                if let Some(root) = self.contexts[self.current_index].root {
+                    self.contexts[self.current_index].current = root;
+                }
+            } else {
+                let next = self.next_context_index();
+                if let Some(root) = self.contexts[next].root {
+                    self.contexts[next].current = root;
+                }
+                self.current_index = next;
             }
         }
         self.sync_window_title();
@@ -857,12 +863,23 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn switch_to_prev_split_or_tab(&mut self) {
         if !self.contexts[self.current_index].select_prev_split_no_loop() {
-            self.switch_to_prev();
-            // Make sure last split is selected - get the last key in order
-            let current_tab = &mut self.contexts[self.current_index];
-            let ordered_keys = current_tab.get_ordered_keys();
-            if let Some(&last_key) = ordered_keys.last() {
-                current_tab.current = last_key;
+            if self.config.is_native {
+                self.switch_to_prev();
+                if let Some(last_key) = self.contexts[self.current_index]
+                    .get_ordered_keys()
+                    .last()
+                    .copied()
+                {
+                    self.contexts[self.current_index].current = last_key;
+                }
+            } else {
+                let previous = self.previous_context_index();
+                if let Some(last_key) =
+                    self.contexts[previous].get_ordered_keys().last().copied()
+                {
+                    self.contexts[previous].current = last_key;
+                }
+                self.current_index = previous;
             }
         }
         self.sync_window_title();
@@ -1588,12 +1605,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return;
         }
 
-        let next = if self.contexts.len() - 1 == self.current_index {
-            0
-        } else {
-            self.current_index + 1
-        };
-        self.set_current(next);
+        self.set_current(self.next_context_index());
     }
 
     #[inline]
@@ -1608,12 +1620,23 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return;
         }
 
-        let previous = if self.current_index == 0 {
+        self.set_current(self.previous_context_index());
+    }
+
+    fn next_context_index(&self) -> usize {
+        if self.current_index == self.contexts.len() - 1 {
+            0
+        } else {
+            self.current_index + 1
+        }
+    }
+
+    fn previous_context_index(&self) -> usize {
+        if self.current_index == 0 {
             self.contexts.len() - 1
         } else {
             self.current_index - 1
-        };
-        self.set_current(previous);
+        }
     }
 
     #[inline]
@@ -1978,6 +2001,24 @@ pub mod test {
         assert_eq!(*events.lock().unwrap(), 1);
 
         manager.set_current(0);
+        assert_eq!(*events.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn split_or_tab_navigation_syncs_window_title_once() {
+        let listener = TitleListener::default();
+        let events = Arc::clone(&listener.0);
+        let mut manager =
+            ContextManager::start_with_capacity(3, listener, WindowId::from(0)).unwrap();
+        manager.add_context(true, 0);
+        *events.lock().unwrap() = 0;
+
+        manager.switch_to_next_split_or_tab();
+        assert_eq!(manager.current_index(), 0);
+        assert_eq!(*events.lock().unwrap(), 1);
+
+        manager.switch_to_prev_split_or_tab();
+        assert_eq!(manager.current_index(), 1);
         assert_eq!(*events.lock().unwrap(), 2);
     }
 
