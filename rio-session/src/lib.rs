@@ -34,9 +34,9 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 #[cfg(unix)]
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{OnceLock, Weak};
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
