@@ -1,8 +1,6 @@
 use crate::context::Context;
 use crate::context::ContextDimension;
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(PartialEq)]
 pub struct ContextTitle {
@@ -93,7 +91,7 @@ impl TitleSnapshot {
     }
 }
 
-fn current_path(current_directory: Option<&PathBuf>) -> Option<String> {
+fn current_path(current_directory: Option<&Path>) -> Option<String> {
     // Lossy conversion is the identity for valid UTF-8, so this covers both
     // cases without branching.
     current_directory.map(|directory| directory.to_string_lossy().into_owned())
@@ -106,10 +104,10 @@ fn variable_value(variable: &str, snapshot: &TitleSnapshot) -> Option<String> {
         "title" => Some(snapshot.title.clone()),
         "program" => Some(snapshot.program.clone().unwrap_or_default()),
         "absolute_path" => {
-            Some(current_path(snapshot.current_directory.as_ref()).unwrap_or_default())
+            Some(current_path(snapshot.current_directory.as_deref()).unwrap_or_default())
         }
         "relative_path" => Some(
-            current_path(snapshot.current_directory.as_ref())
+            current_path(snapshot.current_directory.as_deref())
                 .map(|path| shorten_path(&path))
                 .unwrap_or_default(),
         ),
@@ -340,7 +338,7 @@ pub mod test {
     fn test_current_path_prefers_valid_unicode() {
         let directory = PathBuf::from("/tmp/rio-title-test");
         assert_eq!(
-            current_path(Some(&directory)),
+            current_path(Some(directory.as_path())),
             Some(String::from("/tmp/rio-title-test"))
         );
     }
@@ -352,7 +350,7 @@ pub mod test {
         use std::os::unix::ffi::OsStrExt;
         let directory = PathBuf::from(OsStr::from_bytes(b"/tmp/rio-\xff"));
         assert_eq!(
-            current_path(Some(&directory)),
+            current_path(Some(directory.as_path())),
             Some(String::from("/tmp/rio-\u{fffd}"))
         );
     }
