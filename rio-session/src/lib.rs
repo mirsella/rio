@@ -32,11 +32,11 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+#[cfg(unix)]
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
@@ -56,6 +56,112 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 /// Listening socket name inside a session's private directory.
 #[cfg(unix)]
 pub(crate) const SESSION_SOCKET_FILE: &str = "session.sock";
+
+#[cfg(unix)]
+static PINNED_WORKER_EXECUTABLE: OnceLock<Weak<WorkerExecutable>> = OnceLock::new();
+
+/// The executable used for session workers. A pinned instance keeps its
+/// private snapshot alive until all pending worker launches finish.
+pub struct WorkerExecutable {
+    path: PathBuf,
+    #[cfg(unix)]
+    _directory: Option<tempfile::TempDir>,
+}
+
+impl AsRef<Path> for WorkerExecutable {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(unix)]
+/// Capture the running executable before it can be replaced by an upgrade.
+pub fn pin_current_worker_executable() -> Result<Arc<WorkerExecutable>, SessionError> {
+    let source = std::env::current_exe()?;
+    let pinned = Arc::new(copy_worker_executable(&source)?);
+    if PINNED_WORKER_EXECUTABLE
+        .set(Arc::downgrade(&pinned))
+        .is_err()
+    {
+        return Err(SessionError::invalid(
+            "session worker executable was already pinned",
+        ));
+    }
+    Ok(pinned)
+}
+
+/// Return the worker binary captured at startup, or the current executable
+/// when the application was started without pinning one (for example in tests).
+pub fn worker_executable() -> Result<Arc<WorkerExecutable>, SessionError> {
+    #[cfg(unix)]
+    if let Some(pin) = PINNED_WORKER_EXECUTABLE.get().and_then(Weak::upgrade) {
+        return Ok(pin);
+    }
+
+    Ok(Arc::new(WorkerExecutable {
+        path: std::env::current_exe()?,
+        #[cfg(unix)]
+        _directory: None,
+    }))
+}
+
+#[cfg(unix)]
+fn copy_worker_executable(source: &Path) -> Result<WorkerExecutable, SessionError> {
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| SessionError::invalid("Rio executable path has no filename"))?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("rio-session-worker-");
+    let directory = match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(path) => builder.tempdir_in(path)?,
+        None => builder.tempdir()?,
+    };
+    let path = directory.path().join(file_name);
+    std::fs::copy(source, &path)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+
+    Ok(WorkerExecutable {
+        path,
+        _directory: Some(directory),
+    })
+}
+
+#[cfg(all(test, unix))]
+mod pinned_worker_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn worker_lease_keeps_pinned_copy_after_owner_drops() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("rio");
+        std::fs::write(&source, b"old worker").unwrap();
+
+        let pinned = Arc::new(copy_worker_executable(&source).unwrap());
+        let pinned_path = pinned.path.clone();
+        assert!(PINNED_WORKER_EXECUTABLE
+            .set(Arc::downgrade(&pinned))
+            .is_ok());
+        let worker = worker_executable().unwrap();
+        std::fs::write(&source, b"new worker").unwrap();
+
+        assert_eq!(std::fs::read(&pinned_path).unwrap(), b"old worker");
+        assert_eq!(
+            std::fs::metadata(&pinned_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        drop(pinned);
+        assert!(pinned_path.exists());
+        drop(worker);
+        assert!(!pinned_path.exists());
+    }
+}
 
 #[cfg(unix)]
 type FileIdentity = (u64, u64);
