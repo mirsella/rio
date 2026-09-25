@@ -24,7 +24,7 @@ fn state_drops_empty_writes() {
 
 struct TestPty {
     bytes: io::Cursor<Vec<u8>>,
-    ending: Option<ErrorKind>,
+    ending: ReadEnd,
     read_started: Option<mpsc::Sender<()>>,
     writer: Vec<u8>,
     child: Option<corcovado::Registration>,
@@ -32,7 +32,13 @@ struct TestPty {
     read_event: bool,
     shutdown_calls: usize,
     deregister_calls: usize,
-    raw_error: Option<i32>,
+}
+
+#[derive(Clone, Copy)]
+enum ReadEnd {
+    Eof,
+    Error(ErrorKind),
+    RawOsError(i32),
 }
 
 impl Read for TestPty {
@@ -44,12 +50,10 @@ impl Read for TestPty {
             }
             return Ok(got);
         }
-        if let Some(code) = self.raw_error {
-            return Err(io::Error::from_raw_os_error(code));
-        }
         match self.ending {
-            Some(kind) => Err(io::Error::from(kind)),
-            None => Ok(0),
+            ReadEnd::Eof => Ok(0),
+            ReadEnd::Error(kind) => Err(io::Error::from(kind)),
+            ReadEnd::RawOsError(code) => Err(io::Error::from_raw_os_error(code)),
         }
     }
 }
@@ -127,7 +131,7 @@ impl EventedPty for TestPty {
     }
 }
 
-fn machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> Machine<TestPty, VoidListener> {
+fn machine(bytes: Vec<u8>, ending: ReadEnd) -> Machine<TestPty, VoidListener> {
     let terminal = Crosswords::new(
         CrosswordsSize::new(80, 24),
         CursorShape::Block,
@@ -148,7 +152,6 @@ fn machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> Machine<TestPty, VoidLi
             read_event: false,
             shutdown_calls: 0,
             deregister_calls: 0,
-            raw_error: None,
         },
         VoidListener,
         WindowId::from(0),
@@ -166,9 +169,8 @@ fn first_line(machine: &Machine<TestPty, VoidListener>, len: usize) -> String {
 
 // Holding the terminal until data has been read ensures the output is buffered
 // before parsing. Releasing it lets the worker parse the data before EOF/error.
-fn read_with_contended_terminal(ending: Option<ErrorKind>, raw_error: Option<i32>) {
+fn read_with_contended_terminal(ending: ReadEnd) {
     let mut machine = machine(b"final output".to_vec(), ending);
-    machine.pty.raw_error = raw_error;
     let terminal = Arc::clone(&machine.terminal);
     let guard = terminal.lock();
     let (sender, receiver) = mpsc::channel();
@@ -182,12 +184,11 @@ fn read_with_contended_terminal(ending: Option<ErrorKind>, raw_error: Option<i32
     drop(guard);
     let (machine, result) = worker.join().unwrap();
     read_started.unwrap();
-    if let Some(code) = raw_error {
-        assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
-    } else {
-        match ending {
-            Some(kind) => assert_eq!(result.unwrap_err().kind(), kind),
-            None => assert_eq!(result.unwrap(), ReadOutcome::Closed),
+    match ending {
+        ReadEnd::Eof => assert_eq!(result.unwrap(), ReadOutcome::Closed),
+        ReadEnd::Error(kind) => assert_eq!(result.unwrap_err().kind(), kind),
+        ReadEnd::RawOsError(code) => {
+            assert_eq!(result.unwrap_err().raw_os_error(), Some(code));
         }
     }
     assert_eq!(first_line(&machine, 12), "final output");
@@ -195,12 +196,12 @@ fn read_with_contended_terminal(ending: Option<ErrorKind>, raw_error: Option<i32
 
 #[test]
 fn eof_preserves_buffered_output_under_lock_contention() {
-    read_with_contended_terminal(None, None);
+    read_with_contended_terminal(ReadEnd::Eof);
 }
 
 #[test]
 fn read_error_preserves_buffered_output_under_lock_contention() {
-    read_with_contended_terminal(Some(ErrorKind::Other), None);
+    read_with_contended_terminal(ReadEnd::Error(ErrorKind::Other));
 }
 
 #[test]
@@ -208,7 +209,7 @@ fn final_output_can_be_drained_across_multiple_parse_budgets() {
     // NUL padding consumes parse budgets without scrolling the final marker.
     let mut bytes = vec![0; MAX_LOCKED_READ * 2 + 1];
     bytes.extend_from_slice(b"final output");
-    let mut machine = machine(bytes, None);
+    let mut machine = machine(bytes, ReadEnd::Eof);
     let mut state = State::default();
     let mut buf = vec![0; READ_BUFFER_SIZE];
     assert_eq!(
@@ -231,7 +232,7 @@ fn child_exit_drains_multiple_budgets_and_finishes_pending_sync() {
     let mut bytes = vec![0; MAX_LOCKED_READ * 2 + 1];
     bytes.extend_from_slice(b"\x1b[?2026hfinal output");
     // WouldBlock models a descendant retaining the slave after the child exits.
-    let mut machine = machine(bytes, Some(ErrorKind::WouldBlock));
+    let mut machine = machine(bytes, ReadEnd::Error(ErrorKind::WouldBlock));
     let (registration, readiness) = corcovado::Registration::new2();
     machine.pty.child = Some(registration);
     readiness.set_readiness(Ready::readable()).unwrap();
@@ -245,12 +246,12 @@ fn child_exit_drains_multiple_budgets_and_finishes_pending_sync() {
 #[cfg(unix)]
 #[test]
 fn eio_preserves_buffered_output_under_lock_contention() {
-    read_with_contended_terminal(None, Some(libc::EIO));
+    read_with_contended_terminal(ReadEnd::RawOsError(libc::EIO));
 }
 
 #[test]
 fn registration_failure_shuts_down_pty() {
-    let mut machine = machine(Vec::new(), None);
+    let mut machine = machine(Vec::new(), ReadEnd::Eof);
     machine.pty.registration_error = true;
     let (machine, _) = machine.spawn().join().unwrap();
     assert_eq!(machine.pty.shutdown_calls, 1);
@@ -259,8 +260,10 @@ fn registration_failure_shuts_down_pty() {
 
 #[test]
 fn read_failure_shuts_down_pty_and_finishes_pending_sync() {
-    let mut machine =
-        machine(b"\x1b[?2026hfinal output".to_vec(), Some(ErrorKind::Other));
+    let mut machine = machine(
+        b"\x1b[?2026hfinal output".to_vec(),
+        ReadEnd::Error(ErrorKind::Other),
+    );
     let (registration, readiness) = corcovado::Registration::new2();
     machine.pty.child = Some(registration);
     machine.pty.read_event = true;
@@ -309,7 +312,7 @@ fn pending_sync_is_visible_before_child_exited_notification() {
     *observer.terminal.lock().unwrap() = Arc::downgrade(&terminal);
     let mut pty = machine(
         b"\x1b[?2026hfinal output".to_vec(),
-        Some(ErrorKind::WouldBlock),
+        ReadEnd::Error(ErrorKind::WouldBlock),
     )
     .pty;
     let (registration, readiness) = corcovado::Registration::new2();
@@ -327,7 +330,7 @@ fn pending_sync_is_visible_before_child_exited_notification() {
 #[cfg(unix)]
 #[test]
 fn hangup_without_readable_readiness_drains_residual_output() {
-    let mut machine = machine(b"final output".to_vec(), Some(ErrorKind::Other));
+    let mut machine = machine(b"final output".to_vec(), ReadEnd::Error(ErrorKind::Other));
     let (registration, readiness) = corcovado::Registration::new2();
     machine.pty.child = Some(registration);
     machine.pty.read_event = true;
@@ -349,7 +352,7 @@ fn hangup_without_readable_readiness_drains_residual_output() {
 
 #[test]
 fn explicit_shutdown_finalizes_once() {
-    let machine = machine(Vec::new(), None);
+    let machine = machine(Vec::new(), ReadEnd::Eof);
     machine.channel().send(Msg::Shutdown).unwrap();
     let (machine, _) = machine.spawn().join().unwrap();
     assert_eq!(machine.pty.shutdown_calls, 1);
