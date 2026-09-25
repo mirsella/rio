@@ -243,6 +243,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     setup_environment_variables(&config);
 
+    #[cfg(unix)]
+    let _pinned_worker_executable = match rio_session::pin_current_worker_executable() {
+        Ok(executable) => Some(executable),
+        Err(error) => {
+            tracing::warn!(%error, "unable to pin the session worker executable; sessions may not start after upgrading Rio");
+            None
+        }
+    };
+
     let window_event_loop =
         rio_window::event_loop::EventLoop::<EventPayload>::with_user_event().build()?;
 

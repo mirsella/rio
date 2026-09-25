@@ -395,15 +395,14 @@ impl SessionHandle {
         let command_wakeup_for_thread = Arc::clone(&command_wakeup);
         let commands = CommandSender::new(commands, Arc::clone(&command_wakeup));
         let listener = event_proxy.with_window_target(WindowTarget::dynamic(window_id));
+        let worker = rio_session::worker_executable();
 
         thread::Builder::new()
             .name(format!("rio-session-{route_id}"))
             .spawn(move || {
-                let client = std::env::current_exe()
-                    .map_err(SessionError::from)
-                    .and_then(|worker| {
-                        SessionClient::spawn_with_worker_path(spec, worker)
-                    });
+                let client = worker.and_then(|worker| {
+                    SessionClient::spawn_with_worker_path(spec, worker.as_ref())
+                });
                 let client = match client {
                     Ok(client) => client,
                     Err(error) => {
