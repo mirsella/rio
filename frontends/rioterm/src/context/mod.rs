@@ -2307,6 +2307,24 @@ pub mod test {
     }
 
     #[test]
+    fn split_or_tab_navigation_syncs_window_title_once() {
+        let listener = TitleListener::default();
+        let events = Arc::clone(&listener.0);
+        let mut manager =
+            ContextManager::start_with_capacity(3, listener, WindowId::from(0)).unwrap();
+        manager.add_context(true, 0);
+        *events.lock().unwrap() = 0;
+
+        manager.switch_to_next_split_or_tab();
+        assert_eq!(manager.current_index(), 0);
+        assert_eq!(*events.lock().unwrap(), 1);
+
+        manager.switch_to_prev_split_or_tab();
+        assert_eq!(manager.current_index(), 1);
+        assert_eq!(*events.lock().unwrap(), 2);
+    }
+
+    #[test]
     fn test_add_context() {
         let window_id: WindowId = WindowId::from(0);
 
