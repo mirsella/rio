@@ -995,8 +995,22 @@ impl Screen<'_> {
         }
     }
 
+    /// Pointer cell in terminal coordinates (absolute rows).
     #[inline]
-    pub fn mouse_position(&self, display_offset: usize) -> Pos {
+    pub fn mouse_position(&self) -> Pos {
+        let display_offset = self.display_offset();
+        self.mouse_position_in(display_offset)
+    }
+
+    /// Pointer cell in viewport coordinates (row 0 is the top visible
+    /// row), matching the mouse wire and the hint probe cache.
+    #[inline]
+    pub fn mouse_viewport_position(&self) -> Pos {
+        self.mouse_position_in(0)
+    }
+
+    #[inline]
+    fn mouse_position_in(&self, display_offset: usize) -> Pos {
         let current_grid = self.context_manager.current_grid();
         let (context, margin) = current_grid.current_context_with_computed_dimension();
         let context_dimension = context.dimension;
@@ -2382,7 +2396,7 @@ impl Screen<'_> {
         // still refreshes it. Wheel scrolling resets the probe in
         // `Self::scroll`; content sliding under a stationary cursor
         // without one is stale until the mouse crosses a cell.
-        let viewport_point = self.mouse_position(0);
+        let viewport_point = self.mouse_viewport_position();
         if !had_highlight && self.last_hint_probe == Some((viewport_point, mods)) {
             return false;
         }
@@ -2736,7 +2750,7 @@ impl Screen<'_> {
         }
 
         // The worker owns the scroll and selection update as one operation.
-        let point = self.mouse_position(0);
+        let point = self.mouse_viewport_position();
         let side = self.mouse.square_side;
         self.context_manager
             .current_mut()
@@ -3819,7 +3833,7 @@ impl Screen<'_> {
 
     #[inline]
     pub fn mouse_report(&mut self, button: u8, state: ElementState) {
-        let pos = self.mouse_position(0);
+        let pos = self.mouse_viewport_position();
         let modifiers = wire_mouse_modifiers(self.modifiers.state());
         let mut terminal = self.ctx_mut().current_mut().terminal.lock();
         if button >= 32 {
@@ -3906,7 +3920,7 @@ impl Screen<'_> {
             (new_scroll_y_px * self.mouse.multiplier) / self.mouse.divider;
         let lines = (self.mouse.accumulated_scroll.y / height) as i32;
         if lines != 0 {
-            let point = self.mouse_position(0);
+            let point = self.mouse_viewport_position();
             self.context_manager
                 .current_mut()
                 .terminal
