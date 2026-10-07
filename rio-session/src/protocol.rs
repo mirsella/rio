@@ -830,23 +830,24 @@ pub enum SessionCommand {
         modifiers: u8,
     },
     SelectionBegin {
-        line: i32,
+        viewport_line: i32,
         column: usize,
         kind: SelectionKind,
         side: SelectionSide,
     },
     SelectionUpdate {
-        line: i32,
+        viewport_line: i32,
         column: usize,
         side: SelectionSide,
     },
     SelectionClear,
     SelectAll,
     /// Scroll and update the active selection endpoint while the worker owns
-    /// the terminal lock. `line` and `column` are viewport coordinates.
+    /// the terminal lock. Coordinates are relative to the viewport after the
+    /// scroll, so the endpoint keeps following the pointer.
     SelectionAutoScroll {
         delta_lines: i32,
-        line: i32,
+        viewport_line: i32,
         column: usize,
         side: SelectionSide,
     },
@@ -963,12 +964,12 @@ impl SessionCommand {
             Self::Scroll { delta_lines } => validate_scroll(*delta_lines)?,
             Self::SelectionAutoScroll {
                 delta_lines,
-                line,
+                viewport_line,
                 column,
                 ..
             } => {
                 validate_scroll(*delta_lines)?;
-                validate_position(*line, *column)?;
+                validate_position(*viewport_line, *column)?;
             }
             Self::ViScroll { delta_lines } => validate_scroll(*delta_lines)?,
             Self::ViGoto { line, column } => validate_position(*line, *column as usize)?,
@@ -998,9 +999,17 @@ impl SessionCommand {
                 }
                 validate_modifiers(*modifiers)?;
             }
-            Self::SelectionBegin { line, column, .. }
-            | Self::SelectionUpdate { line, column, .. } => {
-                validate_position(*line, *column)?;
+            Self::SelectionBegin {
+                viewport_line,
+                column,
+                ..
+            }
+            | Self::SelectionUpdate {
+                viewport_line,
+                column,
+                ..
+            } => {
+                validate_position(*viewport_line, *column)?;
             }
             Self::SelectionClear
             | Self::SelectAll

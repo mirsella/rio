@@ -1770,7 +1770,7 @@ impl RemoteView {
             rio_backend::crosswords::pos::Side::Right => WireSelectionSide::Right,
         };
         self.enqueue(SessionCommand::SelectionBegin {
-            line: point.row.0,
+            viewport_line: point.row.0,
             column: point.col.0,
             kind,
             side,
@@ -1787,7 +1787,7 @@ impl RemoteView {
             rio_backend::crosswords::pos::Side::Right => WireSelectionSide::Right,
         };
         self.enqueue(SessionCommand::SelectionUpdate {
-            line: point.row.0,
+            viewport_line: point.row.0,
             column: point.col.0,
             side,
         });
@@ -1805,7 +1805,7 @@ impl RemoteView {
         };
         self.enqueue(SessionCommand::SelectionAutoScroll {
             delta_lines,
-            line: point.row.0,
+            viewport_line: point.row.0,
             column: point.col.0,
             side,
         });
