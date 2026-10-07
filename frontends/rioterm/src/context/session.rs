@@ -1752,6 +1752,11 @@ impl RemoteView {
         });
     }
 
+    /// Wire `viewport_line` fields are viewport rows; `Pos` is terminal-absolute.
+    fn selection_wire_line(&self, point: Pos) -> i32 {
+        point.row.0 + self.grid.display_offset as i32
+    }
+
     pub fn selection_begin(
         &mut self,
         ty: rio_backend::selection::SelectionType,
@@ -1765,7 +1770,7 @@ impl RemoteView {
             rio_backend::selection::SelectionType::Lines => WireSelectionKind::Line,
         };
         self.enqueue(SessionCommand::SelectionBegin {
-            viewport_line: point.row.0,
+            viewport_line: self.selection_wire_line(point),
             column: point.col.0,
             kind,
             side: wire_side(side),
@@ -1778,7 +1783,7 @@ impl RemoteView {
         side: rio_backend::crosswords::pos::Side,
     ) {
         self.enqueue(SessionCommand::SelectionUpdate {
-            viewport_line: point.row.0,
+            viewport_line: self.selection_wire_line(point),
             column: point.col.0,
             side: wire_side(side),
         });
@@ -1792,7 +1797,7 @@ impl RemoteView {
     ) {
         self.enqueue(SessionCommand::SelectionAutoScroll {
             delta_lines,
-            viewport_line: point.row.0,
+            viewport_line: self.selection_wire_line(point),
             column: point.col.0,
             side: wire_side(side),
         });
@@ -2881,6 +2886,76 @@ mod tests {
                     panic!("unexpected selection command")
                 }
             }
+        }
+    }
+
+    #[test]
+    fn selection_commands_translate_absolute_rows_to_viewport_lines() {
+        let (handle, receiver) = selection_test_handle(5);
+        let mut view = RemoteView::new(Some(handle), WindowId::from(1), 80, 24);
+        view.grid.display_offset = 20;
+
+        // Absolute row -20 is the top visible row while scrolled 20 up,
+        // and -15 is five rows below it.
+        view.selection_begin(
+            rio_backend::selection::SelectionType::Simple,
+            Pos::new(Line(-20), Column(3)),
+            rio_backend::crosswords::pos::Side::Left,
+        );
+        view.selection_update(
+            Pos::new(Line(-15), Column(4)),
+            rio_backend::crosswords::pos::Side::Right,
+        );
+        view.selection_autoscroll(
+            -1,
+            Pos::new(Line(-20), Column(3)),
+            rio_backend::crosswords::pos::Side::Left,
+        );
+
+        for expected in [
+            SessionCommand::SelectionBegin {
+                viewport_line: 0,
+                column: 3,
+                kind: WireSelectionKind::Simple,
+                side: WireSelectionSide::Left,
+            },
+            SessionCommand::SelectionUpdate {
+                viewport_line: 5,
+                column: 4,
+                side: WireSelectionSide::Right,
+            },
+            SessionCommand::SelectionAutoScroll {
+                delta_lines: -1,
+                viewport_line: 0,
+                column: 3,
+                side: WireSelectionSide::Left,
+            },
+        ] {
+            match receiver.try_recv().unwrap() {
+                PumpCommand::Terminal(command) => assert_eq!(command, expected),
+                PumpCommand::SelectionText { .. } => {
+                    panic!("unexpected selection command")
+                }
+            }
+        }
+
+        view.grid.display_offset = 0;
+        view.selection_begin(
+            rio_backend::selection::SelectionType::Simple,
+            Pos::new(Line(2), Column(1)),
+            rio_backend::crosswords::pos::Side::Left,
+        );
+        match receiver.try_recv().unwrap() {
+            PumpCommand::Terminal(command) => assert_eq!(
+                command,
+                SessionCommand::SelectionBegin {
+                    viewport_line: 2,
+                    column: 1,
+                    kind: WireSelectionKind::Simple,
+                    side: WireSelectionSide::Left,
+                }
+            ),
+            PumpCommand::SelectionText { .. } => panic!("unexpected selection command"),
         }
     }
 
