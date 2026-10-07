@@ -764,11 +764,17 @@ mod unix {
                     self.validate_pointer(*column, *line)?;
                     Ok(None)
                 }
-                SessionCommand::SelectionBegin { line, column, .. } => {
-                    self.validate_selection(*line, *column).map(Some)
-                }
-                SessionCommand::SelectionUpdate { line, column, .. } => {
-                    let line = self.validate_selection(*line, *column)?;
+                SessionCommand::SelectionBegin {
+                    viewport_line,
+                    column,
+                    ..
+                } => self.validate_selection(*viewport_line, *column).map(Some),
+                SessionCommand::SelectionUpdate {
+                    viewport_line,
+                    column,
+                    ..
+                } => {
+                    let line = self.validate_selection(*viewport_line, *column)?;
                     Ok(Some(match self.selection_anchor {
                         Some(anchor) => {
                             crate::protocol::clamp_selection_span(line, anchor)
@@ -964,7 +970,7 @@ mod unix {
 
         fn validate_selection(
             &self,
-            line: i32,
+            viewport_line: i32,
             column: usize,
         ) -> Result<i32, SessionError> {
             let offset = i32::try_from(self.surface.display_offset()).map_err(|_| {
@@ -972,7 +978,7 @@ mod unix {
                     "selection display offset exceeds the supported range",
                 )
             })?;
-            let line = line.checked_sub(offset).ok_or_else(|| {
+            let line = viewport_line.checked_sub(offset).ok_or_else(|| {
                 SessionError::invalid("selection line is outside the terminal")
             })?;
             self.validate_internal_selection(line, column)?;
@@ -1102,7 +1108,7 @@ mod unix {
                     }
                 }
                 SessionCommand::SelectionBegin {
-                    line: viewport_line,
+                    viewport_line,
                     column,
                     kind,
                     side,
@@ -1121,12 +1127,19 @@ mod unix {
                     self.frame_pending = true;
                     SessionReply::Accepted
                 }
-                SessionCommand::SelectionUpdate { line, column, side } => {
+                SessionCommand::SelectionUpdate {
+                    viewport_line,
+                    column,
+                    side,
+                } => {
                     let internal_line = selection_line.ok_or_else(|| {
                         SessionError::protocol("selection coordinates were not validated")
                     })?;
-                    self.surface
-                        .selection_update(line, column, selection_side(side));
+                    self.surface.selection_update(
+                        viewport_line,
+                        column,
+                        selection_side(side),
+                    );
                     self.selection_endpoint = Some(internal_line);
                     self.frame_pending = true;
                     SessionReply::Accepted
@@ -1255,13 +1268,13 @@ mod unix {
                 }
                 SessionCommand::SelectionAutoScroll {
                     delta_lines,
-                    line,
+                    viewport_line,
                     column,
                     side,
                 } => {
                     let changed = self.surface.selection_autoscroll(
                         delta_lines,
-                        line,
+                        viewport_line,
                         column,
                         selection_side(side),
                     );
@@ -1278,7 +1291,7 @@ mod unix {
                                     "selection history exceeds the supported range",
                                 )
                             })?;
-                        let endpoint = line
+                        let endpoint = viewport_line
                             .checked_sub(display_offset)
                             .ok_or_else(|| {
                                 SessionError::invalid(
