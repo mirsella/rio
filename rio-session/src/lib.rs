@@ -926,13 +926,13 @@ impl SessionClient {
 
     pub fn selection_begin(
         &self,
-        line: i32,
+        viewport_line: i32,
         column: usize,
         kind: SelectionKind,
         side: SelectionSide,
     ) -> Result<(), SessionError> {
         self.accepted(SessionCommand::SelectionBegin {
-            line,
+            viewport_line,
             column,
             kind,
             side,
@@ -941,11 +941,15 @@ impl SessionClient {
 
     pub fn selection_update(
         &self,
-        line: i32,
+        viewport_line: i32,
         column: usize,
         side: SelectionSide,
     ) -> Result<(), SessionError> {
-        self.accepted(SessionCommand::SelectionUpdate { line, column, side })
+        self.accepted(SessionCommand::SelectionUpdate {
+            viewport_line,
+            column,
+            side,
+        })
     }
 
     pub fn selection_clear(&self) -> Result<(), SessionError> {
@@ -959,13 +963,13 @@ impl SessionClient {
     pub fn selection_autoscroll(
         &self,
         delta_lines: i32,
-        line: i32,
+        viewport_line: i32,
         column: usize,
         side: SelectionSide,
     ) -> Result<bool, SessionError> {
         self.changed(SessionCommand::SelectionAutoScroll {
             delta_lines,
-            line,
+            viewport_line,
             column,
             side,
         })
