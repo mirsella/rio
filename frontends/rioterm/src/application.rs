@@ -5708,11 +5708,8 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                             );
                         } else {
                             // Load mouse point, treating message bar and padding as the closest square.
-                            let display_offset = route.window.screen.display_offset();
-
                             if let MouseButton::Left = button {
-                                let pos =
-                                    route.window.screen.mouse_position(display_offset);
+                                let pos = route.window.screen.mouse_position();
                                 route.window.screen.on_left_click(pos);
                             }
 
@@ -6117,8 +6114,7 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     }
                 }
 
-                let display_offset = route.window.screen.display_offset();
-                let point = route.window.screen.mouse_position(display_offset);
+                let point = route.window.screen.mouse_position();
 
                 // Compare *cell* coordinates, not pixel coordinates, so
                 // subpixel HiDPI jitter inside the same cell doesn't
