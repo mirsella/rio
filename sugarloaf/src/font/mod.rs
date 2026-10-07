@@ -2661,8 +2661,9 @@ mod alias_tests {
 
             let handle = font.handle.as_ref().expect("CoreText handle");
             let glyphs = shape_text(handle, "M", 24.0);
-            let mask = rasterize_glyph(handle, glyphs[0].id, 24.0, false, false, false)
-                .expect("rasterized glyph");
+            let mask =
+                rasterize_glyph(handle, glyphs[0].id, 24.0, false, false, false, true)
+                    .expect("rasterized glyph");
             assert!(mask.bytes.iter().any(|&b| b != 0));
             masks.push((mask.width, mask.height, mask.bytes));
         }
