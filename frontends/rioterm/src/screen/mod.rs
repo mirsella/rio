@@ -2750,7 +2750,7 @@ impl Screen<'_> {
         }
 
         // The worker owns the scroll and selection update as one operation.
-        let point = self.mouse_viewport_position();
+        let point = self.mouse_position();
         let side = self.mouse.square_side;
         self.context_manager
             .current_mut()
