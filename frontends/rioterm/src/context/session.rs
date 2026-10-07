@@ -1765,15 +1765,11 @@ impl RemoteView {
             rio_backend::selection::SelectionType::Semantic => WireSelectionKind::Word,
             rio_backend::selection::SelectionType::Lines => WireSelectionKind::Line,
         };
-        let side = match side {
-            rio_backend::crosswords::pos::Side::Left => WireSelectionSide::Left,
-            rio_backend::crosswords::pos::Side::Right => WireSelectionSide::Right,
-        };
         self.enqueue(SessionCommand::SelectionBegin {
             viewport_line: point.row.0,
             column: point.col.0,
             kind,
-            side,
+            side: wire_side(side),
         });
     }
 
@@ -1782,14 +1778,10 @@ impl RemoteView {
         point: Pos,
         side: rio_backend::crosswords::pos::Side,
     ) {
-        let side = match side {
-            rio_backend::crosswords::pos::Side::Left => WireSelectionSide::Left,
-            rio_backend::crosswords::pos::Side::Right => WireSelectionSide::Right,
-        };
         self.enqueue(SessionCommand::SelectionUpdate {
             viewport_line: point.row.0,
             column: point.col.0,
-            side,
+            side: wire_side(side),
         });
     }
 
@@ -1799,15 +1791,11 @@ impl RemoteView {
         point: Pos,
         side: rio_backend::crosswords::pos::Side,
     ) {
-        let side = match side {
-            rio_backend::crosswords::pos::Side::Left => WireSelectionSide::Left,
-            rio_backend::crosswords::pos::Side::Right => WireSelectionSide::Right,
-        };
         self.enqueue(SessionCommand::SelectionAutoScroll {
             delta_lines,
             viewport_line: point.row.0,
             column: point.col.0,
-            side,
+            side: wire_side(side),
         });
     }
 
@@ -1919,10 +1907,7 @@ impl RemoteView {
                     WireSearchDirection::Backward
                 }
             },
-            side: match side {
-                rio_backend::crosswords::pos::Side::Left => WireSelectionSide::Left,
-                rio_backend::crosswords::pos::Side::Right => WireSelectionSide::Right,
-            },
+            side: wire_side(side),
             max_lines: max_lines.and_then(|lines| u32::try_from(lines).ok()),
         });
     }
@@ -2003,6 +1988,13 @@ fn cursor_shape(value: u8) -> CursorShape {
         2 => CursorShape::Beam,
         3 => CursorShape::Hidden,
         _ => CursorShape::Block,
+    }
+}
+
+fn wire_side(side: rio_backend::crosswords::pos::Side) -> WireSelectionSide {
+    match side {
+        rio_backend::crosswords::pos::Side::Left => WireSelectionSide::Left,
+        rio_backend::crosswords::pos::Side::Right => WireSelectionSide::Right,
     }
 }
 
