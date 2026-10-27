@@ -21,6 +21,7 @@ mod renderer;
 mod router;
 mod scheduler;
 mod screen;
+mod shell_integration;
 #[cfg(all(feature = "wayland", target_os = "linux"))]
 mod tab_drag;
 mod watcher;
