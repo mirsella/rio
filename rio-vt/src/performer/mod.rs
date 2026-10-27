@@ -468,7 +468,20 @@ where
                         let hung_up = false;
                         // HUP can accompany unread final output.
                         if event.readiness().is_readable() || hung_up {
-                            self.pty_read(state, buf)?;
+                            // Linux reports EIO when the slave hangs up. Wait for
+                            // the child event to preserve its actual exit status,
+                            // rather than reporting an unexpected reader failure.
+                            // On other platforms this could be `?`, but keep the
+                            // shared path explicit for the Linux exception.
+                            #[allow(clippy::question_mark)]
+                            match self.pty_read(state, buf) {
+                                #[cfg(target_os = "linux")]
+                                Err(err) if err.raw_os_error() == Some(libc::EIO) => {
+                                    continue;
+                                }
+                                Err(err) => return Err(err),
+                                Ok(_) => (),
+                            }
                         }
 
                         if !hung_up && event.readiness().is_writable() {
