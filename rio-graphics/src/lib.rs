@@ -328,12 +328,7 @@ impl GraphicData {
                 return false;
             };
 
-            if row
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .any(|pixel| pixel[3] != 255)
-            {
+            if row.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 255) {
                 return false;
             }
         }
