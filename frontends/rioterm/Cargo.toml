@@ -27,6 +27,7 @@ rio-grid = { workspace = true }
 rio-session = { path = "../../rio-session" }
 
 [dev-dependencies]
+tempfile = "3"
 pretty_assertions = "1.4.1"
 criterion = { workspace = true }
 

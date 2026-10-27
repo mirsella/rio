@@ -565,6 +565,7 @@ impl Screen<'_> {
             keyboard: config.keyboard.clone(),
             scrollback_history_limit: config.scrollback_history_limit,
             grapheme_clustering: config.grapheme_clustering,
+            shell_integration: config.shell_integration,
             cursor_shape: config.cursor.shape,
             cursor_blinking: config.cursor.blinking,
         };
@@ -1117,6 +1118,7 @@ impl Screen<'_> {
 
         // Update keyboard config in context manager
         self.context_manager.config.keyboard = config.keyboard.clone();
+        self.context_manager.config.shell_integration = config.shell_integration;
         // New tabs and splits derive their cursor from the manager config;
         // keep it in sync with the reloaded value.
         self.context_manager.config.cursor_shape = config.cursor.shape;

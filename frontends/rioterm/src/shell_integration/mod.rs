@@ -25,6 +25,7 @@
 //! points into its own directory, and deleting it would make zsh skip
 //! the user's entire configuration.
 
+use rio_session::protocol::{EnvVar, SessionSpec};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -33,47 +34,69 @@ const ZSH_INTEGRATION: &str = include_str!("rio-integration.zsh");
 const FISH_INTEGRATION: &str = include_str!("rio.fish");
 const POWERSHELL_INTEGRATION: &str = include_str!("rio.ps1");
 
-/// Everything shell integration wants applied to one spawn: extra
-/// environment, and for PowerShell a replacement `(program, args)`
-/// command (the program stays `None` when the shell was unconfigured,
-/// so platform default-shell handling such as macOS `login(1)` still
-/// wraps the spawn).
-#[derive(Default)]
-pub struct SpawnIntegration {
-    pub env: Vec<(String, String)>,
-    pub command: Option<(Option<String>, Vec<String>)>,
+/// Prepare a fresh worker's launch without changing process-global environment
+/// or the wire protocol. Never apply this to a recovered/transferred session.
+pub fn apply(spec: &mut SessionSpec) {
+    if let Some(dir) = integration_dir() {
+        apply_in(spec, dir);
+    }
 }
 
-/// Resolve the shell once and derive both integration halves from it.
-/// Empty when the scripts could not be written.
-pub fn prepare(shell_program: Option<&str>, args: &[String]) -> SpawnIntegration {
-    let program = resolved_shell(shell_program);
+fn apply_in(spec: &mut SessionSpec, dir: &Path) {
+    let program = resolved_shell(spec);
     let shell_name = shell_display_name(&program);
-    let Some(dir) = integration_dir() else {
-        return SpawnIntegration::default();
-    };
     let mut env = env_pairs(
         &shell_name,
         dir,
-        std::env::var("ZDOTDIR").ok(),
-        std::env::var("XDG_DATA_DIRS").ok(),
+        environment_value(spec, b"ZDOTDIR"),
+        environment_value(spec, b"XDG_DATA_DIRS"),
     );
     env.push((
         "RIO_SHELL_INTEGRATION".to_string(),
         dir.to_string_lossy().to_string(),
     ));
-    let command = powershell_command(&shell_name, shell_program, &program, args);
-    SpawnIntegration { env, command }
+    for (key, value) in env {
+        // SessionSpec rejects duplicate keys, including inherited hook variables.
+        spec.environment.retain(|env| env.key != key.as_bytes());
+        spec.environment.push(EnvVar::new(key, value));
+    }
+
+    if matches!(shell_name.as_str(), "powershell" | "pwsh") {
+        if spec.args.is_empty() {
+            // Keep an unnamed shell unnamed on Unix so macOS login(1) still
+            // wraps it. Windows needs an explicit program to preserve args.
+            #[cfg(target_os = "windows")]
+            {
+                spec.shell = Some(program);
+            }
+            spec.args = powershell_args();
+        } else {
+            tracing::info!(
+                "shell integration skipped: PowerShell spawn has configured args"
+            );
+        }
+    }
+}
+
+fn environment_value<'a>(spec: &'a SessionSpec, key: &[u8]) -> Option<&'a str> {
+    spec.environment
+        .iter()
+        .find(|env| env.key == key)
+        .map(|env| {
+            std::str::from_utf8(&env.value).expect("validated session environment")
+        })
 }
 
 /// The program the PTY will spawn: the configured one, else the same
 /// resolution the spawn itself performs (`$SHELL`, then the passwd
 /// entry, on unix; `powershell` on Windows).
-fn resolved_shell(shell_program: Option<&str>) -> String {
-    match shell_program {
+fn resolved_shell(spec: &SessionSpec) -> String {
+    match spec.shell.as_deref() {
         Some(program) if !program.is_empty() => program.to_string(),
         #[cfg(not(target_os = "windows"))]
-        _ => teletypewriter::default_shell_program(),
+        _ => environment_value(spec, b"SHELL")
+            .map(str::to_owned)
+            .unwrap_or_else(teletypewriter::default_shell_program),
         #[cfg(target_os = "windows")]
         _ => String::from("powershell"),
     }
@@ -84,9 +107,15 @@ fn resolved_shell(shell_program: Option<&str>) -> String {
 /// `.exe` dropped, so `C:\W\pwsh.exe` and `/usr/bin/pwsh` compare
 /// equal.
 fn shell_display_name(program: &str) -> String {
-    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    let name = name.to_ascii_lowercase();
-    name.strip_suffix(".exe").unwrap_or(&name).to_string()
+    let mut name = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    if name.ends_with(".exe") {
+        name.truncate(name.len() - 4);
+    }
+    name
 }
 
 /// The environment that makes `shell_name` load the scripts under
@@ -95,14 +124,14 @@ fn shell_display_name(program: &str) -> String {
 fn env_pairs(
     shell_name: &str,
     dir: &Path,
-    current_zdotdir: Option<String>,
-    current_xdg_data_dirs: Option<String>,
+    current_zdotdir: Option<&str>,
+    current_xdg_data_dirs: Option<&str>,
 ) -> Vec<(String, String)> {
     match shell_name {
         "zsh" => {
             let mut envs = Vec::new();
             if let Some(old) = current_zdotdir {
-                envs.push(("RIO_ZSH_ZDOTDIR".to_string(), old));
+                envs.push(("RIO_ZSH_ZDOTDIR".to_string(), old.to_owned()));
             }
             envs.push((
                 "ZDOTDIR".to_string(),
@@ -116,57 +145,23 @@ fn env_pairs(
             // so the script can RESTORE it after loading: without the
             // restore, every process the pane ever starts inherits the
             // rio-version-specific prepend.
-            let (restore, dirs) = match current_xdg_data_dirs {
-                Some(existing) if !existing.is_empty() => {
-                    let dirs = format!("{data_dir}:{existing}");
-                    (existing, dirs)
-                }
-                // The XDG spec default applies when the variable is
-                // unset; spell it out so prepending does not hide it.
-                _ => (
-                    String::new(),
-                    format!("{data_dir}:/usr/local/share:/usr/share"),
-                ),
+            let restore = current_xdg_data_dirs.unwrap_or_default();
+            // The XDG default applies to both unset and empty values.
+            let search_path = if restore.is_empty() {
+                "/usr/local/share:/usr/share"
+            } else {
+                restore
             };
             vec![
-                ("RIO_FISH_XDG_DATA_DIRS".to_string(), restore),
-                ("XDG_DATA_DIRS".to_string(), dirs),
+                ("RIO_FISH_XDG_DATA_DIRS".to_string(), restore.to_owned()),
+                (
+                    "XDG_DATA_DIRS".to_string(),
+                    format!("{data_dir}:{search_path}"),
+                ),
             ]
         }
         _ => Vec::new(),
     }
-}
-
-/// Rewrites a PowerShell spawn (powershell.exe or pwsh, any platform)
-/// so the shell loads rio's integration script AFTER the user's
-/// profile ran. Only a bare spawn is rewritten: configured args change
-/// what the command line means, so they win over integration. The
-/// returned program keeps an unconfigured shell unconfigured on unix,
-/// so the platform's default-shell handling (macOS `login(1)`) still
-/// wraps the spawn and only the args ride through it; Windows names
-/// the platform default explicitly because its PTY drops args when no
-/// program is given.
-fn powershell_command(
-    shell_name: &str,
-    configured_program: Option<&str>,
-    resolved_program: &str,
-    args: &[String],
-) -> Option<(Option<String>, Vec<String>)> {
-    if shell_name != "powershell" && shell_name != "pwsh" {
-        return None;
-    }
-    if !args.is_empty() {
-        tracing::info!("shell integration skipped: PowerShell spawn has configured args");
-        return None;
-    }
-    #[cfg(target_os = "windows")]
-    let program = Some(resolved_program.to_string());
-    #[cfg(not(target_os = "windows"))]
-    let program = {
-        let _ = resolved_program;
-        configured_program.map(str::to_string)
-    };
-    Some((program, powershell_args()))
 }
 
 /// `-NoExit -EncodedCommand <base64 of the UTF-16LE script>`: the
@@ -194,7 +189,11 @@ fn powershell_args() -> Vec<String> {
 fn integration_dir() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let base = dirs::cache_dir()?
+        let Some(cache) = dirs::cache_dir() else {
+            tracing::warn!("shell integration skipped: no user cache directory");
+            return None;
+        };
+        let base = cache
             .join("rio")
             .join(format!("shell-integration-{}", env!("CARGO_PKG_VERSION")));
         if let Err(err) = materialize(&base) {
@@ -240,6 +239,104 @@ mod test {
     use super::*;
 
     #[test]
+    fn launch_spec_replaces_hook_variables_and_preserves_user_environment() {
+        let dir = Path::new("/cache/rio/shell-integration-test");
+        for (shell, hook, original, restore, suffix) in [
+            ("zsh", "ZDOTDIR", "/user/zsh", "RIO_ZSH_ZDOTDIR", "zsh"),
+            (
+                "fish",
+                "XDG_DATA_DIRS",
+                "/user/data",
+                "RIO_FISH_XDG_DATA_DIRS",
+                "data",
+            ),
+        ] {
+            let mut spec = SessionSpec {
+                shell: Some(shell.into()),
+                args: vec!["-l".into()],
+                environment: vec![
+                    EnvVar::new("HOME", "/user"),
+                    EnvVar::new(hook, original),
+                    EnvVar::new(restore, "stale"),
+                    EnvVar::new("RIO_SHELL_INTEGRATION", "stale"),
+                ],
+                ..SessionSpec::default()
+            };
+            apply_in(&mut spec, dir);
+            spec.validate().unwrap();
+            assert_eq!(spec.shell.as_deref(), Some(shell));
+            assert_eq!(spec.args, ["-l"]);
+            assert_eq!(environment_value(&spec, b"HOME"), Some("/user"));
+            assert_eq!(environment_value(&spec, restore.as_bytes()), Some(original));
+            assert!(environment_value(&spec, hook.as_bytes())
+                .unwrap()
+                .starts_with(dir.join(suffix).to_str().unwrap()));
+            assert_eq!(
+                environment_value(&spec, b"RIO_SHELL_INTEGRATION"),
+                dir.to_str()
+            );
+        }
+    }
+
+    #[test]
+    fn launch_spec_rewrites_only_bare_powershell_commands() {
+        let dir = Path::new("/cache/rio/shell-integration-test");
+        for shell in ["pwsh", "powershell"] {
+            let mut bare = SessionSpec {
+                shell: Some(shell.into()),
+                ..SessionSpec::default()
+            };
+            apply_in(&mut bare, dir);
+            bare.validate().unwrap();
+            assert_eq!(bare.args, powershell_args());
+            assert_eq!(bare.shell.as_deref(), Some(shell));
+        }
+
+        for shell in ["pwsh", "powershell", "bash", "nu"] {
+            let mut spec = SessionSpec {
+                shell: Some(shell.into()),
+                args: vec!["-c".into(), "echo custom".into()],
+                ..SessionSpec::default()
+            };
+            let args = spec.args.clone();
+            apply_in(&mut spec, dir);
+            spec.validate().unwrap();
+            assert_eq!(spec.args, args);
+            assert_eq!(spec.shell.as_deref(), Some(shell));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_spec_uses_captured_default_shell_without_naming_the_command() {
+        let mut spec = SessionSpec {
+            environment: vec![EnvVar::new("SHELL", "/usr/bin/fish")],
+            ..SessionSpec::default()
+        };
+        apply_in(&mut spec, Path::new("/cache/rio/integration"));
+        spec.validate().unwrap();
+        assert_eq!(spec.shell, None);
+        assert!(spec.args.is_empty());
+        assert_eq!(
+            environment_value(&spec, b"XDG_DATA_DIRS"),
+            Some("/cache/rio/integration/data:/usr/local/share:/usr/share")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_spec_keeps_default_powershell_unnamed() {
+        let mut spec = SessionSpec {
+            environment: vec![EnvVar::new("SHELL", "/usr/bin/pwsh")],
+            ..SessionSpec::default()
+        };
+        apply_in(&mut spec, Path::new("/cache/rio/integration"));
+        spec.validate().unwrap();
+        assert_eq!(spec.shell, None);
+        assert_eq!(spec.args, powershell_args());
+    }
+
+    #[test]
     fn env_pairs_per_shell() {
         let dir = Path::new("/cache/rio/shell-integration-1.0.0");
         // The join separator differs per platform; compare against the
@@ -251,7 +348,7 @@ mod test {
         assert_eq!(zsh, vec![("ZDOTDIR".to_string(), zsh_dir.clone())]);
 
         // A user ZDOTDIR is preserved for the .zshenv chain to restore.
-        let zsh = env_pairs("zsh", dir, Some("/home/u/.config/zsh".into()), None);
+        let zsh = env_pairs("zsh", dir, Some("/home/u/.config/zsh"), None);
         assert_eq!(
             zsh[0],
             (
@@ -262,7 +359,7 @@ mod test {
         assert_eq!(zsh[1], ("ZDOTDIR".to_string(), zsh_dir));
 
         // A user XDG_DATA_DIRS is preserved for rio.fish to restore.
-        let fish = env_pairs("fish", dir, None, Some("/usr/share".into()));
+        let fish = env_pairs("fish", dir, None, Some("/usr/share"));
         assert_eq!(
             fish,
             vec![
@@ -285,6 +382,7 @@ mod test {
             ("RIO_FISH_XDG_DATA_DIRS".to_string(), String::new())
         );
         assert!(fish[1].1.ends_with(":/usr/local/share:/usr/share"));
+        assert_eq!(env_pairs("fish", dir, None, Some("")), fish);
 
         // Shells without an environment-only hook are untouched.
         assert!(env_pairs("bash", dir, None, None).is_empty());
@@ -331,102 +429,11 @@ mod test {
     }
 
     #[test]
-    fn powershell_command_scope() {
-        // Configured args always win over integration.
-        assert!(
-            powershell_command("pwsh", Some("pwsh"), "pwsh", &["-NoLogo".into()])
-                .is_none()
-        );
-        // Non-PowerShell shells are untouched.
-        assert!(powershell_command("zsh", Some("zsh"), "zsh", &[]).is_none());
-
-        let (program, args) =
-            powershell_command("pwsh", Some("pwsh"), "pwsh", &[]).unwrap();
-        assert_eq!(program.as_deref(), Some("pwsh"));
-        assert_eq!(args[1], "-EncodedCommand");
-    }
-
-    /// Runs a real zsh against the materialized scripts: the pane
-    /// setup (ZDOTDIR redirect plus preserved user ZDOTDIR) must end
-    /// with the integration loaded and one cwd report emitted. Skips
-    /// silently where zsh is not installed.
-    #[cfg(unix)]
-    #[test]
-    fn zsh_integration_emits_a_cwd_report() {
-        let base =
-            std::env::temp_dir().join(format!("rio-si-zsh-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        materialize(&base).unwrap();
-        // An empty restored ZDOTDIR keeps the developer's own zsh
-        // config out of the test.
-        let user_zdotdir = base.join("empty-user-config");
-        std::fs::create_dir_all(&user_zdotdir).unwrap();
-
-        let Ok(output) = std::process::Command::new("zsh")
-            .args(["-ic", ":"])
-            .env("ZDOTDIR", base.join("zsh"))
-            .env("RIO_ZSH_ZDOTDIR", &user_zdotdir)
-            .output()
-        else {
-            return;
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("\x1b]7;kitty-shell-cwd://"),
-            "no OSC 7 in zsh output; stdout: {stdout:?}, stderr: {:?}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// Same, for fish, via its `vendor_conf.d` loading from
-    /// `XDG_DATA_DIRS`, which the script must then RESTORE so the
-    /// prepend never leaks to child processes. Skips silently where
-    /// fish is not installed (no CI runner ships it today, so this
-    /// mainly guards local changes to the fish script).
-    #[cfg(unix)]
-    #[test]
-    fn fish_integration_emits_a_cwd_report_and_restores_env() {
-        let base =
-            std::env::temp_dir().join(format!("rio-si-fish-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        materialize(&base).unwrap();
-        // An empty config home keeps the developer's own fish config
-        // out of the test.
-        let config_home = base.join("empty-config-home");
-        std::fs::create_dir_all(&config_home).unwrap();
-
-        let Ok(output) = std::process::Command::new("fish")
-            .args(["-ic", "echo RIO_XDG=$XDG_DATA_DIRS"])
-            .env("XDG_DATA_DIRS", base.join("data"))
-            .env("RIO_FISH_XDG_DATA_DIRS", "/usr/share")
-            .env("XDG_CONFIG_HOME", &config_home)
-            .output()
-        else {
-            return;
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            stdout.contains("\x1b]7;kitty-shell-cwd://"),
-            "no OSC 7 in fish output; stdout: {stdout:?}, stderr: {:?}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            stdout.contains("RIO_XDG=/usr/share"),
-            "XDG_DATA_DIRS not restored; stdout: {stdout:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
     fn materialize_writes_scripts_idempotently() {
-        let base = std::env::temp_dir()
-            .join(format!("rio-shell-integration-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path();
 
-        materialize(&base).unwrap();
+        materialize(base).unwrap();
         let zshenv = base.join("zsh").join(".zshenv");
         let fish = base
             .join("data")
@@ -439,9 +446,7 @@ mod test {
         assert!(base.join("powershell").join("rio.ps1").exists());
 
         // A second run over existing content is a no-op, not an error.
-        materialize(&base).unwrap();
+        materialize(base).unwrap();
         assert_eq!(std::fs::read_to_string(&zshenv).unwrap(), ZSH_ZSHENV);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

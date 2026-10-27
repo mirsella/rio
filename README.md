@@ -33,6 +33,15 @@ the session worker remains the PTY/parser owner and can be recovered while its
 retention period lasts. Windows is currently explicitly unsupported by this
 runtime; there is no in-process fallback.
 
+Fresh sessions automatically load Rio's shell integration for zsh and fish,
+including working-directory reports after `cd`. Rio passes the hook environment
+to the session worker and preserves the shell's user configuration. Bare
+PowerShell launches load the embedded integration; launches with configured
+PowerShell arguments keep those arguments unchanged. Bash has no automatic hook.
+Set the top-level `shell-integration = false` in `config.toml` to disable this
+for new sessions. Reloading the config affects subsequent launches, while
+transferred and recovered sessions keep their existing shell and hooks.
+
 On Linux, open the command palette with `Ctrl+Shift+P`:
 
 - **Merge Tab** immediately arms authenticated live Rio windows for pointer

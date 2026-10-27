@@ -137,6 +137,7 @@ pub struct ContextManagerConfig {
     #[cfg(test)]
     pub dead_pty: bool,
     pub shell: Shell,
+    pub shell_integration: bool,
     pub working_dir: Option<String>,
     pub cwd: bool,
     pub is_native: bool,
@@ -508,6 +509,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         let mut spec = rio_session::SessionSpec::from_current_environment()?;
         spec.shell = config.shell.program.clone();
         spec.args = config.shell.args.clone();
+        if config.shell_integration {
+            // The worker clears its inherited environment. Send integration in
+            // the launch spec, not the GUI's or worker's process environment.
+            crate::shell_integration::apply(&mut spec);
+        }
         // Single choke point: every entry path (first window, new tab,
         // split, cross-window transfer) funnels through here, so a stale
         // directory degrades to a fallback with a warning instead of a
@@ -1735,6 +1741,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             keyboard: config.keyboard,
             scrollback_history_limit: config.scrollback_history_limit,
             grapheme_clustering: config.grapheme_clustering,
+            shell_integration: config.shell_integration,
             cursor_shape: config.cursor.shape,
             cursor_blinking: config.cursor.blinking,
         };
