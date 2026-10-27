@@ -41,8 +41,9 @@ fn wait_for_frame(client: &SessionClient, predicate: impl Fn(&FullFrame) -> bool
             }
             assert!(
                 Instant::now() < deadline,
-                "shell integration timed out: cwd={:?}, rows={:?}",
+                "shell integration timed out: cwd={:?}, title={:?}, rows={:?}",
                 frame.working_dir,
+                frame.title,
                 frame
                     .rows
                     .iter()
@@ -95,7 +96,6 @@ fn worker_reports_cwd(shell: &str) {
         ..SessionSpec::default()
     };
     shell_integration::apply(&mut spec);
-    spec.validate().unwrap();
     let integration_directory = String::from_utf8(
         spec.environment
             .iter()
@@ -155,4 +155,87 @@ fn zsh_worker_reports_cwd_and_restores_environment() {
 #[test]
 fn fish_worker_reports_cwd_and_restores_environment() {
     worker_reports_cwd("fish");
+}
+
+#[test]
+fn nushell_worker_reports_native_cwd_and_title() {
+    match std::process::Command::new("nu").arg("--version").output() {
+        Ok(output) => assert!(output.status.success()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping worker integration: nu is not installed");
+            return;
+        }
+        Err(error) => panic!("cannot run nu: {error}"),
+    }
+
+    // Nushell supplies its own integration. Rio's setting must not be required
+    // or change Nushell's command; keep its native OSC settings at their defaults.
+    for automatic_integration in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().canonicalize().unwrap();
+        let destination_name = "directory with spaces café";
+        let destination = home.join(destination_name);
+        std::fs::create_dir(&destination).unwrap();
+        let mut spec = SessionSpec {
+            shell: Some("nu".into()),
+            args: vec![
+                "--no-config-file".into(),
+                "--no-history".into(),
+                "--execute".into(),
+                "$env.PROMPT_COMMAND = {|| 'RIO_TEST_READY> ' }; \
+                 $env.PROMPT_COMMAND_RIGHT = {|| '' }; \
+                 $env.PROMPT_INDICATOR = ''; \
+                 $env.config.show_banner = false"
+                    .into(),
+            ],
+            working_dir: Some(home.to_str().unwrap().into()),
+            columns: 240,
+            pixel_width: 2160,
+            environment: vec![
+                EnvVar::new("HOME", home.to_str().unwrap()),
+                EnvVar::new("SHELL", "nu"),
+                EnvVar::new("XDG_CONFIG_HOME", home.to_str().unwrap()),
+                EnvVar::new("PATH", std::env::var("PATH").unwrap()),
+                EnvVar::new("TERM", "xterm-256color"),
+                EnvVar::new("TERM_PROGRAM", "rio"),
+            ],
+            ..SessionSpec::default()
+        };
+        let args = spec.args.clone();
+        if automatic_integration {
+            shell_integration::apply(&mut spec);
+        }
+        assert_eq!(spec.shell.as_deref(), Some("nu"));
+        assert_eq!(spec.args, args);
+        let session = Session(
+            SessionClient::spawn_with_worker_path(spec, env!("CARGO_BIN_EXE_rio"))
+                .unwrap(),
+        );
+        wait_for_frame(&session.0, |frame| {
+            frame.working_dir.as_deref() == home.to_str()
+                && frame
+                    .rows
+                    .iter()
+                    .any(|row| row.text.contains("RIO_TEST_READY>"))
+        });
+        session
+            .0
+            .write(format!("cd '{destination_name}'\n").into_bytes())
+            .unwrap();
+        wait_for_frame(&session.0, |frame| {
+            frame.working_dir.as_deref() == destination.to_str()
+                && frame.title.contains(destination_name)
+        });
+        session
+            .0
+            .write(b"print ('RIO_' + 'NUSHELL_OK')\n".to_vec())
+            .unwrap();
+        wait_for_frame(&session.0, |frame| {
+            frame.rows.iter().any(|row| row.text == "RIO_NUSHELL_OK")
+        });
+        session.0.write(b"cd ..\n".to_vec()).unwrap();
+        wait_for_frame(&session.0, |frame| {
+            frame.working_dir.as_deref() == home.to_str()
+        });
+    }
 }
