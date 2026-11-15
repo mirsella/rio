@@ -122,6 +122,13 @@ overhead. It is not actual keystroke latency, frame/present latency, or a
 throughput measurement. PTY bytes are workload accounting only; do not infer
 instantaneous behavior or performance dominance from one bounded run.
 
+To follow upstream, run `scripts/sync-upstream.sh`. It saves the current tip
+as a `backup/` branch, turns on rerere, and rebases onto `upstream/main`. Fork
+commits are not individually buildable, so verify only the final tree. Upstream
+code that drives a terminal inside the GUI process must be ported to the
+session worker (`librio::Surface` through a `SessionCommand`), as was done for
+`--hold`.
+
 A separate saved private KWin/Xvfb run recorded native Wayland DnD with an
 opaque 16-byte payload and a fresh destination shell ACK
 (`~/dev/rio-agent-artifacts/native-foreign-dnd-results.md`). The historical
