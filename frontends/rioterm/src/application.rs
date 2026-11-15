@@ -5616,7 +5616,9 @@ impl ApplicationHandler<EventPayload> for Application<'_> {
                     island.cancel_drag();
                 }
                 route.window.screen.renderer.scrollbar.end_drag();
-                route.window.screen.resize_state = None;
+                if route.window.screen.context_manager.end_border_drag() {
+                    route.window.winit_window.set_cursor(CursorIcon::Default);
+                }
             }
             return;
         }

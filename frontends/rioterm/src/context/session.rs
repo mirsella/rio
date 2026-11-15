@@ -1223,6 +1223,14 @@ pub struct RemoteView {
     search_navigation: Option<SearchNavigation>,
     search_matches: Option<Vec<SearchMatch>>,
     decode_error: Option<String>,
+    /// Test tap: every winsize `resize_to` asks the worker for. Mock
+    /// contexts have no session, so this is how tests see the requests.
+    #[cfg(test)]
+    pub resize_tap: Option<Arc<std::sync::Mutex<Vec<rio_backend::event::WindowSize>>>>,
+    /// Test record of the last winsize asked for, the grid the worker
+    /// will lay its terminal out to.
+    #[cfg(test)]
+    pub last_resize: Option<rio_backend::event::WindowSize>,
 }
 
 impl std::fmt::Debug for RemoteView {
@@ -1325,6 +1333,10 @@ impl RemoteView {
             search_navigation: None,
             search_matches: None,
             decode_error: None,
+            #[cfg(test)]
+            resize_tap: None,
+            #[cfg(test)]
+            last_resize: None,
         }
     }
 
@@ -1674,6 +1686,13 @@ impl RemoteView {
     }
 
     pub fn resize_to(&mut self, size: rio_backend::event::WindowSize) {
+        #[cfg(test)]
+        {
+            self.last_resize = Some(size);
+            if let Some(tap) = &self.resize_tap {
+                tap.lock().unwrap().push(size);
+            }
+        }
         self.enqueue(SessionCommand::Resize {
             columns: size.cols,
             lines: size.rows,

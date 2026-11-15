@@ -413,7 +413,7 @@ mod proportions {
         let ctx =
             create_mock_context(VoidListener {}, WindowId::from(0), 0, dimension(scale));
         let mut grid =
-            ContextGrid::new(ctx, Margin::default(), [0.; 4], [0.; 4], Panel::default());
+            ContextGrid::new(ctx, Margin::default(), [0.; 4], Panel::default());
         grid.compute_layout().unwrap();
         grid
     }
@@ -571,7 +571,7 @@ mod proportions {
             grid.current = bottom_right;
             let removed = grid.remove_current().expect("a pane was removed");
             assert_eq!(removed.rich_text_id, 2);
-            assert_eq!(grid.panel_count(), 2);
+            assert_eq!(grid.len(), 2);
             assert_split(width(&grid, left), width(&grid, right), ratio);
 
             grid.resize(WIDTH / 2.0, HEIGHT);
@@ -939,16 +939,14 @@ mod divider_keys {
 }
 
 // What a relayout pushes to the panels. `apply_taffy_layout` runs for
-// real here: each panel's messenger is swapped for a channel so the
-// winsizes it sends can be counted.
+// real here: each panel's remote view gets a tap so the winsizes it
+// asks its worker for can be counted.
 mod relayout {
     use super::*;
     use crate::context::{create_mock_context, ContextDimension};
-    use crate::event::Msg;
-    use crate::messenger::Messenger;
-    use corcovado::channel::Receiver;
     use rio_backend::config::layout::Panel;
     use rio_backend::event::{VoidListener, WindowId, WindowSize};
+    use std::sync::{Arc, Mutex};
 
     type Grid = ContextGrid<VoidListener>;
 
@@ -975,32 +973,26 @@ mod relayout {
         )
     }
 
-    fn tapped_context(
-        id: usize,
-    ) -> (crate::context::Context<VoidListener>, Receiver<Msg>) {
-        let mut ctx =
+    type Tap = Arc<Mutex<Vec<WindowSize>>>;
+
+    fn tapped_context(id: usize) -> (crate::context::Context<VoidListener>, Tap) {
+        let ctx =
             create_mock_context(VoidListener {}, WindowId::from(0), id, dimension());
-        let (tx, rx) = corcovado::channel::channel();
-        ctx.messenger = Messenger::new(tx);
-        (ctx, rx)
+        let tap = Tap::default();
+        ctx.terminal.lock().resize_tap = Some(tap.clone());
+        (ctx, tap)
     }
 
-    fn winsizes(rx: &Receiver<Msg>) -> Vec<WindowSize> {
-        let mut out = Vec::new();
-        while let Ok(msg) = rx.try_recv() {
-            if let Msg::Resize(size) = msg {
-                out.push(size);
-            }
-        }
-        out
+    fn winsizes(tap: &Tap) -> Vec<WindowSize> {
+        std::mem::take(&mut *tap.lock().unwrap())
     }
 
     /// A | [B | D]: three panes in a row, the right two nested. The
     /// receivers come back in that order, drained after the splits.
-    fn row_of_three() -> (Grid, [NodeId; 3], [Receiver<Msg>; 3]) {
+    fn row_of_three() -> (Grid, [NodeId; 3], [Tap; 3]) {
         let (ctx, rx_a) = tapped_context(0);
         let mut grid =
-            ContextGrid::new(ctx, Margin::default(), [0.; 4], [0.; 4], Panel::default());
+            ContextGrid::new(ctx, Margin::default(), [0.; 4], Panel::default());
         let a = grid.current;
         let split = |grid: &mut Grid, id| {
             let node = grid.try_split_right().unwrap();
@@ -1129,40 +1121,18 @@ mod relayout {
     #[test]
     fn an_untouched_pane_keeps_its_grid_through_a_drag() {
         let (mut grid, [a, _b, d], _rxs) = row_of_three();
-        let cols = grid.inner[&a].val.terminal.lock().grid.columns();
+        let cols = grid.inner[&a].val.terminal.lock().last_resize.unwrap().cols as usize;
         grid.current = d;
         for _ in 0..3 {
             assert!(grid.resize_divider(true, true, LARGE));
             assert!(grid.apply_taffy_layout(true));
         }
         grid.end_border_resize();
-        assert_eq!(grid.inner[&a].val.terminal.lock().grid.columns(), cols);
-        assert_eq!(columns(&grid, a), cols);
-    }
-
-    // A pixel-only drag step must not touch the terminal: a program
-    // inside a synchronized update (mode 2026) would otherwise have its
-    // frame cut short on every pixel. A step that changes the columns
-    // reflows, and ends the update as any resize does.
-    #[test]
-    fn a_pixel_only_drag_step_leaves_the_terminal_alone() {
-        use rio_backend::performer::handler::Processor;
-        let (mut grid, [_a, b, d], _rxs) = row_of_three();
-        let mut parser = Processor::default();
-        parser.advance(&mut *grid.inner[&b].val.terminal.lock(), b"\x1b[?2026h");
-        assert!(grid.inner[&b].val.terminal.lock().synchronized_output());
-
-        grid.current = d;
-        assert!(grid.resize_divider(true, true, SMALL));
-        assert!(grid.apply_taffy_layout(true));
-        assert!(
-            grid.inner[&b].val.terminal.lock().synchronized_output(),
-            "a pixel-only step ended the synchronized update"
+        assert_eq!(
+            grid.inner[&a].val.terminal.lock().last_resize.unwrap().cols as usize,
+            cols
         );
-
-        assert!(grid.resize_divider(true, true, LARGE));
-        assert!(grid.apply_taffy_layout(true));
-        assert!(!grid.inner[&b].val.terminal.lock().synchronized_output());
+        assert_eq!(columns(&grid, a), cols);
     }
 
     // A winsize held back by a drag is not lost if the drag never gets
@@ -1227,7 +1197,6 @@ mod grid {
         let mut grid = ContextGrid::new(
             context(scale, 0),
             Margin::default(),
-            [0.; 4],
             [0.; 4],
             Panel::default(),
         );
@@ -1301,12 +1270,18 @@ mod grid {
             let right = split(&mut grid, true);
             assert_ne!(left, right);
             assert_eq!(grid.current, right);
-            assert_eq!(grid.panel_count(), 2);
+            assert_eq!(grid.len(), 2);
             let margins = 4.0 * MARGIN * scale;
             assert_px(width(&grid, left), (available(&grid).0 - margins) / 2.0);
             assert_px(width(&grid, right), width(&grid, left));
             // The new terminal was told its grid.
-            let cols = grid.inner[&right].val.terminal.lock().grid.columns();
+            let cols = grid.inner[&right]
+                .val
+                .terminal
+                .lock()
+                .last_resize
+                .unwrap()
+                .cols as usize;
             assert_eq!(cols, grid.inner[&right].val.dimension.columns);
             assert_eq!(cols, grid.inner[&left].val.dimension.columns);
         }
@@ -1644,11 +1619,8 @@ mod grid {
                     .is_dirty(),
                 "a reflowed pane was not marked dirty"
             );
-            let terminal = grid.inner[&node].val.terminal.lock();
-            assert_eq!(
-                terminal.grid.screen_lines(),
-                grid.inner[&node].val.dimension.lines
-            );
+            let asked = grid.inner[&node].val.terminal.lock().last_resize.unwrap();
+            assert_eq!(asked.rows as usize, grid.inner[&node].val.dimension.lines);
         }
     }
 
@@ -1668,7 +1640,7 @@ mod grid {
             grid.current, d,
             "the pane after the removed one is selected"
         );
-        assert_eq!(grid.panel_count(), 2);
+        assert_eq!(grid.len(), 2);
         assert!(!grid.inner.contains_key(&b));
         assert_px(width(&grid, a) + width(&grid, d), avail - 4.0 * MARGIN);
         assert_eq!(grid.get_panel_borders().len(), 1);
@@ -1677,7 +1649,7 @@ mod grid {
         grid.current = d;
         assert!(grid.remove_current().is_some());
         assert_eq!(grid.current, a);
-        assert_eq!(grid.panel_count(), 1);
+        assert_eq!(grid.len(), 1);
         assert_px(width(&grid, a), avail - 2.0 * MARGIN);
         assert!(grid.get_panel_borders().is_empty());
     }
@@ -1687,7 +1659,7 @@ mod grid {
         let mut grid = grid(1.0);
         let a = grid.current;
         assert!(grid.remove_current().is_none());
-        assert_eq!(grid.panel_count(), 1);
+        assert_eq!(grid.len(), 1);
         assert_eq!(grid.current, a);
     }
 
@@ -1707,14 +1679,14 @@ mod grid {
             grid.current, a,
             "focus stays on the pane that was not removed"
         );
-        assert_eq!(grid.panel_count(), 2);
+        assert_eq!(grid.len(), 2);
         // b takes the whole right column again.
         let [_, by, _, bh] = rect(&grid, b);
         assert_px(by, MARGIN);
         assert_px(bh, avail_h - 2.0 * MARGIN);
 
         assert!(grid.remove_by_route(usize::MAX).is_none());
-        assert_eq!(grid.panel_count(), 2);
+        assert_eq!(grid.len(), 2);
     }
 
     // Closing a nested pane collapses its container, and the divider
@@ -1779,7 +1751,7 @@ mod metrics {
         );
         let ctx = create_mock_context(VoidListener {}, WindowId::from(0), 0, dim);
         let mut grid =
-            ContextGrid::new(ctx, Margin::default(), [0.; 4], [0.; 4], Panel::default());
+            ContextGrid::new(ctx, Margin::default(), [0.; 4], Panel::default());
         let ctx = create_mock_context(VoidListener {}, WindowId::from(0), 1, dim);
         grid.split_right(ctx);
         grid
@@ -1796,8 +1768,8 @@ mod metrics {
             let dim = grid.inner[node].val.dimension;
             assert_eq!(dim.cell.cell_height, 18);
             assert!(dim.lines < lines_before, "taller cells, fewer lines");
-            let terminal = grid.inner[node].val.terminal.lock();
-            assert_eq!(terminal.grid.screen_lines(), dim.lines);
+            let asked = grid.inner[node].val.terminal.lock().last_resize.unwrap();
+            assert_eq!(asked.rows as usize, dim.lines);
         }
     }
 

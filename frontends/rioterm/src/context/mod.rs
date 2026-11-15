@@ -179,7 +179,7 @@ const DEFAULT_CONTEXT_CAPACITY: usize = 28;
 /// started.
 #[derive(Debug, Clone, Copy)]
 struct BorderDrag {
-    grid: u64,
+    grid: TabId,
     shape: u64,
     state: ResizeState,
 }
@@ -759,6 +759,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             bootstrap_transfer: None,
             window_focused: false,
             focused_route: None,
+            border_drag: None,
         }
     }
 
@@ -784,7 +785,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
         let was_current = index_to_remove == self.current_index;
         if self.contexts[index_to_remove].len() > 1 {
-            if let Some(removed) = self.contexts[index_to_remove].remove_by_route(route_id) {
+            if let Some(removed) =
+                self.contexts[index_to_remove].remove_by_route(route_id)
+            {
                 removed.release(sugarloaf);
             }
             // The sibling taking over a focused tab is now the displayed pane.
@@ -871,7 +874,10 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     }
 
     #[inline]
-    pub fn close_unfocused_tabs(&mut self, sugarloaf: &mut impl PanelImages) -> Vec<usize> {
+    pub fn close_unfocused_tabs(
+        &mut self,
+        sugarloaf: &mut impl PanelImages,
+    ) -> Vec<usize> {
         let current_route_id = self.current().route_id;
         let removed = self
             .contexts
@@ -1110,10 +1116,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
-    fn tab_index_for_grid(&self, id: u64) -> Option<usize> {
-        self.contexts.iter().position(|grid| grid.id() == id)
-    }
-
     /// Start a divider drag if a border of the current grid is under
     /// the pointer. Returns the divider's direction, for the cursor.
     pub fn begin_border_drag(&mut self, x: f32, y: f32) -> Option<BorderDirection> {
@@ -1153,7 +1155,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             BorderDirection::Vertical => x,
             BorderDirection::Horizontal => y,
         };
-        let Some(tab) = self.tab_index_for_grid(drag.grid) else {
+        let Some(tab) = self.tab_index(drag.grid) else {
             return Some(DragStep {
                 direction,
                 visible: false,
@@ -1179,7 +1181,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         let Some(drag) = self.border_drag.take() else {
             return false;
         };
-        match self.tab_index_for_grid(drag.grid) {
+        match self.tab_index(drag.grid) {
             Some(tab) => self.contexts[tab].end_border_resize(),
             None => {
                 for context_grid in self.contexts.iter_mut() {
@@ -1667,7 +1669,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     pub fn remove_transferred_routes(
         &mut self,
         route_ids: &[usize],
-        sugarloaf: &mut Sugarloaf,
+        sugarloaf: &mut impl PanelImages,
     ) {
         self.release_focus(route_ids);
         self.disarm_routes_for_transfer(route_ids);
@@ -1678,8 +1680,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             if self.contexts[index].len() == 1 {
                 self.contexts.remove(index);
                 self.update_selection_after_grid_removal(index);
-            } else {
-                self.contexts[index].remove_by_route(*route_id, sugarloaf);
+            } else if let Some(removed) = self.contexts[index].remove_by_route(*route_id)
+            {
+                removed.release(sugarloaf);
             }
         }
         self.sync_current_route();
@@ -2063,7 +2066,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     /// Switch visibility between two contexts (hide old, show new)
     #[inline]
-    pub fn clear_context_overlays(&self, sugarloaf: &mut impl PanelImages, old_index: usize) {
+    pub fn clear_context_overlays(
+        &self,
+        sugarloaf: &mut impl PanelImages,
+        old_index: usize,
+    ) {
         if let Some(old_context) = self.contexts.get(old_index) {
             old_context.clear_image_overlays(sugarloaf);
         }
@@ -3145,7 +3152,9 @@ mod sugarloaf_free {
         let mut cm =
             ContextManager::start_with_capacity(5, VoidListener {}, WindowId::from(0))
                 .unwrap();
-        cm.resize_all_grids(1200.0, 800.0);
+        for grid in cm.contexts_mut() {
+            grid.resize(1200.0, 800.0);
+        }
         cm
     }
 
@@ -3158,7 +3167,7 @@ mod sugarloaf_free {
     fn closing_a_split_releases_only_that_pane() {
         let mut cm = manager();
         cm.split(7, false);
-        assert_eq!(cm.current_grid_len(), 2);
+        assert_eq!(cm.current_grid().len(), 2);
         let route = cm.current().route_id;
         let kept = cm
             .current_grid()
@@ -3172,7 +3181,7 @@ mod sugarloaf_free {
         cm.remove_current_grid(&mut images);
         assert_eq!(images.cleared, vec![7]);
         assert_eq!(images.removed_routes, vec![route]);
-        assert_eq!(cm.current_grid_len(), 1);
+        assert_eq!(cm.current_grid().len(), 1);
         assert_eq!(cm.current().route_id, kept);
     }
 
@@ -3285,11 +3294,7 @@ mod sugarloaf_free {
         );
         let (l, _) = widths(&cm, 0);
         assert!((l - (lw + 150.0)).abs() <= 1.0, "left {l} from {lw}");
-        assert_eq!(
-            cm.contexts[1].panel_count(),
-            1,
-            "the new tab was not touched"
-        );
+        assert_eq!(cm.contexts[1].len(), 1, "the new tab was not touched");
 
         assert!(cm.end_border_drag(), "a drag was in progress");
         assert!(!cm.end_border_drag(), "and now it is not");
@@ -3318,11 +3323,7 @@ mod sugarloaf_free {
         let mut images = Images::default();
         cm.close_current_context(&mut images);
         assert_eq!(cm.len(), 1);
-        assert_eq!(
-            cm.contexts[0].panel_count(),
-            2,
-            "the split tab is now tab 0"
-        );
+        assert_eq!(cm.contexts[0].len(), 2, "the split tab is now tab 0");
 
         assert_eq!(cm.drag_border_to(x + 120.0, y), VERTICAL);
         let (l, _) = widths(&cm, 0);
@@ -3339,7 +3340,7 @@ mod sugarloaf_free {
         let mut cm = manager();
         cm.split(1, false);
         cm.split(2, true);
-        assert_eq!(cm.current_grid_len(), 3);
+        assert_eq!(cm.current_grid().len(), 3);
         let (x, y, _, _) = separator(&cm, 0);
         let rects = |cm: &ContextManager<VoidListener>| -> Vec<[f32; 4]> {
             let mut rects: Vec<[f32; 4]> = cm
@@ -3355,13 +3356,13 @@ mod sugarloaf_free {
 
         let mut images = Images::default();
         cm.remove_current_grid(&mut images);
-        assert_eq!(cm.current_grid_len(), 2);
+        assert_eq!(cm.current_grid().len(), 2);
         let before = rects(&cm);
         assert_eq!(cm.drag_border_to(x + 80.0, y), VERTICAL, "still a drag");
         assert_eq!(rects(&cm), before, "nothing moved");
 
         cm.split(3, false);
-        assert_eq!(cm.current_grid_len(), 3, "the pane count is back");
+        assert_eq!(cm.current_grid().len(), 3, "the pane count is back");
         let before = rects(&cm);
         assert_eq!(cm.drag_border_to(x + 160.0, y), VERTICAL);
         assert_eq!(

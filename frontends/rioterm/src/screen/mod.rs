@@ -832,9 +832,8 @@ impl Screen<'_> {
                     .pending_update
                     .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
             }
-            grid.update_dimensions(&mut self.sugarloaf);
+            grid.update_dimensions(&self.sugarloaf);
         }
-        self.resize_all_contexts();
         self.mark_dirty();
         // Tab-strip displacement is layout, not cursor travel.
         self.renderer.trail_cursor.snap();
@@ -950,7 +949,7 @@ impl Screen<'_> {
             island.cancel_drag();
         }
         self.handle_scrollbar_release();
-        self.resize_state = None;
+        self.context_manager.end_border_drag();
         (!self.context_manager.is_empty()).then(|| self.context_manager.current_route())
     }
 
@@ -1147,8 +1146,7 @@ impl Screen<'_> {
         } else {
             self.sugarloaf.clear_background_image();
         }
-    
-        self.resize_all_contexts();
+
         self.mark_dirty();
     }
 
@@ -2069,55 +2067,6 @@ impl Screen<'_> {
         } else {
             self.mark_dirty();
         }
-    }
-
-    pub fn resize_top_or_bottom_line(&mut self, num_tabs: usize) {
-        let padding_y_top = padding_top_from_config(
-            &self.renderer.navigation,
-            self.renderer.margin.top,
-            num_tabs,
-            self.renderer.macos_use_unified_titlebar,
-        );
-        let padding_y_bottom = self.renderer.margin.bottom;
-
-        let scale = self.sugarloaf.scale_factor();
-        let scaled_top = padding_y_top * scale;
-        let scaled_bottom = padding_y_bottom * scale;
-
-        // Compare against the grid's scaled margin, the value the
-        // layout actually uses. The per panel dimension margin is
-        // zeroed by the taffy pass so it cannot be used as a guard.
-        let current_margin = self.context_manager.current_grid().scaled_margin;
-        if current_margin.top == scaled_top && current_margin.bottom == scaled_bottom {
-            return;
-        }
-
-        let current_dim = self.context_manager.current().dimension;
-        if current_dim.font_size <= 0.0 {
-            return;
-        }
-
-        let s = self.sugarloaf.style_mut();
-        s.font_size = current_dim.font_size;
-        s.line_height = current_dim.line_height;
-
-        // Every tab shares the window, so every grid needs the new
-        // margin and a layout pass, not just the current one.
-        for context_grid in self.context_manager.contexts_mut() {
-            let margin = context_grid.scaled_margin;
-            context_grid.update_scaled_margin(Margin::new(
-                scaled_top,
-                margin.right,
-                scaled_bottom,
-                margin.left,
-            ));
-            context_grid.update_dimensions(&self.sugarloaf);
-        }
-
-        // The tab strip appearing or vanishing shifts every panel;
-        // a background tab can close without a route change, so this
-        // reflow is not covered by the route-switch teleport.
-        self.renderer.trail_cursor.snap();
     }
 
     fn refresh_current_layout(&mut self) {

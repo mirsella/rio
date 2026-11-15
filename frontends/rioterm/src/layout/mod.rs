@@ -43,8 +43,6 @@ impl TabId {
     }
 }
 
-static NEXT_GRID_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Direction of a draggable panel border
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BorderDirection {
@@ -227,9 +225,6 @@ pub struct ContextGrid<T: EventListener> {
     tree: TaffyTree<()>,
     root_node: NodeId,
     border_config: BorderConfig,
-    /// Unique for the life of the process, so a grid can be found again
-    /// after the tabs were renumbered.
-    id: u64,
     /// Bumped whenever a panel is added or removed, so a reference to
     /// the tree taken earlier can tell the tree changed under it.
     shape: u64,
@@ -551,17 +546,10 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             tree,
             root_node,
             border_config,
-            id: NEXT_GRID_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             shape: 0,
         };
         let _ = grid.compute_layout();
         grid
-    }
-
-    /// This grid's identity, unique for the life of the process.
-    #[inline]
-    pub fn id(&self) -> u64 {
-        self.id
     }
 
     /// A number that changes whenever a panel is added or removed.
@@ -845,8 +833,9 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             tree,
             root_node,
             border_config,
+            shape: 0,
         };
-        if !grid.apply_taffy_layout() {
+        if !grid.apply_taffy_layout(false) {
             return Err((grid.take_contexts(), "apply transfer layout failed".into()));
         }
         Ok(grid)
@@ -866,6 +855,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
             .expect("test grid should accept another split");
         self.inner.insert(node, ContextGridItem::new(context));
         self.current = node;
+        self.shape += 1;
         let _ = self.compute_layout();
     }
 
@@ -883,6 +873,22 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
     #[inline]
     pub fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    /// Test view of every panel, keyed by its layout node.
+    #[cfg(test)]
+    pub fn contexts(&self) -> &FxHashMap<NodeId, ContextGridItem<T>> {
+        &self.inner
+    }
+
+    /// Test stand-in for a window resize: the screen sets the grid size
+    /// and then lays the tree out again through `update_dimensions`.
+    #[cfg(test)]
+    pub fn resize(&mut self, width: f32, height: f32) {
+        self.width = width;
+        self.height = height;
+        let _ = self.try_update_size(width, height);
+        self.apply_taffy_layout(false);
     }
 
     pub fn should_draw_borders(&self) -> bool {
@@ -1969,7 +1975,7 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         }
 
         // Always apply Taffy layout for consistent positioning
-        self.apply_taffy_layout();
+        self.apply_taffy_layout(false);
     }
 
     /// Remove the panel owning `route_id`, wherever it sits in the
