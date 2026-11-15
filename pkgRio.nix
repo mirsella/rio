@@ -24,6 +24,7 @@
   withWayland ? stdenv.hostPlatform.isLinux,
   wayland,
   shaderc,
+  oniguruma,
   ...
 }: let
   readTOML = f: builtins.fromTOML (builtins.readFile f);
@@ -70,18 +71,20 @@ in
 
     cargoBuildFlags = "-p rioterm";
 
-    buildInputs = rlinkLibs ++ (lib.optionals stdenv.hostPlatform.isDarwin [darwin.libutil]);
+    # nixpkgs' Rust builds set RUSTONIG_SYSTEM_LIBONIG, so onig_sys links the
+    # system oniguruma instead of building its bundled copy.
+    buildInputs = rlinkLibs ++ [oniguruma] ++ (lib.optionals stdenv.hostPlatform.isDarwin [darwin.libutil]);
     runtimeDependencies = rlinkLibs;
 
     nativeBuildInputs =
       [
         rustPlatform.bindgenHook
         ncurses
+        pkg-config
         shaderc
       ]
       ++ lib.optionals stdenv.hostPlatform.isLinux [
         cmake
-        pkg-config
         autoPatchelfHook
       ];
 

@@ -1321,7 +1321,6 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             .position(|grid| grid.contains_route_id(route_id))
     }
 
-    #[cfg(all(feature = "wayland", target_os = "linux"))]
     pub fn contains_route_id(&self, route_id: usize) -> bool {
         self.grid_index_for_route(route_id).is_some()
     }

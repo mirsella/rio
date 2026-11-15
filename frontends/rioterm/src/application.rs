@@ -3885,6 +3885,8 @@ impl Application<'_> {
             event_loop,
             TabDragEvent::ForeignCommitted(transfer_id),
         );
+        #[cfg(not(all(feature = "wayland", target_os = "linux")))]
+        let _ = event_loop;
     }
 
     fn report_outgoing_transfer_error(

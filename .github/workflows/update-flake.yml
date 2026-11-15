@@ -6,6 +6,9 @@ on:
 
 jobs:
   lockfile:
+    # Forks take upstream's flake.lock when they sync, and Actions may not
+    # open pull requests there.
+    if: github.repository == 'raphamorim/rio'
     runs-on: ubuntu-latest
     # contents+pull-requests write so update-flake-lock can push its
     # branch and open the PR.
