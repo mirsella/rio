@@ -230,10 +230,21 @@ DISPLAY="$DISPLAY" "$IMPORT" -window root "$RUN_DIR/before-dnd.png"
 before_source=$(cat "$source_ack")
 "$XDOTTOOL" mousemove --sync 200 155
 "$XDOTTOOL" mousedown 1
-for point in '300 155' '500 160' '700 150' '900 148' '1200 148'; do
+# Cross the drag threshold in small steps with pauses, so a loaded source
+# arms the tab drag and starts the platform drag before the pointer leaves it.
+sleep 0.3
+for point in '215 155' '230 155' '260 155' '300 155' '500 160' '700 150' \
+    '900 148' '1200 148'; do
     read -r x y <<<"$point"
     "$XDOTTOOL" mousemove --sync "$x" "$y"
+    sleep 0.15
 done
+# Hold over the target until it accepts the offer. Releasing first makes KWin
+# treat the drop as outside every window, and the source detaches the tab into
+# a new GUI instead.
+wait_for_text "$CONFIG_DIR/destination/log/rio.log" 'event="selected-action"' \
+    "native Wayland target accepting the drag" 15
+"$XDOTTOOL" mousemove --sync 1210 150
 "$XDOTTOOL" mouseup 1
 
 wait_for_text "$CONFIG_DIR/destination/log/rio.log" 'event="data-ready"' \
