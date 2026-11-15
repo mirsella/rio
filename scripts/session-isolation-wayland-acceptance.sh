@@ -4,7 +4,8 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/lib/session-isolation-common.sh"
 
 # This harness owns a nested KWin compositor and never touches the inherited
 # desktop. It validates the live direct Sugarloaf GPU window path. Set
-# RIO_ACCEPT_KWIN_X11=1 to run KWin on a private Xvfb host.
+# RIO_ACCEPT_KWIN_X11=1 to run KWin on a private X host (see
+# start_private_x11_host).
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 ARTIFACT_ROOT=${RIO_ACCEPT_ARTIFACT_ROOT:-"$HOME/dev/rio-agent-artifacts"}
@@ -49,11 +50,8 @@ if [[ "$USE_PRIVATE_X11" == 1 || "$USE_PRIVATE_X11" == true || "$USE_PRIVATE_X11
     done
     DISPLAY_NUM=${RIO_ACCEPT_X_DISPLAY:-$((200 + ($$ % 400)))}
     export DISPLAY=":$DISPLAY_NUM"
-    "$XVFB" "$DISPLAY" -screen 0 1280x720x24 -nolisten tcp -ac >"$LOG_DIR/xvfb.log" 2>&1 &
-    xvfb_pid=$!
-    PIDS+=("$xvfb_pid")
-    wait_until "private Xvfb display" 15 "\"$XDPYINFO\" -display \"$DISPLAY\" >/dev/null 2>&1"
-    log "private Xvfb host ready display=$DISPLAY pid=$xvfb_pid"
+    start_private_x11_host "$DISPLAY" 1280 720 "$LOG_DIR"
+    log "private X11 host ready display=$DISPLAY pid=$XVFB_PID host=${RIO_ACCEPT_X11_HOST:-xwayland}"
 fi
 
 for command in "$KWIN" "$DBUS_RUN_SESSION" pgrep ps grep; do

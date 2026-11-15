@@ -3,7 +3,7 @@ set -Eeuo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib/session-isolation-common.sh"
 
 # Validate the current direct-render build's native Wayland drag path.  KWin's
-# X11 backend is used only inside the private Xvfb server so XTest events never
+# X11 backend is used only inside the private X host so XTest events never
 # reach the user's desktop.  The Rio clients have DISPLAY unset and therefore
 # use only the private Wayland socket.
 
@@ -131,10 +131,8 @@ log "tmpdir=$TMPDIR"
 log "wayland_socket=$SOCKET"
 log "input=private XTest pointer plus private Wayland primary selection"
 
-"$XVFB" "$DISPLAY" -screen 0 1600x1000x24 -nolisten tcp -ac >"$LOG_DIR/xvfb.log" 2>&1 &
-XVFB_PID=$!
-wait_until "private Xvfb" 15 "\"$XDPYINFO\" -display \"$DISPLAY\" >/dev/null 2>&1"
-DISPLAY="$DISPLAY" "$SETXKBMAP" -layout us -variant colemak_dh_iso
+start_private_x11_host "$DISPLAY" 1600 1000 "$LOG_DIR"
+pin_private_keymap "$DISPLAY" "$RUN_DIR/kwin-config"
 
 DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" "$DBUS_DAEMON" --session \
     --address="$BUS_ADDRESS" --nofork >"$LOG_DIR/dbus.log" 2>&1 &
@@ -144,7 +142,7 @@ wait_until "private D-Bus" 15 "kill -0 $DBUS_PID 2>/dev/null"
 HOME="$RUN_DIR/home" XDG_CONFIG_HOME="$RUN_DIR/kwin-config" \
     XDG_DATA_HOME="$RUN_DIR/kwin-data" XDG_CACHE_HOME="$RUN_DIR/kwin-cache" \
     DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" QT_QPA_PLATFORM=xcb \
-    LIBGL_ALWAYS_SOFTWARE=1 "$KWIN" --socket="$SOCKET" \
+    "$KWIN" --socket="$SOCKET" \
     --x11-display="$DISPLAY" --width=1600 --height=1000 --no-lockscreen \
     --no-global-shortcuts --no-kactivities >"$LOG_DIR/kwin.log" 2>&1 &
 kwin_pid=$!
@@ -211,9 +209,9 @@ printf '%s\n' \
     'var windows = workspace.windowList ? workspace.windowList() : workspace.clientList();' \
     'for (var i = 0; i < windows.length; i++) {' \
     '    var window = windows[i];' \
-    '    var geometry = window.frameGeometry;' \
-    '    if (i === 0) { geometry.x = 0; geometry.y = 100; geometry.width = 800; geometry.height = 490; window.frameGeometry = geometry; }' \
-    '    if (i === 1) { geometry.x = 800; geometry.y = 100; geometry.width = 800; geometry.height = 490; window.frameGeometry = geometry; }' \
+    '    // KWin 6.8 ignores writes to the copy frameGeometry returns.' \
+    '    if (i === 0) { window.frameGeometry = {x: 0, y: 100, width: 800, height: 490}; }' \
+    '    if (i === 1) { window.frameGeometry = {x: 800, y: 100, width: 800, height: 490}; }' \
     '}' >"$kwin_script"
 DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" "$QDBUS6" org.kde.KWin /Scripting \
     loadScript "$kwin_script" >>"$RUN_DIR/kwin-script.log" 2>&1 || die "KWin window-placement script failed"
@@ -221,20 +219,8 @@ DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" "$QDBUS6" org.kde.KWin /Scripting \
     start >>"$RUN_DIR/kwin-script.log" 2>&1 || die "KWin window-placement start failed"
 sleep 1
 
-# KWin's X11 backend exposes native Wayland clients only through its host
-# surface. Move the two private decorations apart with the same XTest stream
-# used for the drag, avoiding desktop-wide window IDs or a host WM dependency.
-"$XDOTTOOL" mousemove --sync 800 252
-"$XDOTTOOL" mousedown 1
-"$XDOTTOOL" mousemove --sync 600 220
-"$XDOTTOOL" mousemove --sync 400 180
-"$XDOTTOOL" mousemove --sync 200 140
-"$XDOTTOOL" mouseup 1
-"$XDOTTOOL" mousemove --sync 1000 276
-"$XDOTTOOL" mousedown 1
-"$XDOTTOOL" mousemove --sync 1200 220
-"$XDOTTOOL" mousemove --sync 1368 113
-"$XDOTTOOL" mouseup 1
+# The placement script already put the windows side by side, with frames at
+# y=100. Below the 36 px decoration, the tab strip is centered near y=155.
 
 DISPLAY="$DISPLAY" "$IMPORT" -window root "$RUN_DIR/before-dnd.png"
 
@@ -242,9 +228,9 @@ DISPLAY="$DISPLAY" "$IMPORT" -window root "$RUN_DIR/before-dnd.png"
 # tab strip from the source surface into the destination surface without using
 # a desktop-wide injector or any production-only testing hook.
 before_source=$(cat "$source_ack")
-"$XDOTTOOL" mousemove --sync 200 176
+"$XDOTTOOL" mousemove --sync 200 155
 "$XDOTTOOL" mousedown 1
-for point in '300 176' '500 160' '700 150' '900 148' '1200 148'; do
+for point in '300 155' '500 160' '700 150' '900 148' '1200 148'; do
     read -r x y <<<"$point"
     "$XDOTTOOL" mousemove --sync "$x" "$y"
 done

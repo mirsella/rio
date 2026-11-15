@@ -3,7 +3,7 @@ set -Eeuo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib/session-isolation-common.sh"
 
 # Compare the live Wayland GPU path in a private KWin virtual framebuffer (or
-# optional Xvfb-backed KWin). Images
+# optional KWin on a private X host). Images
 # are compared only after cropping the terminal content area out of the
 # private frame, so decoration and host-compositor pixels do not dominate the
 # result.
@@ -99,9 +99,8 @@ place_window() {
         'var windows = workspace.windowList ? workspace.windowList() : workspace.clientList();' \
         'for (var i = 0; i < windows.length; i++) {' \
         "    if (windows[i].pid == $pid) {" \
-        '        var geometry = windows[i].frameGeometry;' \
-        '        geometry.x = 0; geometry.y = 100; geometry.width = 800; geometry.height = 490;' \
-        '        windows[i].frameGeometry = geometry;' \
+        '        // KWin 6.8 ignores writes to the copy frameGeometry returns.' \
+        '        windows[i].frameGeometry = {x: 0, y: 100, width: 800, height: 490};' \
         '    }' \
         '}' >"$script"
     DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" "$QDBUS6" org.kde.KWin /Scripting \
@@ -453,9 +452,7 @@ else
 fi
 log "socket=$SOCKET renderer=GPU use-cpu=false"
 if [[ "$USE_PRIVATE_X11" == 1 || "$USE_PRIVATE_X11" == true || "$USE_PRIVATE_X11" == yes ]]; then
-    "$XVFB" "$DISPLAY" -screen 0 1600x1000x24 -nolisten tcp -ac >"$LOG_DIR/xvfb.log" 2>&1 &
-    XVFB_PID=$!
-    wait_until "private Xvfb" 15 "\"$XDPYINFO\" -display \"$DISPLAY\" >/dev/null 2>&1"
+    start_private_x11_host "$DISPLAY" 1600 1000 "$LOG_DIR"
 fi
 
 DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS" "$DBUS_DAEMON" --session \
@@ -470,7 +467,7 @@ kwin_env=(HOME="$RUN_DIR/home" XDG_CONFIG_HOME="$RUN_DIR/kwin-config" \
     DBUS_SESSION_BUS_ADDRESS="$BUS_ADDRESS")
 if [[ "$USE_PRIVATE_X11" == 1 || "$USE_PRIVATE_X11" == true || "$USE_PRIVATE_X11" == yes ]]; then
     kwin_args+=(--x11-display="$DISPLAY")
-    kwin_env+=(QT_QPA_PLATFORM=xcb LIBGL_ALWAYS_SOFTWARE=1)
+    kwin_env+=(QT_QPA_PLATFORM=xcb)
 else
     kwin_args+=(--virtual)
 fi

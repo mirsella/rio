@@ -1,6 +1,10 @@
 # Shared lifecycle helpers for the private acceptance harnesses.
 # This file is sourced by scripts in the parent directory.
 
+# Qt sends logs to journald when stderr is not a terminal; keep the private
+# KWin output in each run's kwin.log instead.
+export QT_FORCE_STDERR_LOGGING=1
+
 log() {
     if [[ -n ${SI_LOG_PREFIX:-} ]]; then
         printf '%s%s\n' "$SI_LOG_PREFIX" "$*" | tee -a "$RUN_DIR/summary.log"
@@ -101,4 +105,63 @@ wait_for_text() {
     printf -v text_q '%q' "$text"
     wait_until "$description" "$timeout" \
         "[[ -f $file_q ]] && grep -Fq -- $text_q $file_q"
+}
+
+# Start the private X server that hosts KWin's X11 backend. KWin 6 needs DRI3
+# there, which Xvfb lacks (KWin exits silently right after connecting), so by
+# default the X server is a rootful Xwayland on its own private headless KWin.
+# RIO_ACCEPT_X11_HOST=xvfb keeps the plain Xvfb host. Sets XVFB_PID to the X
+# server; the host compositor is added to PIDS. Needs XDG_RUNTIME_DIR.
+write_us_kxkbrc() {
+    mkdir -p "$1"
+    printf '[Layout]\nLayoutList=us\nUse=true\n' >"$1/kxkbrc"
+}
+
+# xdotool turns keysyms into keycodes with the X server's keymap, and the
+# nested KWin decodes them with its own; both must be plain US. Xwayland takes
+# its keymap from the host KWin, and setxkbmap on a live Xwayland kills other
+# X clients, so only check the result here.
+pin_private_keymap() {
+    local display=$1 kwin_config=$2 query
+    write_us_kxkbrc "$kwin_config"
+    query=$(DISPLAY="$display" "${SETXKBMAP:-/usr/bin/setxkbmap}" -query 2>/dev/null) ||
+        die "could not query the private X keymap"
+    grep -qxE 'layout:[[:space:]]+us' <<<"$query" && ! grep -q '^variant:' <<<"$query" ||
+        die "private X keymap is not plain US: ${query//$'\n'/ }"
+}
+
+start_private_x11_host() {
+    local display=$1 width=$2 height=$3 log_dir=$4
+    local xdpyinfo=${XDPYINFO:-/usr/bin/xdpyinfo}
+    if [[ ${RIO_ACCEPT_X11_HOST:-xwayland} == xvfb ]]; then
+        "${XVFB:-/usr/bin/Xvfb}" "$display" -screen 0 "${width}x${height}x24" \
+            -nolisten tcp -ac >"$log_dir/xvfb.log" 2>&1 &
+        XVFB_PID=$!
+    else
+        local kwin=${KWIN:-/usr/bin/kwin_wayland}
+        local xwayland=${XWAYLAND:-/usr/bin/Xwayland}
+        local dbus_run_session=${DBUS_RUN_SESSION:-/usr/bin/dbus-run-session}
+        local socket="rio-x11-host-$$" host_pid
+        require_command "$xwayland"
+        require_command "$dbus_run_session"
+        write_us_kxkbrc "$log_dir/x11-host-config"
+        # dbus-run-session gives the host compositor its own bus, never the
+        # user's session bus.
+        env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
+            XDG_CONFIG_HOME="$log_dir/x11-host-config" \
+            "$dbus_run_session" -- "$kwin" --virtual --socket="$socket" \
+            --width="$width" --height="$height" --no-lockscreen \
+            --no-global-shortcuts --no-kactivities \
+            >"$log_dir/x11-host-kwin.log" 2>&1 &
+        host_pid=$!
+        PIDS+=("$host_pid")
+        wait_until "private X11 host compositor" 15 \
+            "[[ -S \"$XDG_RUNTIME_DIR/$socket\" ]] && kill -0 $host_pid 2>/dev/null"
+        env -u DISPLAY WAYLAND_DISPLAY="$socket" "$xwayland" "$display" \
+            -geometry "${width}x${height}" -nolisten tcp -ac \
+            >"$log_dir/xwayland.log" 2>&1 &
+        XVFB_PID=$!
+    fi
+    wait_until "private X server" 15 \
+        "kill -0 $XVFB_PID 2>/dev/null && \"$xdpyinfo\" -display \"$display\" >/dev/null 2>&1"
 }

@@ -93,13 +93,15 @@ AVAILABLE`; MangoHud, PresentMon, vkmark, and RenderDoc are absent. The
 private KWin/Xvfb setup therefore exposes no presentation timestamps, so this
 harness makes no FPS, frame-latency, or input-latency claim.
 `scripts/session-isolation-wayland-x11-pointer-acceptance.sh` is a stricter
-pointer probe: it hosts KWin's X11 backend on a private Xvfb display, applies the
-known private keymap, and injects global XTest events only into that display. It
+pointer probe: it hosts KWin's X11 backend on a private X display, pins a US
+keymap, and injects global XTest events only into that display. The X host is
+a rootful Xwayland on a private virtual KWin, because KWin 6.8 needs DRI3,
+which Xvfb lacks; `RIO_ACCEPT_X11_HOST=xvfb` selects the old Xvfb host. It
 requires target-local arm, highlight, click, and source-exit evidence. A failed
 probe is not a Wayland input claim; native Wayland DnD still requires a native
 Wayland injector.
 `scripts/session-isolation-wayland-dnd-acceptance.sh` separately exercises the
-current native Wayland drag path through that private KWin/Xvfb setup. It records
+current native Wayland drag path through that private nested KWin setup. It records
 target-local drag events, direct-frame readiness, authenticated opaque-token
 commit, source GUI exit, survival of the transferred worker and shell, and a
 fresh post-drop ACK through private primary-selection middle-click input. It
