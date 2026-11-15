@@ -167,7 +167,9 @@ DISPLAY="$DISPLAY" "$IMPORT" -window "$gui_window" "$RUN_DIR/after-kill.png"
 # Close the remaining tab through the public shell path. The frontend keeps
 # the event loop alive until the dropped context's session pump acknowledges
 # its close request.
-send_line "$gui_window" exit
+# The GUI can destroy its window between the Return press and release, so a
+# BadWindow from xdotool here is the expected close, not a failure.
+send_line "$gui_window" exit || true
 wait_until "healthy pane shell cleanup" 15 "process_gone $pane_a_shell"
 wait_until "healthy worker cleanup" 15 "process_gone $pane_a_worker"
 wait_until "GUI normal close" 15 "process_gone $gui_pid"

@@ -395,7 +395,17 @@ impl SessionHandle {
         let command_wakeup_for_thread = Arc::clone(&command_wakeup);
         let commands = CommandSender::new(commands, Arc::clone(&command_wakeup));
         let listener = event_proxy.with_window_target(WindowTarget::dynamic(window_id));
+        // A unit-test binary is libtest, not Rio: re-executing it as a worker
+        // only fails later with a CLI error. Fail the same way without the spawn.
+        #[cfg(not(test))]
         let worker = rio_session::worker_executable();
+        #[cfg(test)]
+        let worker: Result<std::sync::Arc<rio_session::WorkerExecutable>, _> =
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unit tests do not spawn session workers",
+            )
+            .into());
 
         thread::Builder::new()
             .name(format!("rio-session-{route_id}"))
