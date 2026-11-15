@@ -3353,6 +3353,31 @@ mod tests {
     }
 
     #[test]
+    fn passive_view_tracks_vi_mode_for_the_vi_cursor_color() {
+        let row = || RowFrame {
+            cells: vec![CellFrame {
+                content: CellContentFrame::Codepoint('x' as u32),
+                wide: 0,
+                flags: 0,
+            }],
+            styles: vec![default_style()],
+            extras: vec![None],
+            kitty_virtual_placeholder: false,
+            text: "x".into(),
+        };
+        let mut view = RemoteView::new(None, WindowId::from(0), 1, 1);
+        let mut content = RenderableContent::new(Default::default());
+
+        for vi in [false, true, false] {
+            let mut snapshot = frame(1, 1, vec![row()]);
+            snapshot.modes = if vi { Mode::VI.bits() } else { 0 };
+            view.apply_frame(snapshot).unwrap();
+            view.refresh_renderable(&mut content);
+            assert_eq!(content.is_vi_mode, vi);
+        }
+    }
+
+    #[test]
     fn passive_view_owns_the_published_frame_and_keeps_interaction_data() {
         let snapshot = frame(
             1,

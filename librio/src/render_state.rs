@@ -1182,6 +1182,44 @@ mod tests {
         assert!(!state.row_dirty(1));
     }
 
+    /// A synchronized update (mode 2026) holds the published rows and keeps
+    /// the damage for the first snapshot after the update ends.
+    #[test]
+    fn synchronized_update_holds_and_keeps_damage() {
+        let surface = quiet_surface();
+        let mut state = RenderState::new(&surface);
+        surface.inject_output(b"before");
+        state
+            .update_with_surface_state(&surface, usize::MAX, usize::MAX, usize::MAX)
+            .expect("capture initial state");
+        assert_eq!(state.text_row(0), "before");
+        state.reset_dirty();
+
+        surface.inject_output(b"\x1b[?2026h\x1b[1;1H\x1b[2Kheld");
+        state
+            .update_with_surface_state_for_delta(
+                &surface,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("capture held state");
+        assert_eq!(state.text_row(0), "before", "rows stay held");
+        assert!(state.terminal.lock().peek_damage_event().is_some());
+
+        surface.inject_output(b"\x1b[?2026l");
+        state
+            .update_with_surface_state_for_delta(
+                &surface,
+                usize::MAX,
+                usize::MAX,
+                usize::MAX,
+            )
+            .expect("capture released state");
+        assert_eq!(state.text_row(0), "held");
+        assert!(state.row_dirty(0));
+    }
+
     #[cfg(feature = "graphics")]
     #[test]
     fn snapshot_state_skips_renderer_kitty_geometry() {
