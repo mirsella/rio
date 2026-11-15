@@ -1038,6 +1038,12 @@ impl SessionClient {
         })
     }
 
+    /// Keep the exited terminal open until the next input. Returns false
+    /// when it was already held.
+    pub fn hold(&self) -> Result<bool, SessionError> {
+        self.changed(SessionCommand::Hold)
+    }
+
     pub fn set_vi_mode(&self, enabled: bool) -> Result<bool, SessionError> {
         self.changed(SessionCommand::SetViMode(enabled))
     }
@@ -1651,7 +1657,8 @@ impl ReplyKind {
             | SessionCommand::ToggleViMode
             | SessionCommand::ViMotion(_)
             | SessionCommand::ViScroll { .. }
-            | SessionCommand::ViGoto { .. } => Self::AcceptedOrNoChange,
+            | SessionCommand::ViGoto { .. }
+            | SessionCommand::Hold => Self::AcceptedOrNoChange,
             SessionCommand::SelectionText => Self::SelectionText,
             SessionCommand::Search { .. } => Self::SearchMatches,
             SessionCommand::SearchBegin { .. }

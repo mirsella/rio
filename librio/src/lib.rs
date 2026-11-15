@@ -923,6 +923,9 @@ fn trailing_url_punctuation(text: &str) -> usize {
 pub struct Surface {
     id: SurfaceId,
     alt_is_meta: std::sync::atomic::AtomicBool,
+    /// The program exited and the surface stays open until the next input.
+    /// See [`Surface::hold_exited`].
+    held: std::sync::atomic::AtomicBool,
     terminal: Arc<FairMutex<Crosswords<Listener>>>,
     graphics_updates: Arc<Mutex<GraphicsUpdateStore>>,
     /// Compiled URL detector, built on first hover. Hit-testing runs per
@@ -936,8 +939,7 @@ pub struct Surface {
     /// Sixel/iTerm2 pixels for the render states to read.
     inline_images: InlineImages,
     /// Non-pty transport: `write` hands the bytes to the delegate instead
-    /// of a PTY channel.
-    #[cfg(not(feature = "pty"))]
+    /// of a PTY channel. Both transports use it to request a close.
     delegate: Arc<dyn SurfaceDelegate>,
     #[cfg(feature = "pty")]
     channel: corcovado::channel::Sender<Msg>,
@@ -1055,6 +1057,7 @@ impl Surface {
                 id,
                 // Terminals default alt to meta; the host may override it.
                 alt_is_meta: std::sync::atomic::AtomicBool::new(true),
+                held: std::sync::atomic::AtomicBool::new(false),
                 terminal,
                 graphics_updates,
                 url_regex: std::sync::Mutex::new(None),
@@ -1171,11 +1174,13 @@ impl Surface {
                 id,
                 // Terminals default alt to meta; the host may override it.
                 alt_is_meta: std::sync::atomic::AtomicBool::new(true),
+                held: std::sync::atomic::AtomicBool::new(false),
                 terminal,
                 graphics_updates,
                 url_regex: std::sync::Mutex::new(None),
                 processor: std::sync::Mutex::new(None),
                 inline_images,
+                delegate: engine.delegate.clone(),
                 channel,
                 shell_pid,
                 #[cfg(not(target_os = "windows"))]
@@ -1267,6 +1272,12 @@ impl Surface {
     ) -> Result<(), InputError> {
         let bytes = bytes.into();
         if bytes.is_empty() {
+            return Ok(());
+        }
+        if self.is_held() {
+            // Any input that would reach the exited program closes the
+            // held surface instead.
+            self.delegate.close_surface(self.id);
             return Ok(());
         }
         self.try_write_response(bytes)?;
@@ -1425,6 +1436,54 @@ impl Surface {
         };
         self.try_write_response(report.as_bytes())?;
         Ok(true)
+    }
+
+    /// Keep the surface open after its program exited. Leaves vi mode,
+    /// resets the style, charset, mouse, focus and keyboard modes the
+    /// program may have left behind, and prints a note. From then on any
+    /// input that would produce PTY bytes asks the delegate to close the
+    /// surface instead. Returns false when the surface was already held.
+    pub fn hold_exited(&self) -> bool {
+        use rio_vt::ansi::mode::{NamedPrivateMode, PrivateMode};
+        use rio_vt::ansi::{KeyboardModes, KeyboardModesApplyBehavior};
+        use rio_vt::crosswords::attr::Attr;
+        use rio_vt::crosswords::pos::{CharsetIndex, StandardCharset};
+        use rio_vt::performer::handler::Handler;
+
+        if self.held.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let mut terminal = self.terminal.lock();
+        if terminal.mode().contains(Mode::VI) {
+            terminal.toggle_vi_mode();
+        }
+        terminal.terminal_attribute(Attr::Reset);
+        terminal.configure_charset(CharsetIndex::G0, StandardCharset::Ascii);
+        terminal.set_active_charset(CharsetIndex::G0);
+        terminal.carriage_return();
+        terminal.linefeed();
+        terminal.input_str("Process exited. Press any key to close the terminal.");
+        for mode in [
+            NamedPrivateMode::ShowCursor,
+            NamedPrivateMode::ReportX10MouseClicks,
+            NamedPrivateMode::ReportMouseClicks,
+            NamedPrivateMode::ReportCellMouseMotion,
+            NamedPrivateMode::ReportAllMouseMotion,
+            NamedPrivateMode::ReportFocusInOut,
+        ] {
+            terminal.unset_private_mode(PrivateMode::Named(mode));
+        }
+        Handler::set_keyboard_mode(
+            &mut *terminal,
+            KeyboardModes::empty(),
+            KeyboardModesApplyBehavior::Replace,
+        );
+        terminal.mark_fully_damaged();
+        true
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.held.load(Ordering::Acquire)
     }
 
     pub fn vi_mode(&self) -> bool {
@@ -2702,6 +2761,58 @@ mod tests {
                 ..SurfaceDesc::default()
             })
             .expect("spawn sleeper")
+    }
+
+    struct CloseRecorder {
+        closes: AtomicUsize,
+    }
+
+    impl SurfaceDelegate for CloseRecorder {
+        fn wakeup(&self, _surface: SurfaceId) {}
+        fn close_surface(&self, _surface: SurfaceId) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn hold_keeps_exited_surface_until_input() {
+        let delegate = Arc::new(CloseRecorder {
+            closes: AtomicUsize::new(0),
+        });
+        let engine = Engine::new(delegate.clone());
+        let surface = engine
+            .create_surface(&SurfaceDesc {
+                shell: Some("/bin/sh".to_string()),
+                args: vec!["-c".to_string(), "sleep 300".to_string()],
+                cols: 80,
+                rows: 24,
+                ..SurfaceDesc::default()
+            })
+            .expect("spawn sleeper");
+        // Leave the modes a full-screen program would: mouse, focus,
+        // kitty keyboard and vi mode.
+        surface.inject_output(b"\x1b[?1000h\x1b[?1004h\x1b[>1u");
+        assert!(surface.set_vi_mode(true));
+
+        assert!(surface.hold_exited());
+        assert!(!surface.hold_exited(), "a second hold is a no-op");
+
+        let mode = surface.terminal.lock().mode();
+        // The note is not a prompt: no cursor.
+        assert!(!mode.contains(Mode::SHOW_CURSOR));
+        assert!(!mode.intersects(Mode::MOUSE_MODE));
+        assert!(!mode.contains(Mode::FOCUS_IN_OUT));
+        assert!(!mode.intersects(Mode::KITTY_KEYBOARD_PROTOCOL));
+        assert!(!mode.contains(Mode::VI));
+        assert!(surface
+            .serialize()
+            .contains("Process exited. Press any key to close the terminal."));
+
+        // Output-free input does not close; the first PTY bytes do.
+        surface.try_write(Vec::new()).unwrap();
+        assert_eq!(delegate.closes.load(Ordering::SeqCst), 0);
+        surface.try_write(b"x".to_vec()).unwrap();
+        assert_eq!(delegate.closes.load(Ordering::SeqCst), 1);
     }
 
     #[test]

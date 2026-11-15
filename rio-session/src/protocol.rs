@@ -916,6 +916,9 @@ pub enum SessionCommand {
         route_id: u64,
         status: GlyphStatus,
     },
+    /// The program exited: keep the terminal open with a note until the
+    /// next input that would reach the PTY, then close.
+    Hold,
     Close,
 }
 
@@ -1023,6 +1026,7 @@ impl SessionCommand {
             | Self::ChildPid
             | Self::Snapshot
             | Self::SetAltIsMeta(_)
+            | Self::Hold
             | Self::Close => {}
             Self::SnapshotSince { base_sequence } => {
                 if *base_sequence == 0 {

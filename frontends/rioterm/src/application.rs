@@ -4523,9 +4523,39 @@ impl Application<'_> {
                 );
             }
             SessionEvent::Closed => {
+                if self.config.hold && self.hold_exited(window_id, route_id) {
+                    return;
+                }
                 self.close_terminal_at(event_loop, window_id, route_id);
             }
         }
+    }
+
+    /// Keep an exited pane open until the next input (`hold`). Returns
+    /// false when the pane is already held, so this Closed is the close.
+    fn hold_exited(
+        &mut self,
+        window_id: rio_backend::event::WindowId,
+        route_id: usize,
+    ) -> bool {
+        let Some(route) = self.router.routes.get_mut(&window_id) else {
+            return false;
+        };
+        let Some(context) = route
+            .window
+            .screen
+            .context_manager
+            .get_by_route_id(route_id)
+        else {
+            return false;
+        };
+        if context.held {
+            return false;
+        }
+        context.held = true;
+        route.request_redraw();
+        self.send_session_command(window_id, route_id, SessionCommand::Hold);
+        true
     }
 
     fn send_session_command(

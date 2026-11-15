@@ -1207,3 +1207,40 @@ fn worker_does_not_send_cpr_ahead_of_held_color_response() {
     client.close().unwrap();
     wait_for_endpoint_removal(client.descriptor());
 }
+
+fn wait_for_closed(client: &SessionClient) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = client.snapshot();
+        while let Some(event) = client.poll_event().unwrap() {
+            if matches!(event, SessionEvent::Closed) {
+                return;
+            }
+        }
+        assert!(Instant::now() < deadline, "closed event timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn hold_keeps_exited_session_until_input() {
+    let client = SessionClient::spawn_with_worker_path(
+        spec("printf 'held-output\\n'; exit 0", None),
+        worker_path(),
+    )
+    .unwrap();
+    wait_for_closed(&client);
+
+    assert!(client.hold().unwrap());
+    assert!(!client.hold().unwrap(), "a second hold is a no-op");
+    let frame = snapshot_until(&client, |frame| {
+        frame_text(frame).contains("Process exited. Press any key")
+    });
+    assert!(frame_text(&frame).contains("held-output"));
+
+    // Input to the held surface becomes a second Closed.
+    client.write(b"x".to_vec()).unwrap();
+    wait_for_closed(&client);
+    client.close().unwrap();
+    wait_for_endpoint_removal(client.descriptor());
+}

@@ -193,13 +193,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let overrides = args.window_options.terminal_options.overrides();
     overrides.apply(&mut config);
-    if config.hold {
-        // Upstream's hold drives a local terminal; panes here are owned by
-        // session workers, which do not implement it yet.
-        tracing::warn!(
-            "`hold` (--hold) is not supported with worker sessions; panes close when their command exits"
-        );
-    }
 
     setup_environment_variables(&config);
 

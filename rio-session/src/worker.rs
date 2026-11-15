@@ -1245,6 +1245,18 @@ mod unix {
                     SessionReply::Accepted
                 }
                 SessionCommand::Close => SessionReply::Closed,
+                SessionCommand::Hold => {
+                    // Keep `terminal_closed`: a later owner replays Closed,
+                    // answers it with Hold, gets NoChange and so learns the
+                    // surface is held. Input to a held surface closes it,
+                    // which emits Closed again.
+                    if self.surface.hold_exited() {
+                        self.frame_pending = true;
+                        SessionReply::Accepted
+                    } else {
+                        SessionReply::NoChange
+                    }
+                }
                 SessionCommand::Key(input) => {
                     let changed = self
                         .surface

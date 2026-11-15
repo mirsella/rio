@@ -50,6 +50,10 @@ pub struct Context<T: EventListener> {
     pub rich_text_id: usize,
     pub dimension: ContextDimension,
     pub title: ContextTitle,
+    /// The program exited and `hold` keeps the pane open until the next
+    /// input. The worker owns the held state; this only records that the
+    /// next Closed event is the real close.
+    pub held: bool,
     _listener: PhantomData<fn() -> T>,
 }
 
@@ -249,6 +253,7 @@ where
         rich_text_id,
         dimension,
         title: ContextTitle::default(),
+        held: false,
         _listener: PhantomData,
     }
 }
@@ -285,6 +290,7 @@ where
         renderable_content: RenderableContent::new(Cursor::default()),
         dimension,
         title: ContextTitle::default(),
+        held: false,
         _listener: PhantomData,
     }
 }
@@ -332,6 +338,7 @@ where
         rich_text_id,
         dimension,
         title: ContextTitle::default(),
+        held: false,
         _listener: PhantomData,
     }
 }
@@ -588,6 +595,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             renderable_content: RenderableContent::new(cursor),
             dimension,
             title: ContextTitle::default(),
+            held: false,
             _listener: PhantomData,
         })
     }
