@@ -2320,14 +2320,7 @@ mod unix {
                 runtime.frame_pending = true;
                 // A live replacement skips `detach`, so replay Closed here or
                 // the new owner never learns the terminal (maybe held) closed.
-                if runtime.terminal_closed
-                    && !runtime
-                        .pending_events
-                        .iter()
-                        .any(|event| matches!(event, SessionEvent::Closed))
-                {
-                    queue_event(&mut runtime.pending_events, SessionEvent::Closed);
-                }
+                replay_closed(runtime);
             }
             state.idle_since = None;
             old_fd.map(|active| active.connection_fd)
@@ -2610,15 +2603,27 @@ mod unix {
                         SessionEvent::ChildExited { status },
                     );
                 }
-                if runtime.terminal_closed {
-                    queue_event(&mut runtime.pending_events, SessionEvent::Closed);
-                }
+                replay_closed(runtime);
             }
             state.idle_since = Some(Instant::now());
         }
         drop(state);
         if detached {
             shared.delegate.wakeup.signal();
+        }
+    }
+
+    /// Every ownership change (commit or detach) replays Closed exactly once,
+    /// so `requeue_critical` never requeues it. A second Closed would make a
+    /// held pane close without input.
+    fn replay_closed(runtime: &mut Runtime) {
+        if runtime.terminal_closed
+            && !runtime
+                .pending_events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Closed))
+        {
+            queue_event(&mut runtime.pending_events, SessionEvent::Closed);
         }
     }
 
@@ -2954,7 +2959,11 @@ mod unix {
                 return;
             };
             let mut published = false;
-            for event in events {
+            // Closed is replayed by ownership changes; see `replay_closed`.
+            for event in events
+                .into_iter()
+                .filter(|event| !matches!(event, SessionEvent::Closed))
+            {
                 published |= queue_event(&mut runtime.pending_events, event);
             }
             published
@@ -3429,6 +3438,47 @@ mod unix {
         assert!(!shared.expire_if_idle());
         shared.state.lock().unwrap().idle_since = Some(Instant::now() - IDLE_RETENTION);
         assert!(shared.expire_if_idle());
+    }
+
+    #[test]
+    fn closed_is_replayed_once_per_ownership_change() {
+        let shared = test_shared();
+        let mut runtime =
+            Runtime::new(test_spec(), Arc::clone(&shared.delegate)).unwrap();
+        runtime.terminal_closed = true;
+        shared.state.lock().unwrap().runtime = Some(runtime);
+        let closed_count = |shared: &Shared| {
+            let state = shared.state.lock().unwrap();
+            let runtime = state.runtime.as_ref().unwrap();
+            runtime
+                .pending_events
+                .iter()
+                .filter(|event| matches!(event, SessionEvent::Closed))
+                .count()
+        };
+        let drained = [ServerMessage::Event {
+            generation: 1,
+            event: SessionEvent::Closed,
+        }];
+
+        // The old owner requeues a drained Closed after the replacement
+        // already flushed its replay: nothing new may be queued.
+        requeue_critical(&shared, &drained, 0);
+        assert_eq!(closed_count(&shared), 0);
+
+        // Replay, then a racing requeue, still leaves one Closed.
+        replay_closed(shared.state.lock().unwrap().runtime.as_mut().unwrap());
+        requeue_critical(&shared, &drained, 0);
+        assert_eq!(closed_count(&shared), 1);
+
+        // Detach does not stack a second Closed on a pending one.
+        shared.state.lock().unwrap().active = Some(Active {
+            generation: 1,
+            connection_fd: -1,
+            wakeup: Arc::new(readiness::Readiness::new().unwrap()),
+        });
+        detach(&shared, 1);
+        assert_eq!(closed_count(&shared), 1);
     }
 
     #[cfg(test)]
