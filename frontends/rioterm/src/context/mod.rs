@@ -757,6 +757,8 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             window_id,
             config,
             bootstrap_transfer: None,
+            window_focused: false,
+            focused_route: None,
         }
     }
 
@@ -780,11 +782,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return self.contexts.is_empty();
         };
 
+        let was_current = index_to_remove == self.current_index;
         if self.contexts[index_to_remove].len() > 1 {
             if let Some(removed) = self.contexts[index_to_remove].remove_by_route(route_id) {
                 removed.release(sugarloaf);
             }
-            if index_to_remove == self.current_index {
+            // The sibling taking over a focused tab is now the displayed pane.
+            if was_current {
                 self.sync_current_route();
             }
             return false;
@@ -794,6 +798,9 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.contexts.remove(index_to_remove);
         self.update_selection_after_grid_removal(index_to_remove);
         if !self.contexts.is_empty() {
+            if was_current {
+                self.sync_current_route();
+            }
             self.keep_only_active_context_visible(sugarloaf);
         }
 
@@ -891,13 +898,13 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     #[inline]
     pub fn select_next_split(&mut self) {
         self.contexts[self.current_index].select_next_split();
-        self.sync_window_title();
+        self.sync_current_route();
     }
 
     #[inline]
     pub fn select_prev_split(&mut self) {
         self.contexts[self.current_index].select_prev_split();
-        self.sync_window_title();
+        self.sync_current_route();
     }
 
     #[inline]
@@ -912,7 +919,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 current_tab.current = root;
             }
         }
-        self.sync_window_title();
+        self.sync_current_route();
     }
 
     #[inline]
@@ -928,7 +935,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 current_tab.current = last_key;
             }
         }
-        self.sync_window_title();
+        self.sync_current_route();
     }
 
     #[inline]
@@ -1070,12 +1077,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         }
     }
 
-    pub fn ring_bell(&mut self, route_id: usize, window_focused: bool) -> bool {
+    pub fn ring_bell(&mut self, route_id: usize) -> bool {
         let Some(index) = self.grid_index_for_route(route_id) else {
             return false;
         };
         let grid = &mut self.contexts[index];
-        if (window_focused && index == self.current_index) || grid.bell {
+        if (self.window_focused && index == self.current_index) || grid.bell {
             return false;
         }
         grid.bell = true;
@@ -1274,19 +1281,34 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     /// focus events. Idempotent, so every active-pane change calls it; a
     /// pane that died owes nothing.
     fn sync_focus_reports(&mut self) {
-        let wanted = self.window_focused.then(|| self.current().route_id);
+        let wanted = (self.window_focused && !self.contexts.is_empty())
+            .then(|| self.current().route_id);
         if wanted == self.focused_route {
             return;
         }
         if let Some(previous) = self.focused_route.take() {
-            if let Some(item) = self.get_by_route_id(previous) {
-                Self::write_focus(item.context(), false);
+            if let Some(context) = self.get_by_route_id(previous) {
+                Self::write_focus(context, false);
             }
         }
         if wanted.is_some() {
             Self::write_focus(self.current(), true);
         }
         self.focused_route = wanted;
+    }
+
+    /// A pane leaving this window must not stay focused in its worker:
+    /// the new window only reports focus when it is focused itself.
+    fn release_focus(&mut self, route_ids: &[usize]) {
+        let Some(focused) = self.focused_route else {
+            return;
+        };
+        if route_ids.contains(&focused) {
+            if let Some(context) = self.get_by_route_id(focused) {
+                Self::write_focus(context, false);
+            }
+            self.focused_route = None;
+        }
     }
 
     /// The worker keeps the focus state and reports it only when the
@@ -1363,8 +1385,11 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             return None;
         }
 
+        let leaving = self.contexts[index].route_ids();
+        self.release_focus(&leaving);
         let grid = self.contexts.remove(index);
         self.update_selection_after_grid_removal(index);
+        self.sync_current_route();
         self.mark_all_full_damage();
 
         Some(GridTransfer::new(grid))
@@ -1385,6 +1410,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         transfer.grid.rebind_window(self.window_id);
         self.contexts.insert(index, *transfer.grid);
         self.current_index = index;
+        self.sync_current_route();
         self.mark_all_full_damage();
         Ok(())
     }
@@ -1486,6 +1512,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         );
         self.contexts.push(grid);
         self.current_index = self.contexts.len() - 1;
+        self.sync_current_route();
         Ok(route_id)
     }
 
@@ -1618,6 +1645,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
             self.contexts.insert(insert_at + offset, grid);
         }
         self.current_index = insert_at + active_grid.unwrap_or(0);
+        self.sync_current_route();
         Ok(source_order
             .into_iter()
             .map(|source| {
@@ -1641,6 +1669,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         route_ids: &[usize],
         sugarloaf: &mut Sugarloaf,
     ) {
+        self.release_focus(route_ids);
         self.disarm_routes_for_transfer(route_ids);
         for route_id in route_ids {
             let Some(index) = self.grid_index_for_route(*route_id) else {
@@ -1653,6 +1682,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 self.contexts[index].remove_by_route(*route_id, sugarloaf);
             }
         }
+        self.sync_current_route();
         self.mark_all_full_damage();
     }
 
@@ -1663,6 +1693,12 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                 removed.release(sugarloaf);
             }
         }
+        self.sync_current_route();
+    }
+
+    /// The current grid selected another split (a click): it is now the
+    /// displayed pane.
+    pub fn select_route_from_current_grid(&mut self) {
         self.sync_current_route();
     }
 
@@ -1705,7 +1741,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
     pub fn set_current(&mut self, context_id: usize) {
         if context_id < self.contexts.len() {
             self.current_index = context_id;
-            self.sync_window_title();
+            self.sync_current_route();
         }
     }
 
@@ -1980,6 +2016,7 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
                     ));
                     if redirect {
                         self.current_index = last_index;
+                        self.sync_current_route();
                     }
                 }
                 Err(error) => self.report_context_error(error.as_ref()),
@@ -2080,94 +2117,44 @@ pub mod test {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct FocusRecorder(std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>>);
-
-    impl EventListener for FocusRecorder {
-        fn send_event(&self, event: RioEvent, _: WindowId) {
-            match event {
-                RioEvent::PtyWrite(route, text) => {
-                    self.0.lock().unwrap().push((route, text));
-                }
-                RioEvent::FocusReport(route, focused) => {
-                    self.0
-                        .lock()
-                        .unwrap()
-                        .push((route, format!("reply:{focused}")));
-                }
-                _ => {}
-            }
-        }
-    }
-
     // Focus follows the pane the user is looking at, not just the window:
-    // a tab switch tells the old pane it lost focus and the new one it
-    // gained it, when they asked for focus events.
+    // a tab switch moves it from the old pane to the new one. Worker panes
+    // get it as a session command and answer the program themselves, so
+    // the manager's part is picking the one focused route.
     #[test]
-    fn focus_reports_follow_tab_switches() {
-        use rio_backend::performer::handler::Processor;
-        let recorder = FocusRecorder::default();
+    fn focus_follows_tab_switches() {
         let mut cm =
-            ContextManager::start_with_capacity(5, recorder.clone(), WindowId::from(0))
+            ContextManager::start_with_capacity(5, VoidListener {}, WindowId::from(0))
                 .unwrap();
         cm.add_context(true, 0);
-        assert_eq!(cm.len(), 2);
-        // Each pane's PTY input lands on a channel the test reads.
-        let mut routes = Vec::new();
-        let mut inputs = Vec::new();
-        for i in 0..2 {
-            let (tx, rx) = corcovado::channel::channel();
-            let context = cm.contexts[i].current_mut();
-            context.messenger = Messenger::new(tx);
-            routes.push(context.route_id);
-            inputs.push(rx);
-            let mut parser = Processor::default();
-            parser.advance(&mut *context.terminal.lock(), b"\x1b[?1004h");
-        }
-        let drain = |rx: &corcovado::channel::Receiver<Msg>| {
-            let mut out = Vec::new();
-            while let Ok(Msg::Input(bytes)) = rx.try_recv() {
-                out.push(bytes.into_owned());
-            }
-            out
-        };
-        let gained = vec![b"\x1b[I".to_vec()];
-        let lost = vec![b"\x1b[O".to_vec()];
-        let none: Vec<Vec<u8>> = Vec::new();
+        let routes: Vec<usize> =
+            (0..2).map(|i| cm.contexts[i].current().route_id).collect();
 
-        // The window was never focused: enabling the mode asked for a
-        // reply telling each program it is unfocused, and the switch
-        // add_context made reported nothing.
-        assert_eq!(
-            *recorder.0.lock().unwrap(),
-            vec![
-                (routes[0], "reply:false".to_string()),
-                (routes[1], "reply:false".to_string())
-            ]
-        );
-        assert_eq!(drain(&inputs[0]), none);
-        assert_eq!(drain(&inputs[1]), none);
+        // The window was never focused: switching tabs focuses nothing.
+        assert_eq!(cm.focused_route, None);
 
-        cm.set_window_focus(true); // tab 1 gains
-        assert_eq!(drain(&inputs[0]), none);
-        assert_eq!(drain(&inputs[1]), gained);
+        cm.set_window_focus(true);
+        assert_eq!(cm.focused_route, Some(routes[1]));
 
-        cm.switch_to_prev(); // tab 1 loses, tab 0 gains
-        assert_eq!(drain(&inputs[0]), gained);
-        assert_eq!(drain(&inputs[1]), lost);
+        cm.switch_to_prev();
+        assert_eq!(cm.focused_route, Some(routes[0]));
 
-        cm.set_window_focus(false); // tab 0 loses
-        cm.set_window_focus(false); // a repeat: nothing
-        cm.switch_to_next(); // unfocused window: nothing
-        assert_eq!(drain(&inputs[0]), lost);
-        assert_eq!(drain(&inputs[1]), none);
+        cm.set_window_focus(false);
+        cm.set_window_focus(false);
+        cm.switch_to_next();
+        assert_eq!(cm.focused_route, None);
 
-        cm.set_window_focus(true); // tab 1 gains
-        assert_eq!(drain(&inputs[0]), none);
-        assert_eq!(drain(&inputs[1]), gained);
+        cm.set_window_focus(true);
+        assert_eq!(cm.focused_route, Some(routes[1]));
 
-        // Nothing but the two enable replies rode the event path.
-        assert_eq!(recorder.0.lock().unwrap().len(), 2);
+        // The focused tab leaves for another window: focus moves to the
+        // tab left behind, and the extracted pane is no longer tracked.
+        let transfer = cm.extract_grid(1).unwrap();
+        assert_eq!(cm.focused_route, Some(routes[0]));
+
+        // It comes back and becomes the displayed tab again.
+        assert!(cm.insert_grid(1, transfer).is_ok());
+        assert_eq!(cm.focused_route, Some(routes[1]));
     }
 
     #[test]
@@ -2252,6 +2239,8 @@ pub mod test {
         let mut manager =
             ContextManager::start_with_capacity(3, listener, WindowId::from(0)).unwrap();
         manager.add_context(true, 0);
+        // Opening the tab already synced the title once.
+        *events.lock().unwrap() = 0;
         manager.config.title.content = "{{columns}}".into();
         manager.contexts[0].current_mut().dimension.columns = 80;
         manager.contexts[1].current_mut().dimension.columns = 120;

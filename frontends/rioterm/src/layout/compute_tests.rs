@@ -627,7 +627,7 @@ mod divider_keys {
         let ctx =
             create_mock_context(VoidListener {}, WindowId::from(0), 0, dimension(scale));
         let mut grid =
-            ContextGrid::new(ctx, Margin::default(), [0.; 4], [0.; 4], Panel::default());
+            ContextGrid::new(ctx, Margin::default(), [0.; 4], Panel::default());
         grid.compute_layout().unwrap();
         grid
     }

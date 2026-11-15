@@ -2119,25 +2119,6 @@ impl<T: rio_backend::event::EventListener> ContextGrid<T> {
         self.resize_divider(true, false, amount) && self.apply_taffy_layout(false)
     }
 
-    /// Hide the panel set by clearing per-panel image overlays. The
-    /// `visible=true` case is a no-op — the next `Renderer::run` will
-    /// repopulate overlays naturally for whichever tab/group is
-    /// active. (Naming preserved for callers; the function used to
-    /// drive sugarloaf's content visibility flag, which is gone.)
-    #[inline]
-    pub fn set_all_rich_text_visibility(
-        &self,
-        images: &mut impl PanelImages,
-        visible: bool,
-    ) {
-        if visible {
-            return;
-        }
-        for item in self.inner.values() {
-            images.clear_image_overlays_for(item.val.rich_text_id);
-        }
-    }
-
     /// Clear image overlays without dropping the image data, used when a
     /// tab or split is hidden.
     #[inline]
