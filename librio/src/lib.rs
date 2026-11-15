@@ -3452,14 +3452,10 @@ mod tests {
         assert_eq!(state.kitty_image_rgba(7, &mut buf), 16);
     }
 
+    // A silent child: a real shell's prompt can land on the image's
+    // cells and drop its placement before the test looks.
     fn image_surface() -> (Surface, RenderState) {
-        let delegate = Arc::new(CountingDelegate {
-            wakeups: AtomicUsize::new(0),
-        });
-        let engine = Engine::new(delegate);
-        let surface = engine
-            .create_surface(&SurfaceDesc::default())
-            .expect("spawn shell");
+        let surface = quiet_surface(80, 24);
         let state = RenderState::new(&surface);
         (surface, state)
     }
