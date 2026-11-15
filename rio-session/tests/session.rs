@@ -1244,3 +1244,21 @@ fn hold_keeps_exited_session_until_input() {
     client.close().unwrap();
     wait_for_endpoint_removal(client.descriptor());
 }
+
+#[test]
+fn live_replacement_of_a_held_session_replays_closed() {
+    let client =
+        SessionClient::spawn_with_worker_path(spec("exit 0", None), worker_path())
+            .unwrap();
+    wait_for_closed(&client);
+    assert!(client.hold().unwrap());
+
+    // The old owner stays attached, so this is a replacement, not a detach.
+    let replacement = SessionClient::attach(client.descriptor().clone()).unwrap();
+    wait_for_closed(&replacement);
+    assert!(!replacement.hold().unwrap(), "the surface is already held");
+    replacement.write(b"x".to_vec()).unwrap();
+    wait_for_closed(&replacement);
+    replacement.close().unwrap();
+    wait_for_endpoint_removal(replacement.descriptor());
+}

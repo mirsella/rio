@@ -2318,6 +2318,16 @@ mod unix {
             });
             if let Some(runtime) = state.runtime.as_mut() {
                 runtime.frame_pending = true;
+                // A live replacement skips `detach`, so replay Closed here or
+                // the new owner never learns the terminal (maybe held) closed.
+                if runtime.terminal_closed
+                    && !runtime
+                        .pending_events
+                        .iter()
+                        .any(|event| matches!(event, SessionEvent::Closed))
+                {
+                    queue_event(&mut runtime.pending_events, SessionEvent::Closed);
+                }
             }
             state.idle_since = None;
             old_fd.map(|active| active.connection_fd)
