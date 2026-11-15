@@ -2,10 +2,10 @@
 # Rebase this fork's branch onto raphamorim/rio.
 #
 # Adds the `upstream` remote when missing, saves the current tip as
-# backup/<branch>-pre-rebase-<date>, enables rerere so a resolution recorded
+# backup/<branch>-pre-rebase-<timestamp>, enables rerere so a resolution recorded
 # once is replayed on the next sync, then starts the rebase. Resolve conflicts
 # as usual and `git rebase --continue`; undo with
-# `git reset --hard backup/<branch>-pre-rebase-<date>`.
+# `git reset --hard backup/<branch>-pre-rebase-<timestamp>`.
 #
 # Intermediate fork commits are not guaranteed to build. Check the final tree:
 #   cargo +nightly clippy --workspace --all-targets && cargo +nightly test --workspace
@@ -25,7 +25,7 @@ fi
 git fetch upstream
 
 branch=$(git symbolic-ref --short HEAD)
-backup="backup/$branch-pre-rebase-$(date -u +%Y-%m-%d)"
+backup="backup/$branch-pre-rebase-$(date -u +%Y%m%dT%H%M%SZ)"
 git branch "$backup"
 git config rerere.enabled true
 git config rerere.autoUpdate true
