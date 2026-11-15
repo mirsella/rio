@@ -1274,7 +1274,7 @@ impl Surface {
         if bytes.is_empty() {
             return Ok(());
         }
-        if self.is_held() {
+        if self.held.load(Ordering::Acquire) {
             // Any input that would reach the exited program closes the
             // held surface instead.
             self.delegate.close_surface(self.id);
@@ -1480,10 +1480,6 @@ impl Surface {
         );
         terminal.mark_fully_damaged();
         true
-    }
-
-    pub fn is_held(&self) -> bool {
-        self.held.load(Ordering::Acquire)
     }
 
     pub fn vi_mode(&self) -> bool {
