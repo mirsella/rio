@@ -230,15 +230,19 @@ DISPLAY="$DISPLAY" "$IMPORT" -window root "$RUN_DIR/before-dnd.png"
 before_source=$(cat "$source_ack")
 "$XDOTTOOL" mousemove --sync 200 155
 "$XDOTTOOL" mousedown 1
-# Cross the drag threshold in small steps with pauses, so a loaded source
-# arms the tab drag and starts the platform drag before the pointer leaves it.
-sleep 0.3
-for point in '215 155' '230 155' '260 155' '300 155' '500 160' '700 150' \
-    '900 148' '1200 148'; do
-    read -r x y <<<"$point"
-    "$XDOTTOOL" mousemove --sync "$x" "$y"
-    sleep 0.15
-done
+drag_to() {
+    local point x y
+    for point in "$@"; do
+        read -r x y <<<"$point"
+        "$XDOTTOOL" mousemove --sync "$x" "$y"
+    done
+}
+# The source hands the tab to a platform drag when the pointer leaves it, so
+# wait for that start before moving over the target.
+drag_to '215 155' '230 155' '260 155' '300 155' '500 160' '700 150' '900 148'
+wait_for_text "$CONFIG_DIR/source/log/rio.log" 'started source tab drag owner' \
+    "source starting the platform tab drag" 15
+drag_to '1200 148'
 # Hold over the target until it accepts the offer. Releasing first makes KWin
 # treat the drop as outside every window, and the source detaches the tab into
 # a new GUI instead.

@@ -53,7 +53,7 @@ pub struct Context<T: EventListener> {
     /// The program exited and `hold` keeps the pane open until the next
     /// input. The worker owns the held state; this only records that the
     /// next Closed event is the real close.
-    pub held: bool,
+    held: bool,
     _listener: PhantomData<fn() -> T>,
 }
 
@@ -68,6 +68,12 @@ impl<T: rio_backend::event::EventListener> Drop for Context<T> {
 }
 
 impl<T: EventListener> Context<T> {
+    /// Marks the pane held after its program exited. Returns false when it
+    /// already was, meaning this exit notice is the close that ends the hold.
+    pub fn hold(&mut self) -> bool {
+        !std::mem::replace(&mut self.held, true)
+    }
+
     /// Reassign this context and all of its queued producer events to a window.
     pub fn rebind_window(&mut self, window_id: WindowId) {
         self.window_target.rebind(window_id);
@@ -2416,6 +2422,17 @@ pub mod test {
         assert!(!cm.update_titles());
         cm.set_current(1);
         assert_eq!(cm.displayed_title_for_current_tab(), columns);
+    }
+
+    #[test]
+    fn hold_is_taken_once_per_pane() {
+        let window_id = WindowId::from(0);
+        let mut cm =
+            ContextManager::start_with_capacity(1, VoidListener {}, window_id).unwrap();
+        let route = cm.current_route();
+        let context = cm.get_by_route_id(route).unwrap();
+        assert!(context.hold(), "the first exit holds the pane");
+        assert!(!context.hold(), "a later exit notice closes the held pane");
     }
 
     #[test]

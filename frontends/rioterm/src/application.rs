@@ -1368,6 +1368,11 @@ impl<'a> Application<'a> {
                 let result = route.window.winit_window.start_toplevel_drag(drag_id);
                 Some(match result {
                     Ok(()) => {
+                        tracing::info!(
+                            window = ?state.source_window,
+                            whole_window = state.whole_window,
+                            "started source tab drag owner"
+                        );
                         if let Some(source_routes) = source_routes {
                             self.track_outgoing_offer(
                                 state.token.as_bytes(),
@@ -4549,10 +4554,9 @@ impl Application<'_> {
         else {
             return false;
         };
-        if context.held {
+        if !context.hold() {
             return false;
         }
-        context.held = true;
         route.request_redraw();
         self.send_session_command(window_id, route_id, SessionCommand::Hold);
         true
