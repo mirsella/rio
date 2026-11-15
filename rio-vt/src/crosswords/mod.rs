@@ -8958,9 +8958,7 @@ mod tests {
             events
                 .borrow()
                 .iter()
-                .filter(
-                    |e| matches!(e, RioEvent::RenderRoute(route) if *route == 7),
-                )
+                .filter(|e| matches!(e, RioEvent::RenderRoute(route) if *route == 7))
                 .count()
         };
 

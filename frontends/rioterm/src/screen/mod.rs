@@ -2313,7 +2313,6 @@ impl Screen<'_> {
                 .pending_update
                 .set_terminal_damage(rio_backend::event::TerminalDamage::Full);
         }
-        self.renderer.set_vi_mode(enabled);
         self.mark_dirty();
     }
 
@@ -4624,16 +4623,9 @@ impl Screen<'_> {
             }
         }
 
-        let search_dfas = if is_search_active {
-            Some(self.search_state.dfas_mut())
-        } else {
-            None
-        };
-        let (window_update, any_panel_dirty) = self.renderer.run(
-            &mut self.sugarloaf,
-            &mut self.context_manager,
-            search_dfas,
-        );
+        let (window_update, any_panel_dirty) = self
+            .renderer
+            .run(&mut self.sugarloaf, &mut self.context_manager);
 
         if self.renderer.custom_mouse_cursor {
             let scale = self.sugarloaf.scale_factor();

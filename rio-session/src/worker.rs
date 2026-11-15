@@ -199,6 +199,7 @@ mod unix {
         queued: VecDeque<Notification>,
         title: Option<String>,
         progress: Option<(u8, u8)>,
+        command_finished: Option<(Option<i32>, std::time::Duration)>,
         bell: bool,
         cursor_blinking: bool,
         clipboard_store: [Option<String>; 2],
@@ -215,6 +216,7 @@ mod unix {
         fn has_deferred_notifications(&self) -> bool {
             self.title.is_some()
                 || self.progress.is_some()
+                || self.command_finished.is_some()
                 || self.bell
                 || self.cursor_blinking
                 || self.clipboard_store.iter().any(Option::is_some)
@@ -240,6 +242,12 @@ mod unix {
             if let Some((state, value)) = self.progress.take() {
                 notifications
                     .push(Notification::Action(Action::Progress { state, value }));
+            }
+            if let Some((exit_status, duration)) = self.command_finished.take() {
+                notifications.push(Notification::Action(Action::CommandFinished {
+                    exit_status,
+                    duration,
+                }));
             }
             if self.bell {
                 self.bell = false;
@@ -410,6 +418,17 @@ mod unix {
                 }
                 Notification::Action(Action::Progress { state, value }) => {
                     deferred.progress = Some((state, value));
+                }
+                // Under backpressure only the latest finished command is
+                // worth a notification.
+                Notification::Action(Action::CommandFinished {
+                    exit_status,
+                    duration,
+                }) => deferred.command_finished = Some((exit_status, duration)),
+                Notification::Action(Action::ProgramStatus(_)) => {
+                    tracing::warn!(
+                        "worker delegate received OSC 7501 program status it never opted into"
+                    );
                 }
                 Notification::Action(Action::RingBell) => deferred.bell = true,
                 Notification::Action(Action::CursorBlinkingChange) => {
@@ -2632,6 +2651,20 @@ mod unix {
                             }
                             Action::Progress { state, value } => {
                                 SessionEvent::Progress { state, value }
+                            }
+                            Action::CommandFinished {
+                                exit_status,
+                                duration,
+                            } => SessionEvent::CommandFinished {
+                                exit_status,
+                                duration_ms: u64::try_from(duration.as_millis())
+                                    .unwrap_or(u64::MAX),
+                            },
+                            Action::ProgramStatus(_) => {
+                                tracing::warn!(
+                                    "worker delegate received OSC 7501 program status it never opted into"
+                                );
+                                continue;
                             }
                         };
                         queue_event(&mut runtime.pending_events, event);

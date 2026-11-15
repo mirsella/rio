@@ -389,7 +389,7 @@ fn pending_sync_at_exit_is_announced_as_damage() {
     )));
     let mut pty = machine(
         b"\x1b[?2026hfinal output".to_vec(),
-        Some(ErrorKind::WouldBlock),
+        ReadEnd::Error(ErrorKind::WouldBlock),
     )
     .pty;
     let (registration, readiness) = corcovado::Registration::new2();
@@ -424,7 +424,7 @@ fn recording_machine(bytes: Vec<u8>, ending: Option<ErrorKind>) -> RecordingMach
         0,
         0,
     )));
-    let pty = machine(bytes, ending).pty;
+    let pty = machine(bytes, ending.map_or(ReadEnd::Eof, ReadEnd::Error)).pty;
     let machine =
         Machine::new(terminal.clone(), pty, recorder, WindowId::from(0), 0).unwrap();
     (machine, receiver, terminal)

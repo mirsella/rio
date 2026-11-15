@@ -1,4 +1,4 @@
-use crate::{InlineImages, GraphicsSnapshot, GraphicsSnapshotError, Listener, Surface};
+use crate::{GraphicsSnapshot, GraphicsSnapshotError, InlineImages, Listener, Surface};
 use rio_graphics::{atlas_image_key, ColorType, GraphicData};
 use rio_vt::ansi::graphics::{
     atlas_overlay_geometry, kitty_overlay_geometry, AtlasPlacement, KittyOverlayGeometry,
@@ -263,24 +263,24 @@ pub struct RenderState {
     images_view: (i64, usize, usize),
     /// The surface's baseline for image change stamps.
     epoch: rio_vt::time::Instant,
-    /// Session snapshots do not use the renderer's resolved Kitty geometry.
-    /// Avoid rebuilding that cache and scanning placeholder rows there.
-    collect_kitty_geometry: bool,
+    /// Session snapshots do not use the renderer's resolved image list.
+    /// Avoid rebuilding it and scanning placeholder rows there.
+    collect_images: bool,
 }
 
 impl RenderState {
     pub fn new(surface: &Surface) -> Self {
-        Self::new_with_kitty_geometry(surface, true)
+        Self::new_with_images(surface, true)
     }
 
     /// Build render state for a consumer that serializes terminal state rather
     /// than drawing Kitty overlays. The terminal graphics snapshot still owns
     /// all protocol-visible images and placements.
     pub fn new_for_snapshot(surface: &Surface) -> Self {
-        Self::new_with_kitty_geometry(surface, false)
+        Self::new_with_images(surface, false)
     }
 
-     fn new_with_kitty_geometry(surface: &Surface, collect_kitty_geometry: bool) -> Self {
+    fn new_with_images(surface: &Surface, collect_images: bool) -> Self {
         let terminal = surface.terminal();
         let inline_images = surface.inline_images();
         let (columns, term_colors) = {
@@ -311,7 +311,7 @@ impl RenderState {
             graphics_updates: Arc::clone(&surface.graphics_updates),
             placements_generation: 0,
             images_view: (0, 0, 0),
-            collect_kitty_geometry,
+            collect_images,
         }
     }
 
@@ -503,61 +503,63 @@ impl RenderState {
             apply_graphics_updates(&self.inline_images, queues.clone());
             self.graphics_updates.lock().unwrap().merge(queues);
         }
-        let mut images = std::mem::take(&mut self.images_scratch);
-        images.clear();
-        for placement in term.graphics.kitty_placements.values() {
-            if let Some(image) = term.graphics.get_kitty_image(placement.image_id) {
-                images.push(ImageEntry::Kitty(KittyEntry::Direct {
-                    placement: placement.clone(),
-                    image_width: image.data.width,
-                    image_height: image.data.height,
-                    image_stamp: self.stamp(image.transmission_time),
+        if self.collect_images {
+            let mut images = std::mem::take(&mut self.images_scratch);
+            images.clear();
+            for placement in term.graphics.kitty_placements.values() {
+                if let Some(image) = term.graphics.get_kitty_image(placement.image_id) {
+                    images.push(ImageEntry::Kitty(KittyEntry::Direct {
+                        placement: placement.clone(),
+                        image_width: image.data.width,
+                        image_height: image.data.height,
+                        image_stamp: self.stamp(image.transmission_time),
+                    }));
+                }
+            }
+            self.collect_virtual_runs(term, &mut images);
+            if !term.graphics.atlas_placements.is_empty() {
+                // One lock per update; the accessors then read the stamp
+                // from the entry.
+                let inline_images = self.inline_images.lock();
+                images.extend(term.graphics.atlas_placements.iter().map(|placement| {
+                    let image_stamp = inline_images
+                        .get(&placement.image_key)
+                        .map_or(0, |image| self.stamp(image.transmit_time));
+                    ImageEntry::Inline {
+                        placement: placement.clone(),
+                        image_stamp,
+                    }
                 }));
             }
-        }
-        self.collect_virtual_runs(term, &mut images);
-        if !term.graphics.atlas_placements.is_empty() {
-            // One lock per update; the accessors then read the stamp
-            // from the entry.
-            let inline_images = self.inline_images.lock();
-            images.extend(term.graphics.atlas_placements.iter().map(|placement| {
-                let image_stamp = inline_images
-                    .get(&placement.image_key)
-                    .map_or(0, |image| self.stamp(image.transmit_time));
-                ImageEntry::Inline {
-                    placement: placement.clone(),
-                    image_stamp,
-                }
-            }));
-        }
-        // Under-background placements (z < i32::MIN / 2) first, then
-        // under-text (z < 0), then over-text: drawing in order layers
-        // correctly, and the host can split the list at those bounds.
-        images.sort_by_key(ImageEntry::order);
-        let view = (self.history_size, self.display_offset, self.rows.len());
-        let list_changed = images != self.images;
-        // A scroll only moves what was or is in view: an image deep in
-        // the scrollback must not make every line of output a new
-        // generation.
-        let moved = view != self.images_view
-            && images
-                .iter()
-                .any(|entry| entry.in_view(self.images_view) || entry.in_view(view));
-        if list_changed || moved {
-            self.placements_generation = self.placements_generation.wrapping_add(1);
-        }
-        if list_changed {
-            self.kitty_indices.clear();
-            self.kitty_indices.extend(
-                images
+            // Under-background placements (z < i32::MIN / 2) first, then
+            // under-text (z < 0), then over-text: drawing in order layers
+            // correctly, and the host can split the list at those bounds.
+            images.sort_by_key(ImageEntry::order);
+            let view = (self.history_size, self.display_offset, self.rows.len());
+            let list_changed = images != self.images;
+            // A scroll only moves what was or is in view: an image deep in
+            // the scrollback must not make every line of output a new
+            // generation.
+            let moved = view != self.images_view
+                && images
                     .iter()
-                    .enumerate()
-                    .filter(|(_, entry)| matches!(entry, ImageEntry::Kitty(_)))
-                    .map(|(index, _)| index),
-            );
+                    .any(|entry| entry.in_view(self.images_view) || entry.in_view(view));
+            if list_changed || moved {
+                self.placements_generation = self.placements_generation.wrapping_add(1);
+            }
+            if list_changed {
+                self.kitty_indices.clear();
+                self.kitty_indices.extend(
+                    images
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, entry)| matches!(entry, ImageEntry::Kitty(_)))
+                        .map(|(index, _)| index),
+                );
+            }
+            self.images_scratch = std::mem::replace(&mut self.images, images);
+            self.images_view = view;
         }
-        self.images_scratch = std::mem::replace(&mut self.images, images);
-        self.images_view = view;
         self.term_colors = *term.colors();
         let cursor = term.cursor();
         self.cursor_line = cursor.pos.row.0.max(0) as usize;
@@ -1192,7 +1194,7 @@ mod tests {
         let snapshot = state
             .update_with_surface_state(&surface, usize::MAX, usize::MAX, usize::MAX)
             .expect("capture snapshot graphics");
-        assert!(state.kitty.is_empty());
+        assert!(state.images.is_empty());
         assert_eq!(snapshot.graphics.unwrap().kitty_placements.len(), 1);
     }
 }

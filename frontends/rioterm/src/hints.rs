@@ -371,10 +371,6 @@ impl HintState {
 
         for line_idx in 0..visible_lines {
             let line = Line(line_idx as i32 - display_offset as i32);
-            if line < Line(0) || line.0 >= grid.total_lines() as i32 {
-                continue;
-            }
-
             let mut col = 0usize;
             let cols = term.columns();
             while col < cols {

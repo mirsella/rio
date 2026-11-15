@@ -19,7 +19,6 @@ pub mod utils;
 
 use crate::context::{renderable::PendingUpdate, Context, ContextManager};
 use crate::crosswords::style::{Style as CellStyle, StyleFlags};
-use crate::screen::hint::HintMatches;
 use rio_backend::config::colors::term::TermColors;
 use rio_backend::config::colors::{
     term::{List, DIM_FACTOR},
@@ -27,7 +26,6 @@ use rio_backend::config::colors::{
 };
 use rio_backend::config::navigation::Navigation;
 use rio_backend::config::Config;
-use rio_backend::crosswords::search::RegexSearch;
 use rio_backend::event::EventProxy;
 use rio_backend::sugarloaf::text::DrawOpts;
 use rio_backend::sugarloaf::Sugarloaf;
@@ -487,7 +485,6 @@ impl Renderer {
         &mut self,
         sugarloaf: &mut Sugarloaf,
         context_manager: &mut ContextManager<EventProxy>,
-        mut search: Option<Option<&mut RegexSearch>>,
     ) -> (Option<crate::context::renderable::WindowUpdate>, bool) {
         let mut any_panel_dirty = false;
         let active_route = context_manager.current_grid().current().route_id;

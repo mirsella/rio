@@ -39,7 +39,8 @@ use std::time::{Duration, Instant};
 
 fn title_tracks_size(config: &rio_backend::config::Config) -> bool {
     let template = config.title.content.to_ascii_lowercase();
-    template.contains("columns") || template.contains("lines")
+    crate::context::title::is_template(&template)
+        && (template.contains("columns") || template.contains("lines"))
 }
 
 #[cfg(all(feature = "wayland", target_os = "linux"))]
@@ -673,7 +674,7 @@ impl<'a> Application<'a> {
             return;
         };
         let manager = &mut route.window.screen.context_manager;
-        if manager.tab_index_for_route(route_id).is_none() {
+        if !manager.contains_route_id(route_id) {
             return;
         }
         let focused = route.window.is_focused && manager.current_route() == route_id;
@@ -835,12 +836,6 @@ impl<'a> Application<'a> {
         let mut remove_window = false;
         let mut closing_sessions = Vec::new();
         if let Some(route) = self.router.routes.get_mut(&window_id) {
-            if self.config.hold
-                && route.window.screen.context_manager.hold_exited(route_id)
-            {
-                route.request_redraw();
-                return;
-            }
             closing_sessions = route.window.screen.context_manager.session_handles();
             route.window.screen.discard_routes([route_id]);
             remove_window = route
@@ -4273,6 +4268,17 @@ impl Application<'_> {
                         route.set_window_title(&title);
                     }
                 }
+            }
+            SessionEvent::CommandFinished {
+                exit_status,
+                duration_ms,
+            } => {
+                self.handle_command_finished(
+                    window_id,
+                    route_id,
+                    exit_status,
+                    Duration::from_millis(duration_ms),
+                );
             }
             SessionEvent::Bell => {
                 if self.config.bell.audio {

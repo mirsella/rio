@@ -1159,6 +1159,11 @@ pub enum SessionEvent {
         state: u8,
         value: u8,
     },
+    /// OSC 133;D closed a command line that ran for `duration_ms`.
+    CommandFinished {
+        exit_status: Option<i32>,
+        duration_ms: u64,
+    },
     ClipboardStore {
         kind: u8,
         text: String,
@@ -1315,6 +1320,7 @@ impl SessionEvent {
                 }
             }
             Self::FrameReady
+            | Self::CommandFinished { .. }
             | Self::Bell
             | Self::CursorBlinkingChanged
             | Self::ChildExited { .. }

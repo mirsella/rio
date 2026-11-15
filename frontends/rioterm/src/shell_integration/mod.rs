@@ -461,7 +461,7 @@ mod test {
             env_pairs(
                 "zsh",
                 &self.base,
-                Some(self.user_zdotdir.to_string_lossy().into_owned()),
+                Some(&self.user_zdotdir.to_string_lossy()),
                 None,
             )
         }
